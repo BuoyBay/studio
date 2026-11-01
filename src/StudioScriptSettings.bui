@@ -1,0 +1,46 @@
+''' Process-wide scripting preferences, shared by agent tools and the playground.
+Public Class StudioScriptSettings
+    Public Shared Property Enabled As Boolean = True
+    Public Shared Property RunnerPath As String = ""
+
+    Public Shared Sub Load(domain As String)
+        StudioScriptSettings.Enabled = Prefs.Get(domain, "scripts.enabled", True)
+        StudioScriptSettings.RunnerPath = Prefs.Get(domain, "scripts.runnerPath", "")
+    End Sub
+
+    Public Shared Sub Save(domain As String)
+        Prefs.Set(domain, "scripts.enabled", StudioScriptSettings.Enabled)
+        Prefs.Set(domain, "scripts.runnerPath", StudioScriptSettings.RunnerPath)
+    End Sub
+End Class
+
+''' Explicit overrides win; otherwise use only the helper deployed with this app.
+Public Function StudioScriptRunnerPath(applicationPath As String = "") As String
+    If StudioScriptSettings.RunnerPath <> "" Then Return StudioScriptSettings.RunnerPath
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_SCRIPT_RUNNER").Or("")
+    If configured <> "" Then Return configured
+    If applicationPath = "" Then applicationPath = Application.Executable.FullPath()
+    Dim directory As FileSystemItem = New FileSystemItem(applicationPath).Parent
+    If directory = Nil Then Return ""
+    Dim name As String = "studio-script-runner"
+    #If TargetWindows Then
+        name += ".exe"
+    #End If
+    #If TargetMac Then
+        directory = directory.Parent
+        If directory = Nil Then Return ""
+        Return Path.Join(directory.FullPath(), "Helpers/BuoyScript/" + name)
+    #Else
+        Return Path.Join(directory.FullPath(), "helpers/BuoyScript/" + name)
+    #End If
+End Function
+
+Public Function StudioScriptRunnerAvailable(executable As String) As Boolean
+    If executable = "" Then Return False
+    Dim absolute As Boolean = String.StartsWith(executable, "/", True)
+    #If TargetWindows Then
+        absolute = String.Len(executable) > 2 And String.Substring(executable, 1, 1) = ":" And (String.Substring(executable, 2, 1) = "\\" Or String.Substring(executable, 2, 1) = "/")
+        If String.StartsWith(executable, "\\\\", True) Then absolute = True
+    #End If
+    Return absolute And New FileSystemItem(executable).IsFile()
+End Function

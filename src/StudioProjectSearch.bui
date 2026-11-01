@@ -1,0 +1,449 @@
+Import StudioFindEngine
+Import StudioProjectSpelling
+Import editorkit
+Import projectkit
+
+''' Authoritative immutable-by-convention snapshot. IDs must be unique and stable.
+Public Class StudioSearchDocument
+    Private Property mId As String
+    Private Property mPath As String
+    Private Property mText As String
+    Private Property mVersion As Integer
+    Public Sub Constructor(id As String, filePath As String, text As String, version As Integer)
+        Me.mId = id
+        Me.mPath = filePath
+        Me.mText = text
+        Me.mVersion = version
+    End Sub
+    Public Property Id As String
+        Get
+            Return Me.mId
+        End Get
+    End Property
+    Public Property Path As String
+        Get
+            Return Me.mPath
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+    End Property
+    Public Property Version As Integer
+        Get
+            Return Me.mVersion
+        End Get
+    End Property
+End Class
+
+Public Interface StudioProjectSearchHost
+    ' Enumeration is complete and independent of search filters; synchronize editor first.
+    Function EnumerateSearchItems() As Array Of String
+    Function ReadSearchItem(id As String) As StudioSearchDocument
+    ' MUST be all-or-nothing, revision checked, one undo group. Never loop ReplaceText.
+    Sub ApplySearchTransaction(requests As Array Of ProjectChangeRequest)
+    Sub OpenSearchLocation(id As String, start As Integer, length As Integer)
+End Interface
+
+''' Use with the existing ProjectWorkspace: staged validation and one atomic state swap.
+Public Sub StudioApplySearchTransaction(workspace As ProjectWorkspace, requests As Array Of ProjectChangeRequest)
+    Dim proposal As ProjectProposal = workspace.Propose(requests)
+    Try
+        workspace.ApproveProposal(proposal.Id)
+    Catch e As Exception
+        workspace.RejectProposal(proposal.Id)
+        workspace.ForgetProposal(proposal.Id)
+        Throw e
+    End Try
+    workspace.ForgetProposal(proposal.Id)
+End Sub
+
+Public Class StudioSearchOptions
+    Public Property Query As String
+    Public Property Replacement As String
+    Public Property Regex As Boolean = False
+    Public Property MatchCase As Boolean = False
+    Public Property WholeWord As Boolean = False
+    Public Property Multiline As Boolean = True
+    Public Property DotAll As Boolean = False
+    Public Property IncludePaths As String = ""
+    Public Property ExcludePaths As String = ""
+    Public Function Hits(source As String, expand As Boolean = True) As Array Of StudioFindHit
+        Return StudioFindHits(source, Me.Query, Me.Regex, Me.MatchCase, Me.WholeWord, Me.Multiline, Me.DotAll, Me.Replacement, expand)
+    End Function
+End Class
+
+''' Glob policy: * spans slash, ? is one character, semicolon separates patterns.
+Public Function StudioSearchPathMatches(filePath As String, patterns As String, emptyResult As Boolean) As Boolean
+    If String.Trim(patterns) = "" Then Return emptyResult
+    filePath = String.Replace(filePath, "\\", "/", True)
+    For Each glob As String In String.Split(patterns, ";")
+        glob = String.Trim(glob)
+        If glob = "" Then Continue For
+        Dim pattern As String = "^"
+        For Each c As String In String.Chars(glob)
+            If c = "*" Then
+                pattern += ".*"
+            ElseIf c = "?" Then
+                pattern += "."
+            Else
+                If String.Contains("\\.^$|+()[]{}", c, True) Then pattern += "\\"
+                pattern += c
+            End If
+        Next
+        pattern += "$"
+        If Array.Count(StudioRegexHits(filePath, pattern, True, False, False, False)) > 0 Then Return True
+    Next
+    Return False
+End Function
+
+Public Class StudioProjectSearchResult
+    Public Property Document As StudioSearchDocument
+    Public Property Hit As StudioFindHit
+    Public Property Selected As Boolean = True
+    Public Property Line As Integer = 1
+    Public Property Column As Integer = 1
+    Public Property Preview As String
+End Class
+
+''' Comment-only TODO/FIXME policy for Buoy. Strings retain their length as spaces,
+''' so Unicode coordinates and newline positions are preserved. No REM recognition.
+Public Function StudioSearchCommentMask(source As String) As String
+    Dim chars As Array Of String = String.Chars(source)
+    Dim pieces As Array Of String = []
+    Dim state As String = "code"
+    Dim escaped As Boolean = False
+    Dim i As Integer = 0
+    While i < Array.Count(chars)
+        Dim c As String = chars(i)
+        Dim following As String = ""
+        If i + 1 < Array.Count(chars) Then following = chars(i + 1)
+        If state = "string" Then
+            If c = "\n" Or c = "\r" Then
+                pieces.Append(c)
+            Else
+                pieces.Append(" ")
+            End If
+            If escaped Then
+                escaped = False
+            ElseIf c = "\\" Then
+                escaped = True
+            ElseIf c = "\"" Then
+                state = "code"
+            End If
+        ElseIf state = "line" Then
+            pieces.Append(c)
+            If c = "\n" Or c = "\r" Then state = "code"
+        ElseIf state = "block" Then
+            pieces.Append(c)
+            If c = "*" And following = "/" Then
+                pieces.Append("/")
+                i += 1
+                state = "code"
+            End If
+        ElseIf c = "\"" Then
+            state = "string"
+            pieces.Append(" ")
+        ElseIf c = "'" Then
+            state = "line"
+            pieces.Append(c)
+        ElseIf c = "/" And following = "/" Then
+            state = "line"
+            pieces.Append(c)
+        ElseIf c = "/" And following = "*" Then
+            state = "block"
+            pieces.Append("/")
+            pieces.Append("*")
+            i += 1
+        ElseIf c = "\n" Or c = "\r" Then
+            pieces.Append(c)
+        Else
+            pieces.Append(" ")
+        End If
+        i += 1
+    Wend
+    Return String.Join(pieces, "")
+End Function
+
+''' Cooperative job: call Step once per event-loop tick; Cancel is immediate between
+''' files. PCRE2 has match/depth limits and subjects have a strict byte limit.
+Public Class StudioProjectSearchJob
+    Public Property Host As StudioProjectSearchHost
+    Public Property Results As Array Of StudioProjectSearchResult = []
+    Public Property Complete As Boolean = False
+    Public Property Cancelled As Boolean = False
+    Public Property ReplacementError As String = ""
+    Public Property ErrorMessage As String = ""
+    Public Property TodoMode As Boolean = False
+    Public Property SpellingMode As Boolean = False
+    Public Property SelectedResult As Integer = -1
+    Public Property LimitedSpellingLines As Integer = 0
+    Private Property SpellingScan As StudioProjectSpellingScan
+    Private Property SpellingDocument As StudioSearchDocument
+    Private Property Options As StudioSearchOptions
+    Private Property Ids As Array Of String = []
+    Private Property Cursor As Integer = 0
+    Private Property TotalBytes As Integer = 0
+    Private Property Applied As Boolean = False
+
+    Public Sub Constructor(host As StudioProjectSearchHost, options As StudioSearchOptions, todoMode As Boolean = False, spellingMode As Boolean = False)
+        Me.Host = host
+        ' Freeze settings: later UI changes cannot silently alter a replacement plan.
+        Me.Options = New StudioSearchOptions()
+        Me.Options.Query = options.Query
+        Me.Options.Replacement = options.Replacement
+        Me.Options.Regex = options.Regex
+        Me.Options.MatchCase = options.MatchCase
+        Me.Options.WholeWord = options.WholeWord
+        Me.Options.Multiline = options.Multiline
+        Me.Options.DotAll = options.DotAll
+        Me.Options.IncludePaths = options.IncludePaths
+        Me.Options.ExcludePaths = options.ExcludePaths
+        Me.TodoMode = todoMode
+        Me.SpellingMode = spellingMode
+        Me.Ids = host.EnumerateSearchItems()
+        If Array.Count(Me.Ids) > 10000 Then Me.ErrorMessage = "More than 10,000 files; narrow the project. Preview cannot be applied."
+        Dim seen As New Set Of String()
+        For Each id As String In Me.Ids
+            If seen.Contains(id) Then Me.ErrorMessage = "Duplicate search item ID."
+            seen.Add(id)
+        Next
+        If Not todoMode And Not spellingMode And options.Query = "" Then Me.ErrorMessage = "Enter text to find."
+    End Sub
+
+    Public Sub Cancel()
+        Me.Cancelled = True
+        Me.SpellingScan = Nil
+        Me.SpellingDocument = Nil
+    End Sub
+
+    Public Function IsActive() As Boolean
+        Return Not Me.Complete And Not Me.Cancelled And Me.ErrorMessage = ""
+    End Function
+
+    Public Sub Step()
+        If Not Me.IsActive() Then Return
+        Try
+            If Me.SpellingScan <> Nil Then
+                Me.StepSpelling()
+                Return
+            End If
+            If Me.Cursor >= Array.Count(Me.Ids) Then
+                Me.Complete = True
+                Return
+            End If
+            Dim id As String = Me.Ids(Me.Cursor)
+            Me.Cursor += 1
+            Dim searchHost As StudioProjectSearchHost = Me.Host
+            Dim options As StudioSearchOptions = Me.Options
+            Dim doc As StudioSearchDocument = searchHost.ReadSearchItem(id)
+            If doc = Nil Or doc.Id <> id Then Throw New InvalidArgumentException("Invalid search snapshot.")
+            If Not StudioSearchPathMatches(doc.Path, Me.Options.IncludePaths, True) Or StudioSearchPathMatches(doc.Path, Me.Options.ExcludePaths, False) Then Return
+            Dim size As Integer = String.LenBytes(doc.Text)
+            Me.TotalBytes += size
+            If size > 2097152 Or Me.TotalBytes > 33554432 Then Throw New InvalidArgumentException("Search byte limit exceeded; preview cannot be applied.")
+            If Me.SpellingMode Then
+                Me.SpellingDocument = doc
+                Me.SpellingScan = New StudioProjectSpellingScan(doc.Text, doc.Path)
+                Me.StepSpelling()
+                Return
+            End If
+            Dim hits As Array Of StudioFindHit = []
+            If Me.TodoMode Then
+                hits = StudioRegexHits(StudioSearchCommentMask(doc.Text), "\\b(?:TODO|FIXME)\\b[^\\r\\n]*", True, False, True, False)
+            Else
+                hits = options.Hits(doc.Text, False)
+                If Me.ReplacementError = "" Then
+                    Try
+                        hits = options.Hits(doc.Text, True)
+                    Catch e As InvalidArgumentException
+                        Me.ReplacementError = e.Message
+                    End Try
+                End If
+            End If
+            If Array.Count(Me.Results) + Array.Count(hits) > 100000 Then Throw New InvalidArgumentException("Search match limit exceeded; preview cannot be applied.")
+            Dim position As Integer = 0
+            Dim line As Integer = 1
+            Dim column As Integer = 1
+            Dim chars As Array Of String = String.Chars(doc.Text)
+            For Each hit As StudioFindHit In hits
+                While position < hit.Start
+                    If chars(position) = "\r" Then
+                        line += 1
+                        column = 1
+                    ElseIf chars(position) = "\n" Then
+                        ' CRLF represents a single line break.
+                        If position = 0 Then
+                            line += 1
+                        ElseIf chars(position - 1) <> "\r" Then
+                            line += 1
+                        End If
+                        column = 1
+                    Else
+                        column += 1
+                    End If
+                    position += 1
+                Wend
+                Dim entry As New StudioProjectSearchResult()
+                entry.Document = doc
+                entry.Hit = hit
+                entry.Line = line
+                entry.Column = column
+                Dim previewPieces As Array Of String = []
+                For previewIndex As Integer = hit.Start To hit.Start + Math.Min(160, hit.Length) - 1
+                    previewPieces.Append(chars(previewIndex))
+                Next
+                entry.Preview = String.Join(previewPieces, "")
+                Me.Results.Append(entry)
+            Next
+            If Me.Cursor >= Array.Count(Me.Ids) Then Me.Complete = True
+        Catch e As Exception
+            Me.ErrorMessage = e.Message
+        End Try
+    End Sub
+
+    Private Sub StepSpelling()
+        For Each word As StudioProjectSpellingHit In Me.SpellingScan.Step()
+            If Array.Count(Me.Results) >= 100000 Then Throw New InvalidArgumentException("Spelling result limit exceeded; narrow the include/exclude filters.")
+            Dim entry As New StudioProjectSearchResult()
+            entry.Document = Me.SpellingDocument
+            entry.Hit = New StudioFindHit()
+            entry.Hit.Start = word.Start
+            entry.Hit.Length = word.Length
+            entry.Line = word.Line
+            entry.Column = word.Column
+            entry.Preview = word.Word + " · " + word.Context
+            entry.Selected = False
+            Me.Results.Append(entry)
+        Next
+        If Me.SpellingScan.Complete Then
+            Me.LimitedSpellingLines += Me.SpellingScan.LimitedLines
+            Me.SpellingScan = Nil
+            Me.SpellingDocument = Nil
+            If Me.Cursor >= Array.Count(Me.Ids) Then Me.Complete = True
+        End If
+    End Sub
+
+    ''' Wrap in either direction; navigation never restarts or changes a scan.
+    Public Function MoveResult(forward As Boolean) As Integer
+        Dim count As Integer = Array.Count(Me.Results)
+        If count = 0 Then Return -1
+        If Me.SelectedResult < 0 Or Me.SelectedResult >= count Then
+            Me.SelectedResult = 0
+            If Not forward Then Me.SelectedResult = count - 1
+        ElseIf forward Then
+            Me.SelectedResult = (Me.SelectedResult + 1) Mod count
+        Else
+            Me.SelectedResult = (Me.SelectedResult + count - 1) Mod count
+        End If
+        Return Me.SelectedResult
+    End Function
+
+    Public Function Summary() As String
+        If Me.ErrorMessage <> "" Then Return Me.ErrorMessage
+        If Me.Cancelled Then Return "Cancelled · partial results; replacement disabled"
+        Dim state As String = "Searching"
+        If Me.Complete Then state = "Complete"
+        Dim summary As String = state + " · " + String.From(Me.Cursor) + "/" + String.From(Array.Count(Me.Ids)) + " files · " + String.From(Array.Count(Me.Results)) + " matches"
+        If Me.SpellingMode Then
+            summary = "Spelling · " + summary
+            If Me.LimitedSpellingLines > 0 Then summary += " · " + String.From(Me.LimitedSpellingLines) + " lines limited (long lines or 100+ issues)"
+        End If
+        If Me.ReplacementError <> "" Then summary += " · Replacement error: " + Me.ReplacementError
+        Return summary
+    End Function
+
+    Public Sub ApplySelected()
+        If Me.ReplacementError <> "" Then Throw New InvalidArgumentException("Fix the replacement and preview again: " + Me.ReplacementError)
+        If Not Me.Complete Or Me.Cancelled Or Me.ErrorMessage <> "" Or Me.TodoMode Or Me.SpellingMode Or Me.Applied Then Throw New InvalidArgumentException("Only a complete, fresh replacement preview can be applied once.")
+        Dim transactionHost As StudioProjectSearchHost = Me.Host
+        Dim requests As Array Of ProjectChangeRequest = []
+        Dim cursor As Integer = 0
+        While cursor < Array.Count(Me.Results)
+            Dim doc As StudioSearchDocument = Me.Results(cursor).Document
+            Dim chosen As Array Of StudioFindHit = []
+            While cursor < Array.Count(Me.Results)
+                Dim candidate As StudioProjectSearchResult = Me.Results(cursor)
+                If candidate.Document.Id <> doc.Id Then Exit While
+                If candidate.Selected Then chosen.Append(candidate.Hit)
+                cursor += 1
+            Wend
+            If Array.Count(chosen) = 0 Then Continue While
+            Dim current As StudioSearchDocument = transactionHost.ReadSearchItem(doc.Id)
+            If current.Version <> doc.Version Or String.Compare(current.Text, doc.Text, True) <> 0 Then Throw New InvalidArgumentException("Search preview is stale: " + doc.Path)
+            Dim replacement As String = StudioSearchReplaceHits(doc.Text, chosen)
+            requests.Append(New ProjectChangeRequest(doc.Id, doc.Version, [New EditorEdit(0, String.LenBytes(doc.Text), replacement)]))
+        Wend
+        If Array.Count(requests) = 0 Then Throw New InvalidArgumentException("Select at least one replacement.")
+        If Array.Count(requests) > 256 Then Throw New InvalidArgumentException("Atomic replacement supports at most 256 changed files; narrow search.")
+        ' Keep the receiver in an ARC-managed local across a throwing host call.
+        ' Buoy 0.72 does not release temporary property receivers on exceptions.
+        transactionHost.ApplySearchTransaction(requests)
+        Me.Applied = True
+    End Sub
+End Class
+
+''' Hit coordinates are codepoints; replacement requests use whole-file UTF-8 bytes.
+Public Function StudioSearchReplaceHits(source As String, hits As Array Of StudioFindHit) As String
+    Dim pieces As Array Of String = []
+    Dim subject As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+    Dim sourceLength As Integer = String.Len(source)
+    Dim position As Integer = 0
+    Dim bytePosition As Integer = 0
+    Dim copiedByte As Integer = 0
+    For Each hit As StudioFindHit In hits
+        If hit.Start < position Or hit.Length < 0 Or hit.Start + hit.Length > sourceLength Then Throw New InvalidArgumentException("Overlapping or invalid replacement ranges.")
+        ' Walk UTF-8 once, rather than rescanning the full prefix for every match.
+        For phase As Integer = 0 To 1
+            Dim destination As Integer = hit.Start
+            If phase = 1 Then destination += hit.Length
+            While position < destination
+                bytePosition += 1
+                While bytePosition < subject.Count
+                    If subject.Item(bytePosition) < 128 Or subject.Item(bytePosition) >= 192 Then Exit While
+                    bytePosition += 1
+                Wend
+                position += 1
+            Wend
+            If phase = 0 Then pieces.Append(String.SubstringBytes(source, copiedByte, bytePosition - copiedByte))
+        Next
+        pieces.Append(hit.Replacement)
+        copiedByte = bytePosition
+    Next
+    pieces.Append(String.SubstringBytes(source, copiedByte))
+    Return String.Join(pieces, "")
+End Function
+
+Public Interface StudioSelectionSearchHost
+    Function CaptureSearchSelection() As StudioFrozenSearchScope
+    Function ReadSearchSelectionDocument() As StudioSearchDocument
+    Sub SelectSearchRange(start As Integer, length As Integer)
+    Sub ApplySearchSelection(request As ProjectChangeRequest)
+End Interface
+
+''' Frozen half-open codepoint range; full subject preserves regex context. Changes
+''' outside this object invalidate it, even when the editor's visible selection moves.
+Public Class StudioFrozenSearchScope
+    Public Property Document As StudioSearchDocument
+    Public Property Start As Integer
+    Public Property Length As Integer
+    Public Sub Constructor(document As StudioSearchDocument, start As Integer, length As Integer)
+        If start < 0 Or length < 0 Or start + length > String.Len(document.Text) Then Throw New InvalidArgumentException("Invalid frozen selection range.")
+        Me.Document = document
+        Me.Start = start
+        Me.Length = length
+    End Sub
+    Public Sub Validate(current As StudioSearchDocument)
+        Dim expected As StudioSearchDocument = Me.Document
+        If current.Id <> expected.Id Or current.Version <> expected.Version Or String.Compare(current.Text, expected.Text, True) <> 0 Then Throw New InvalidArgumentException("Frozen selection is stale; capture the selection again.")
+    End Sub
+    Public Function Hits(current As StudioSearchDocument, options As StudioSearchOptions, expand As Boolean = True) As Array Of StudioFindHit
+        Me.Validate(current)
+        Dim hits As Array Of StudioFindHit = []
+        For Each hit As StudioFindHit In options.Hits(current.Text, expand)
+            If hit.Start >= Me.Start And hit.Start + hit.Length <= Me.Start + Me.Length Then hits.Append(hit)
+        Next
+        Return hits
+    End Function
+End Class

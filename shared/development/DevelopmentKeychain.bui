@@ -1,0 +1,118 @@
+Import processkit
+Import keychain
+Import secretstore
+Import crypto
+
+Const ExpectedDevelopmentHelperSHA256 As String = "UNCONFIGURED"
+
+Private Sub VerifyDevelopmentHelper(executable As String)
+    If ExpectedDevelopmentHelperSHA256 = "UNCONFIGURED" Then Throw New InvalidArgumentException("Install Buoy Development Services, then rebuild this development app")
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(executable), False)
+    If Not opened.IsOk Then Throw New InvalidArgumentException("Buoy Development Services is missing; run tools/build_development_services.py")
+    Dim stream As BinaryStream = opened.Value
+    Dim data As Bytes
+    Try
+        data = stream.Read(4194305)
+    Finally
+        stream.Close()
+    End Try
+    If data.Count > 4194304 Then Throw New InvalidArgumentException("Development Services executable is too large")
+    If Crypto.Hash(Crypto.HashAlgorithms.SHA256, data).ToHex() <> ExpectedDevelopmentHelperSHA256 Then Throw New InvalidArgumentException("Development Services changed; verify its installation and rebuild this development app")
+End Sub
+
+' Only copied into macOS development consumers by the builders. Production
+' consumers never import this module and cannot enable it through an environment variable.
+Private Function BrokerRequest(operation As String, service As String, account As String, value As String = "") As JSONItem
+    Dim home As String = System.EnvironmentVariable("HOME").Or("")
+    If home = "" Then Throw New InvalidArgumentException("Development Services needs a home directory")
+    Dim executable As String = home + "/Applications/Buoy Development Services.app/Contents/MacOS/BuoyDevelopmentServices"
+    VerifyDevelopmentHelper(executable)
+    Dim request As JSONItem = JSONItem.NewObject()
+    request.Value("version") = 1
+    request.Value("operation") = operation
+    request.Value("service") = service
+    request.Value("account") = account
+    If operation = "write" Then request.Value("value") = value
+    Dim payload As Bytes = Bytes.FromString(Json.Stringify(request), Text.Encodings.UTF8)
+    If payload.Count > 2097152 Then Throw New InvalidArgumentException("Development credential request is too large")
+    Dim process As New PipeProcess(executable, ["--request"])
+    Try
+        Dim sent As Integer = 0
+        Dim closed As Boolean = False
+        Dim output As New Bytes()
+        Dim errorSize As Integer = 0
+        Dim deadline As Integer = System.Microseconds() + 125000000
+        While True
+            output.Append(process.ReadOutput())
+            errorSize += process.ReadError().Count
+            If output.Count > 2097152 Or errorSize > 65536 Then Throw New InvalidArgumentException("Development Services returned an oversized response")
+            Dim running As Boolean = process.Poll()
+            If running And Not closed Then
+                If sent < payload.Count Then sent += process.WriteInput(payload, sent)
+                If sent = payload.Count Then
+                    process.CloseInput()
+                    closed = True
+                End If
+            End If
+            If Not running And process.OutputClosed And process.ErrorClosed Then Exit While
+            If System.Microseconds() > deadline Then Throw New InvalidArgumentException("Development Services timed out; check pending Keychain dialogs")
+            Thread.Sleep(1)
+        End While
+        If process.ExitCode <> 0 Then Throw New InvalidArgumentException("Development Services exited without completing the request")
+        Dim parsed As Optional Of JSONItem = Json.TryParse(output.ToString(Text.Encodings.UTF8))
+        If Not parsed.HasValue Then Throw New InvalidArgumentException("Development Services returned invalid JSON")
+        Dim response As JSONItem = parsed.Value
+        If Not response.IsObject() Then Throw New InvalidArgumentException("Development Services returned an invalid response")
+        If response.Value("version").AsNumber().Or(0.0) <> 1.0 Or Not response.Value("ok").IsBoolean() Then Throw New InvalidArgumentException("Development Services protocol mismatch")
+        If Not response.Value("ok").AsBoolean().Or(False) Then
+            Dim kind As String = response.Value("kind").AsString().Or("")
+            If kind = "keychain" Then
+                Dim status As Integer = response.Value("status").AsNumber().Or(-1.0)
+                Throw New KeychainException(operation, status)
+            End If
+            If kind = "client-not-approved" Then Throw New InvalidArgumentException("Open Buoy Development Services and approve this development app's installed location")
+            Throw New InvalidArgumentException("Development Services rejected the credential operation")
+        End If
+        Return response
+    Finally
+        process.Close()
+    End Try
+End Function
+
+Public Class DevelopmentKeychainStore
+    Private Property Service As String
+    Public Sub Constructor(service As String)
+        Me.Service = service
+    End Sub
+    Public Function GetPassword(account As String) As Optional Of String
+        Dim response As JSONItem = BrokerRequest("read", Me.Service, account)
+        If Not response.Value("found").IsBoolean() Then Throw New InvalidArgumentException("Development Services returned an invalid read response")
+        If Not response.Value("found").AsBoolean().Or(False) Then Return None
+        If Not response.Value("value").IsString() Then Throw New InvalidArgumentException("Development Services returned an invalid credential")
+        Return Some(response.Value("value").AsString().Or(""))
+    End Function
+    Public Sub SetPassword(account As String, password As String, label As String = "")
+        BrokerRequest("write", Me.Service, account, password)
+    End Sub
+    Public Function DeletePassword(account As String) As Boolean
+        Dim response As JSONItem = BrokerRequest("delete", Me.Service, account)
+        If Not response.Value("removed").IsBoolean() Then Throw New InvalidArgumentException("Development Services returned an invalid delete response")
+        Return response.Value("removed").AsBoolean().Or(False)
+    End Function
+End Class
+
+Public Class DevelopmentSecretRecordItems Implements SecretRecordItems
+    Private Property Store As DevelopmentKeychainStore
+    Public Sub Constructor(service As String)
+        Me.Store = New DevelopmentKeychainStore(service)
+    End Sub
+    Public Function Read(account As String) As Optional Of String
+        Return Me.Store.GetPassword(account)
+    End Function
+    Public Sub Write(account As String, value As String)
+        Me.Store.SetPassword(account, value)
+    End Sub
+    Public Sub Remove(account As String)
+        Me.Store.DeletePassword(account)
+    End Sub
+End Class

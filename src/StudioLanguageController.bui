@@ -1,0 +1,546 @@
+Import StudioLanguageServer
+
+''' Host owns buffers. RevisionToken must cover all buffer and disk snapshot changes.
+''' ApplyLanguageEdits must validate the token and every range, reject overlapping edits,
+''' and apply all edits atomically in memory (one undo operation); never save files here.
+Public Interface StudioLanguageHost
+    Function LanguageBuffer() As StudioLanguageBuffer
+    Function LanguageRevisionToken() As String
+    Function ApplyLanguageEdits(edits As Array Of StudioLanguageLocation, expectedToken As String) As Boolean
+    Sub OpenLanguageLocation(location As StudioLanguageLocation)
+    Sub PublishLanguageDiagnostics(answer As StudioLanguageResult)
+    Sub LanguageStatus(message As String)
+End Interface
+
+''' Optional host extension (discovered with TryCast): completion and signature help
+''' are presented inline at the caret instead of in the results window. A scratch path
+''' lets unsaved buffers be analysed; it is never written to disk.
+Public Interface StudioLanguageInlineHost
+    Sub ShowLanguageCompletions(choices As Array Of StudioLanguageChoice, automatic As Boolean)
+    Sub ShowLanguageSignature(label As String)
+    Function LanguageScratchPath() As String
+End Interface
+
+Public Class StudioLanguageBuffer
+    Public Property Path As String
+    Public Property Text As String
+    Public Property Revision As Integer
+    Public Property Line As Integer
+    Public Property Column As Integer
+    Public Property EndLine As Integer
+    Public Property EndColumn As Integer
+End Class
+
+Public Class StudioLanguageChoice
+    Public Property Title As String
+    Public Property Detail As String
+    Public Property Location As StudioLanguageLocation
+    Public Property Edits As Array Of StudioLanguageLocation = []
+    ' Completion only: LSP CompletionItemKind and the plain text to type ("" when the
+    ' item also needs additional edits elsewhere, which inline insertion cannot apply).
+    Public Property Kind As Integer
+    Public Property InsertText As String
+End Class
+
+Private Function StudioLanguageLineText(text As String, line As Integer) As String
+    Dim lines As Array Of String = String.Split(text, "\n")
+    If line < 0 Or line >= Array.Count(lines) Then Return ""
+    Return lines(line)
+End Function
+
+Private Function StudioLanguageIsWordChar(ch As String) As Boolean
+    If ch = "" Then Return False
+    Return String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", ch, True)
+End Function
+
+' Column where the identifier ending at `column` starts.
+Private Function StudioLanguagePrefixColumn(text As String, line As Integer, column As Integer) As Integer
+    Dim lineText As String = StudioLanguageLineText(text, line)
+    Dim start As Integer = column
+    While start > 0
+        If Not StudioLanguageIsWordChar(String.Mid(lineText, start, 1)) Then Exit While
+        start -= 1
+    End While
+    Return start
+End Function
+
+''' One instance per Studio window; no import of main or editor is needed.
+Public Class StudioLanguageController Implements StudioLanguageServerListener, StudioLanguageFeatureListener
+    Public Property Host As StudioLanguageHost
+    Public Property Server As StudioLanguageServer
+    Public Property View As StudioLanguageWindow
+    Public Property Choices As Array Of StudioLanguageChoice = []
+    Public Property Diagnostics As Map Of String, StudioLanguageResult = New Map Of String, StudioLanguageResult()
+    Public Property PresentResults As Boolean = True
+    Public Property LastMessage As String
+    Public Property Pending As Integer = 0
+    Public Property ActiveKind As String
+    Private Property Link As StudioLanguageServerLink = New StudioLanguageServerLink()
+    Private Property Snapshot As StudioLanguageBuffer
+    Private Property Token As String
+    Private Property AutomaticRequest As Boolean = False
+    ' Path sent to the server: the buffer's file, or the host scratch path when unsaved.
+    Private Property RequestPath As String
+
+    Public Sub Attach(host As StudioLanguageHost, projectRoot As String)
+        Me.Stop()
+        Me.Host = host
+        Me.Link.Listener = Me
+        Me.Server = New StudioLanguageServer(projectRoot)
+        Me.Server.Link = Me.Link
+        Me.Server.Start()
+        Me.Sync()
+    End Sub
+
+    Public Sub Sync()
+        If Me.Host = Nil Or Me.Server = Nil Then Return
+        Dim buffer As StudioLanguageBuffer = Me.Host.LanguageBuffer()
+        If buffer = Nil Then Return
+        If Me.Snapshot <> Nil Then
+            If Not Me.Current() And Not Me.StillTyping() Then
+                If Me.Pending > 0 Then Me.ReleaseScratch()
+                If Me.Pending > 0 Then Me.Server.Cancel(Me.Pending)
+                Me.Pending = 0
+                Me.Choices = []
+                If Me.View <> Nil Then Me.View.Visible = False
+            End If
+        End If
+        If buffer.Path <> "" Then Me.Server.Sync(buffer.Path, buffer.Text)
+    End Sub
+
+    ' Synchronize every dirty buffer, including inactive tabs, before issuing requests.
+    Public Sub SyncBuffer(localPath As String, content As String)
+        If Me.Server <> Nil And localPath <> "" Then Me.Server.Sync(localPath, content)
+    End Sub
+
+    ''' A file Studio renamed or moved: close the old document, open it at the new path.
+    Public Sub Renamed(oldPath As String, newPath As String, content As String)
+        If Me.Server = Nil Then Return
+        If oldPath <> "" Then Me.Server.Close(oldPath)
+        If newPath <> "" Then Me.Server.Sync(newPath, content)
+    End Sub
+
+    ' Editor text-input callback: request active help after call punctuation.
+    Public Sub Typed(text As String)
+        If text = "(" Or text = "," Then Me.Command("signature")
+        If text = "." Then Me.Command("completion")
+    End Sub
+
+    Public Sub Poll()
+        Me.Sync()
+        If Me.Server <> Nil Then Me.Server.Poll()
+    End Sub
+
+    Public Sub Stop()
+        Me.Pending = 0
+        If Me.Server <> Nil Then Me.Server.Stop()
+        Me.Server = Nil
+        Me.Host = Nil
+        Me.Diagnostics = New Map Of String, StudioLanguageResult()
+        Me.Snapshot = Nil
+        Me.Choices = []
+        If Me.View <> Nil Then Me.View.Visible = False
+    End Sub
+
+    ''' Inline completion stays valid while the user keeps typing the same identifier on
+    ''' the request line: the editor popup filters the reply by what was typed since.
+    Private Function StillTyping() As Boolean
+        If Me.ActiveKind <> "completion" Or Me.Host = Nil Or Me.Snapshot = Nil Then Return False
+        Dim inlineHost As StudioLanguageInlineHost = TryCast(Me.Host, StudioLanguageInlineHost)
+        If inlineHost = Nil Then Return False
+        Dim buffer As StudioLanguageBuffer = Me.Host.LanguageBuffer()
+        If buffer = Nil Then Return False
+        If String.Compare(buffer.Path, Me.Snapshot.Path, True) <> 0 Then Return False
+        If buffer.Line <> Me.Snapshot.Line Or buffer.EndLine <> buffer.Line Or buffer.EndColumn <> buffer.Column Or buffer.Column < Me.Snapshot.Column Then Return False
+        Dim before As String = StudioLanguageLineText(Me.Snapshot.Text, Me.Snapshot.Line)
+        Dim now As String = StudioLanguageLineText(buffer.Text, buffer.Line)
+        If String.Compare(String.Left(now, Me.Snapshot.Column), String.Left(before, Me.Snapshot.Column), True) <> 0 Then Return False
+        For Each ch As String In String.Chars(String.Mid(now, Me.Snapshot.Column + 1, buffer.Column - Me.Snapshot.Column))
+            If Not StudioLanguageIsWordChar(ch) Then Return False
+        Next
+        Return True
+    End Function
+
+    ' The scratch document of an unsaved buffer lives on the server for one request only,
+    ' so it never shadows the saved file or shows up in references and symbols.
+    Private Sub ReleaseScratch()
+        If Me.Snapshot = Nil Or Me.Server = Nil Then Return
+        If Me.Snapshot.Path = "" And Me.RequestPath <> "" Then Me.Server.Close(Me.RequestPath)
+    End Sub
+
+    Private Function Current() As Boolean
+        If Me.Host = Nil Or Me.Snapshot = Nil Then Return False
+        Dim buffer As StudioLanguageBuffer = Me.Host.LanguageBuffer()
+        If buffer = Nil Then Return False
+        Return String.Compare(buffer.Path, Me.Snapshot.Path, True) = 0 And buffer.Revision = Me.Snapshot.Revision And String.Compare(buffer.Text, Me.Snapshot.Text, True) = 0 And buffer.Line = Me.Snapshot.Line And buffer.Column = Me.Snapshot.Column And buffer.EndLine = Me.Snapshot.EndLine And buffer.EndColumn = Me.Snapshot.EndColumn And String.Compare(Me.Host.LanguageRevisionToken(), Me.Token, True) = 0
+    End Function
+
+    Public Sub Status(message As String)
+        Me.LastMessage = message
+        If Me.Host <> Nil Then Me.Host.LanguageStatus(message)
+    End Sub
+
+    ''' Explicit commands; query is the workspace search string or new rename spelling.
+    Public Sub Command(kind As String, query As String = "", automatic As Boolean = False)
+        If Me.Host = Nil Or Me.Server = Nil Then Return
+        ' Typing on: keep the in-flight completion rather than restarting it per key.
+        If automatic And kind = "completion" And Me.Pending > 0 And Me.StillTyping() Then Return
+        Me.Sync()
+        If Me.Pending > 0 Then Me.ReleaseScratch()
+        If Me.Pending > 0 Then Me.Server.Cancel(Me.Pending)
+        Me.Pending = 0
+        Me.Choices = []
+        If Me.View <> Nil Then Me.View.Visible = False
+        Dim source As StudioLanguageBuffer = Me.Host.LanguageBuffer()
+        If source = Nil Then Return
+        Dim requestPath As String = source.Path
+        If requestPath = "" And (kind = "completion" Or kind = "signature") Then
+            Dim inlineHost As StudioLanguageInlineHost = TryCast(Me.Host, StudioLanguageInlineHost)
+            If inlineHost <> Nil Then requestPath = inlineHost.LanguageScratchPath()
+        End If
+        If requestPath = "" And kind <> "workspaceSymbols" Then
+            If Not automatic Then Me.Status("Save this buffer before requesting language services.")
+            Return
+        End If
+        Me.RequestPath = requestPath
+        ' Copy values: a host may reuse its mutable snapshot object.
+        Me.Snapshot = New StudioLanguageBuffer()
+        Me.Snapshot.Path = source.Path
+        Me.Snapshot.Text = source.Text
+        Me.Snapshot.Revision = source.Revision
+        Me.Snapshot.Line = source.Line
+        Me.Snapshot.Column = source.Column
+        Me.Snapshot.EndLine = source.EndLine
+        Me.Snapshot.EndColumn = source.EndColumn
+        Me.Token = Me.Host.LanguageRevisionToken()
+        Me.ActiveKind = kind
+        Me.AutomaticRequest = automatic
+        Select Case kind
+            Case "definition"
+                Me.Pending = Me.Server.RequestDefinition(source.Path, source.Text, source.Line, source.Column)
+            Case "references"
+                Me.Pending = Me.Server.RequestReferences(source.Path, source.Text, source.Line, source.Column)
+            Case "hover"
+                Me.Pending = Me.Server.RequestHover(source.Path, source.Text, source.Line, source.Column)
+            Case "symbols"
+                Me.Pending = Me.Server.RequestDocumentSymbols(source.Path, source.Text)
+            Case "rename"
+                If String.Trim(query) = "" Then
+                    Me.Status("Enter a new symbol name before renaming.")
+                    Return
+                End If
+                Me.Pending = Me.Server.RequestRename(source.Path, source.Text, source.Line, source.Column, query)
+            Case Else
+                Me.Pending = Me.Server.RequestFeature(kind, requestPath, source.Text, source.Line, source.Column, source.EndLine, source.EndColumn, query)
+        End Select
+        If Me.Pending = 0 Then Me.Status(Me.Server.LastError)
+    End Sub
+
+    Public Sub LanguageServerStateChanged(state As String, message As String)
+        If message <> "" Then Me.Status(message)
+    End Sub
+    Public Sub DefinitionReady(answer As StudioLanguageResult)
+        Me.Receive(answer)
+    End Sub
+    Public Sub ReferencesReady(answer As StudioLanguageResult)
+        Me.Receive(answer)
+    End Sub
+    Public Sub HoverReady(answer As StudioLanguageResult)
+        Me.Receive(answer)
+    End Sub
+    Public Sub DocumentSymbolsReady(answer As StudioLanguageResult)
+        Me.Receive(answer)
+    End Sub
+    Public Sub RenameReady(answer As StudioLanguageResult)
+        Me.Receive(answer)
+    End Sub
+    Public Sub LanguageFeatureReady(answer As StudioLanguageResult)
+        Me.Receive(answer)
+    End Sub
+    Public Sub LanguageDiagnosticsReady(answer As StudioLanguageResult)
+        Me.Diagnostics.Set(answer.Path, answer)
+        If Me.Host <> Nil Then Me.Host.PublishLanguageDiagnostics(answer)
+    End Sub
+
+    Private Sub AddText(title As String, detail As String)
+        Dim choice As New StudioLanguageChoice()
+        choice.Title = title
+        choice.Detail = detail
+        Me.Choices.Append(choice)
+    End Sub
+
+    Public Sub Receive(answer As StudioLanguageResult)
+        If answer.RequestId <> Me.Pending Or Me.Pending = 0 Then Return
+        Me.ReleaseScratch()
+        If Not Me.Current() And Not Me.StillTyping() Then Return
+        Me.Pending = 0
+        If answer.Error <> "" Then
+            If Not Me.AutomaticRequest Then Me.Status(answer.Error)
+            Return
+        End If
+        Dim activeSignature As String = ""
+        Select Case answer.Kind
+            Case "completion"
+                Me.ReadCompletions(answer.Raw)
+            Case "signature"
+                If answer.Raw.IsObject() Then
+                Dim signatures As JSONItem = answer.Raw.Value("signatures")
+                If signatures.IsArray() Then
+                Dim active As Integer = answer.Raw.Value("activeSignature").AsNumber().Or(0)
+                For i As Integer = 0 To signatures.Count() - 1
+                    Dim signature As JSONItem = signatures.ValueAt(i)
+                    Dim prefix As String = ""
+                    If i = active Then prefix = "Active: "
+                    If i = active Or activeSignature = "" Then activeSignature = signature.Value("label").AsString().Or("")
+                    Dim parameter As Integer = signature.Value("activeParameter").AsNumber().Or(answer.Raw.Value("activeParameter").AsNumber().Or(0))
+                    Me.AddText(prefix + signature.Value("label").AsString().Or(""), "Parameter " + String.From(parameter + 1) + "\n" + Me.Documentation(signature.Value("documentation")))
+                Next
+                End If
+                End If
+            Case "quickfix"
+                Me.ReadActions(answer.Raw)
+            Case "hover"
+                If answer.Hover <> "" Then Me.AddText(answer.HoverSignature, answer.Hover)
+            Case "format", "formatSelection", "rename"
+                If Array.Count(answer.Locations) > 0 Then
+                    Dim choice As New StudioLanguageChoice()
+                    choice.Title = "Apply " + answer.Kind + " (" + String.From(Array.Count(answer.Locations)) + " edits)"
+                    choice.Edits = answer.Locations
+                    For Each edit As StudioLanguageLocation In choice.Edits
+                        choice.Detail += edit.Path + ":" + String.From(edit.Line + 1) + ":" + String.From(edit.Column + 1) + " → " + edit.NewText + "\n"
+                    Next
+                    Me.Choices.Append(choice)
+                End If
+            Case Else
+                For Each location As StudioLanguageLocation In answer.Locations
+                    Dim choice As New StudioLanguageChoice()
+                    choice.Location = location
+                    choice.Title = location.Name
+                    If choice.Title = "" Then choice.Title = location.Path
+                    choice.Detail = location.Detail + "\n" + location.Path + ":" + String.From(location.Line + 1) + ":" + String.From(location.Column + 1)
+                    Me.Choices.Append(choice)
+                Next
+        End Select
+        Dim inlineHost As StudioLanguageInlineHost = TryCast(Me.Host, StudioLanguageInlineHost)
+        Dim needsResults As Boolean = False
+        If answer.Kind = "completion" Then
+            For Each choice As StudioLanguageChoice In Me.Choices
+                If choice.InsertText = "" And Array.Count(choice.Edits) > 0 Then needsResults = True
+            Next
+        End If
+        If inlineHost <> Nil And Not needsResults And (answer.Kind = "completion" Or answer.Kind = "signature") Then
+            If answer.Kind = "completion" Then
+                inlineHost.ShowLanguageCompletions(Me.Choices, Me.AutomaticRequest)
+            Else
+                inlineHost.ShowLanguageSignature(activeSignature)
+            End If
+            If Array.Count(Me.Choices) = 0 And Not Me.AutomaticRequest Then Me.Status("No " + answer.Kind + " results.")
+            Me.Choices = []
+            Return
+        End If
+        If Array.Count(Me.Choices) = 0 Then
+            Me.Status("No " + answer.Kind + " results.")
+            Return
+        End If
+        Me.Status(String.From(Array.Count(Me.Choices)) + " " + answer.Kind + " results; select and Accept.")
+        If Not Me.PresentResults Then Return
+        If Me.View = Nil Then Me.View = New StudioLanguageWindow(Me)
+        Me.View.Render()
+        Me.View.Show()
+        ' Typing help must return focus to the source window so typing can continue.
+        If Me.AutomaticRequest Then
+            Dim sourceWindow As Window = TryCast(Me.Host, Window)
+            If sourceWindow <> Nil Then sourceWindow.Focus()
+        End If
+    End Sub
+
+    Private Function Documentation(value As JSONItem) As String
+        If value.IsString() Then Return value.AsString().Or("")
+        Return value.Value("value").AsString().Or("")
+    End Function
+
+    Private Sub ReadCompletions(raw As JSONItem)
+        Dim items As JSONItem = raw
+        If raw.IsObject() Then items = raw.Value("items")
+        If Not items.IsArray() Then Return
+        For i As Integer = 0 To items.Count() - 1
+            Dim item As JSONItem = items.ValueAt(i)
+            ' No snippet or command execution support advertised. Never insert snippet syntax.
+            If item.Value("insertTextFormat").AsNumber().Or(1) <> 1 Or item.HasKey("command") Then Continue For
+            Dim choice As New StudioLanguageChoice()
+            choice.Title = item.Value("label").AsString().Or("")
+            ' Compiler-generated property storage is not something to type.
+            If choice.Title = "" Or String.EndsWith(choice.Title, "$backing") Then Continue For
+            choice.Kind = item.Value("kind").AsNumber().Or(0)
+            choice.Detail = item.Value("detail").AsString().Or("") + "\n" + Me.Documentation(item.Value("documentation"))
+            Dim edit As JSONItem = item.Value("textEdit")
+            If item.HasKey("textEdit") Then
+                If Not edit.IsObject() Or Not edit.Value("range").IsObject() Then Continue For
+                Dim edits As JSONItem = JSONItem.NewArray()
+                edits.Add(edit)
+                Dim decoded As StudioLanguageResult = Me.Server.DecodeTextEdits(Me.RequestPath, edits)
+                If decoded.Error <> "" Then Continue For
+                choice.Edits = decoded.Locations
+                ' Inline insertion replaces the identifier before the caret; use the edit
+                ' text only when the server's range is exactly that span.
+                If Array.Count(decoded.Locations) = 1 Then
+                    Dim span As StudioLanguageLocation = decoded.Locations(0)
+                    If span.Line = Me.Snapshot.Line And span.EndLine = span.Line And span.EndColumn = Me.Snapshot.Column And span.Column = StudioLanguagePrefixColumn(Me.Snapshot.Text, Me.Snapshot.Line, Me.Snapshot.Column) Then choice.InsertText = span.NewText
+                End If
+            Else
+                Dim location As New StudioLanguageLocation()
+                location.Path = Me.Snapshot.Path
+                location.Line = Me.Snapshot.Line
+                location.EndLine = location.Line
+                location.Column = Me.Snapshot.Column
+                location.EndColumn = location.Column
+                ' Replace the typed identifier prefix for plain insertion completions.
+                Dim lines As Array Of String = String.Split(Me.Snapshot.Text, "\n")
+                If location.Line >= 0 And location.Line < Array.Count(lines) Then
+                    Dim text As String = lines(location.Line)
+                    While location.Column > 0
+                        Dim ch As String = String.Mid(text, location.Column, 1)
+                        If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", ch, True) Or ch = "" Then Exit While
+                        location.Column -= 1
+                    End While
+                End If
+                location.NewText = item.Value("insertText").AsString().Or(choice.Title)
+                choice.InsertText = location.NewText
+                choice.Edits.Append(location)
+            End If
+            If item.HasKey("additionalTextEdits") Then
+                Dim extra As StudioLanguageResult = Me.Server.DecodeTextEdits(Me.RequestPath, item.Value("additionalTextEdits"))
+                If extra.Error <> "" Then Continue For
+                If Array.Count(extra.Locations) > 0 Then choice.InsertText = ""
+                For Each location As StudioLanguageLocation In extra.Locations
+                    choice.Edits.Append(location)
+                Next
+            End If
+            Me.Choices.Append(choice)
+        Next
+    End Sub
+
+    Private Sub ReadActions(items As JSONItem)
+        For i As Integer = 0 To items.Count() - 1
+            Dim item As JSONItem = items.ValueAt(i)
+            If item.HasKey("disabled") Or item.HasKey("command") Then Continue For
+            If Not item.Value("edit").IsObject() Then Continue For
+            Dim decoded As StudioLanguageResult = Me.Server.DecodeWorkspaceEdit(item.Value("edit"))
+            If decoded.Error <> "" Then
+                Me.Status(decoded.Error)
+                Continue For
+            End If
+            If Array.Count(decoded.Locations) = 0 Then Continue For
+            Dim choice As New StudioLanguageChoice()
+            choice.Title = item.Value("title").AsString().Or("Quick fix")
+            choice.Edits = decoded.Locations
+            For Each edit As StudioLanguageLocation In choice.Edits
+                choice.Detail += edit.Path + ":" + String.From(edit.Line + 1) + " → " + edit.NewText + "\n"
+            Next
+            Me.Choices.Append(choice)
+        Next
+    End Sub
+
+    Public Function Accept(index As Integer) As Boolean
+        If index < 0 Or index >= Array.Count(Me.Choices) Then Return False
+        If Not Me.Current() Then
+            Me.Status("Language result expired; request it again.")
+            If Me.View <> Nil Then Me.View.Visible = False
+            Return False
+        End If
+        Dim choice As StudioLanguageChoice = Me.Choices(index)
+        If Array.Count(choice.Edits) > 0 Then
+            If Not Me.Host.ApplyLanguageEdits(choice.Edits, Me.Token) Then
+                Me.Status("Workspace changed or edits were rejected; nothing applied.")
+                Return False
+            End If
+            Me.Status("Applied " + String.From(Array.Count(choice.Edits)) + " edits.")
+        ElseIf choice.Location <> Nil Then
+            If choice.Location.Path = "" Then
+                Me.Status("The server returned a non-file location.")
+                Return False
+            End If
+            Me.Host.OpenLanguageLocation(choice.Location)
+        End If
+        Me.Choices = []
+        If Me.View <> Nil Then Me.View.Visible = False
+        Return True
+    End Function
+End Class
+
+Public Class StudioLanguageRows Inherits ListBoxDataSource
+    Public Property Owner As Weak StudioLanguageController
+    Public Overrides Function RowCount() As Integer
+        Return Array.Count(Me.Owner.Choices)
+    End Function
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        Dim label As New Label()
+        label.Move(6, 2, 650, 22)
+        cell.AddSubview(label)
+    End Sub
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        If row < 0 Or row >= Array.Count(Me.Owner.Choices) Or cell.SubviewCount() = 0 Then Return
+        Dim label As Label = TryCast(cell.Subview(0), Label)
+        If label <> Nil Then label.Text = Me.Owner.Choices(row).Title
+    End Sub
+End Class
+
+Public Class StudioLanguageList Inherits ListBox
+    Public Property Owner As Weak StudioLanguageWindow
+    Handle SelectionChanged()
+        Dim owner As StudioLanguageWindow = Me.Owner
+        If owner <> Nil Then owner.SelectionChanged()
+    End Handle
+End Class
+
+Public Class StudioLanguageAccept Inherits Button
+    Public Property Owner As Weak StudioLanguageWindow
+    Handle Action()
+        Dim owner As StudioLanguageWindow = Me.Owner
+        If owner <> Nil Then owner.AcceptSelection()
+    End Handle
+End Class
+
+Public Class StudioLanguageWindow Inherits Window
+    Public Property Controller As Weak StudioLanguageController
+    Public Property Results As StudioLanguageList = New StudioLanguageList()
+    Public Property Details As TextArea = New TextArea()
+    Public Property AcceptButton As StudioLanguageAccept = New StudioLanguageAccept()
+    Private Property Rows As StudioLanguageRows = New StudioLanguageRows()
+    Public Sub Constructor(controller As StudioLanguageController)
+        Super.Constructor()
+        Me.Controller = controller
+        Me.Title = "Buoy Language Services"
+        Me.Move(180, 160, 720, 520)
+        Me.Results.Owner = Me
+        Me.Rows.Owner = controller
+        Me.Results.DataSource = Me.Rows
+        Me.Results.AddColumn("Select a result", 680.0)
+        Me.Results.Move(16, 16, 688, 244)
+        Me.Details.IsReadOnly = True
+        Me.Details.Move(16, 272, 688, 184)
+        Me.AcceptButton.Owner = Me
+        Me.AcceptButton.Caption = "Accept Selected"
+        Me.AcceptButton.Move(16, 470, 180, 32)
+        Me.AddSubview(Me.Results)
+        Me.AddSubview(Me.Details)
+        Me.AddSubview(Me.AcceptButton)
+    End Sub
+    Public Sub Render()
+        Me.Title = "Buoy — " + Me.Controller.ActiveKind
+        Me.Results.ReloadData()
+        Me.Results.SelectedRow = -1
+        Me.Details.Text = "Select a result to inspect it, then Accept Selected."
+    End Sub
+    Public Sub SelectionChanged()
+        Dim index As Integer = Me.Results.SelectedRow
+        If index >= 0 And index < Array.Count(Me.Controller.Choices) Then Me.Details.Text = Me.Controller.Choices(index).Detail
+    End Sub
+    Public Sub AcceptSelection()
+        Me.Controller.Accept(Me.Results.SelectedRow)
+    End Sub
+    Handle Closing() As Boolean
+        Me.Visible = False
+        Return True
+    End Handle
+End Class

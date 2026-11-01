@@ -1,0 +1,580 @@
+Import projectkit
+
+' Project source inventory is deliberately independent of the selected document.
+' Every .bui file below the chosen root is included (also vendor/generated source).
+' Only VCS private databases and Studio's .buoy cache are non-source stores.
+' Symlinks/reparse points are refused instead of silently following or skipping them.
+#If TargetWindows Then
+    Private Declare Function SPAttributes Lib "kernel32" Alias "GetFileAttributesW" (name As Ptr) As UInt32
+    Private Declare Function SPOpenDirectory Lib "kernel32" Alias "CreateFileW" (name As Ptr, access As UInt32, share As UInt32, security As Ptr, creation As UInt32, attributes As UInt32, templateFile As Ptr) As Ptr
+    Private Declare Function SPCloseDirectory Lib "kernel32" Alias "CloseHandle" (handle As Ptr) As Int32
+#ElseIf TargetMac Then
+    Private Declare Function SPReadLink Lib "c" Alias "readlink" (name As String, buffer As Ptr, count As UInt64) As Int64
+    Private Declare Function SPOpenDirectory Lib "c" Alias "opendir" (name As String) As Ptr
+    Private Declare Function SPCloseDirectory Lib "c" Alias "closedir" (handle As Ptr) As Int32
+#Else
+    Private Declare Function SPReadLink Lib "c" Alias "readlink" (name As String, buffer As Ptr, count As UInt64) As Int64
+    Private Declare Function SPOpenDirectory Lib "c" Alias "opendir" (name As String) As Ptr
+    Private Declare Function SPCloseDirectory Lib "c" Alias "closedir" (handle As Ptr) As Int32
+#End If
+
+Private Function SPExact(left As String, right As String) As Boolean
+    Return String.Compare(left, right, True) = 0
+End Function
+
+Private Function SPWorkspaceText(content As String) As String
+    Dim text As String = String.Replace(String.Replace(content, "\r\n", "\n", True), "\r", "\n", True)
+    If String.StartsWith(text, String.Chr(65279), True) Then text = String.Substring(text, 1)
+    Return text
+End Function
+
+Private Function SPIdentity(filePath As String) As String
+    Dim first As Integer = 17
+    Dim second As Integer = 29
+    For Each character As String In String.Chars(filePath)
+        first = (first * 131 + String.Asc(character)) Mod 2147483647
+        second = (second * 257 + String.Asc(character)) Mod 2147483629
+    Next
+    Return String.From(first) + "-" + String.From(second)
+End Function
+
+''' Project documents Studio opens and keeps references in (rename/move rewrites links).
+Private Function SPDocument(name As String) As Boolean
+    Dim lower As String = String.LCase(name)
+    For Each suffix As String In [".md", ".json", ".txt", ".html", ".htm", ".css", ".yml", ".yaml", ".toml"]
+        If String.EndsWith(lower, suffix) Then Return True
+    Next
+    Return False
+End Function
+
+Private Function SPSource(name As String) As Boolean
+    Return String.EndsWith(String.LCase(name), ".bui")
+End Function
+
+Private Function SPReadSource(file As FileSystemItem) As String
+    Dim length As Integer = file.Length()
+    If length < 0 Or length > 8388608 Then Throw New InvalidArgumentException("Unreadable source or source exceeds 8 MiB: " + file.FullPath())
+    Dim read As Result Of String, String = file.ReadAllText()
+    If read.IsErr Then Throw New InvalidArgumentException(read.Error)
+    ' BUI-003: native String conversions cannot faithfully retain embedded NUL.
+    ' Reject lossy/truncated reads rather than proving closure over altered bytes.
+    If Bytes.FromString(read.Value, Text.Encodings.UTF8).Count <> length Or file.Length() <> length Then Throw New InvalidArgumentException("Source changed during read or cannot be represented losslessly as UTF-8: " + file.FullPath())
+    Return read.Value
+End Function
+
+Private Sub SPCheckLocation(item As FileSystemItem)
+    #If TargetWindows Then
+        Dim attributes As UInt32 = SPAttributes(item.Handle)
+        If attributes = &hffffffff Then Throw New InvalidArgumentException("Cannot inspect project path: " + item.FullPath())
+        If (attributes And &h400) <> 0 Then Throw New InvalidArgumentException("Project symlink/reparse point is not supported: " + item.FullPath())
+    #Else
+        Dim buffer As New Bytes()
+        buffer.Append(0)
+        If SPReadLink(item.FullPath(), buffer.DataPtr(), 1) >= 0 Then Throw New InvalidArgumentException("Project symlink is not supported: " + item.FullPath())
+        If Not item.Exists() Then Throw New InvalidArgumentException("Missing project path: " + item.FullPath())
+    #End If
+End Sub
+
+Private Sub SPCheckDirectory(item As FileSystemItem)
+    SPCheckLocation(item)
+    If Not item.IsFolder() Then Throw New InvalidArgumentException("Not a project directory: " + item.FullPath())
+    #If TargetWindows Then
+        Dim handle As Ptr = SPOpenDirectory(item.Handle, 1, 7, Nil, 3, &h2000000, Nil)
+        If handle = CType(-1, Ptr) Or handle = Nil Then Throw New InvalidArgumentException("Cannot enumerate project directory: " + item.FullPath())
+    #Else
+        Dim handle As Ptr = SPOpenDirectory(item.FullPath())
+        If handle = Nil Then Throw New InvalidArgumentException("Cannot enumerate project directory: " + item.FullPath())
+    #End If
+    SPCloseDirectory(handle)
+End Sub
+
+Private Function SPRoot(value As String) As String
+    For Each character As String In String.Chars(value)
+        Dim code As Integer = String.Asc(character)
+        If code < 32 Or code = 127 Then Throw New InvalidArgumentException("Control character in project path")
+    Next
+    Dim normalized As String = String.Replace(value, "\\", "/", True)
+    If normalized = "" Or String.Contains(normalized, "://") Then Throw New InvalidArgumentException("Choose an absolute local project directory")
+    #If TargetWindows Then
+        If String.Len(normalized) < 3 Then Throw New InvalidArgumentException("Choose an absolute project directory")
+        If String.Mid(normalized, 2, 2) <> ":/" Then Throw New InvalidArgumentException("Only absolute local drive project paths are supported")
+    #Else
+        If Not String.StartsWith(normalized, "/") Then Throw New InvalidArgumentException("Choose an absolute project directory")
+    #End If
+    Dim minimumRootLength As Integer = 1
+    #If TargetWindows Then
+        minimumRootLength = 3
+    #End If
+    While String.EndsWith(normalized, "/") And String.Len(normalized) > minimumRootLength
+        normalized = String.Left(normalized, String.Len(normalized) - 1)
+    End While
+    Dim components As Array Of String = String.Split(normalized, "/")
+    For Each component As String In components
+        If component = "." Or component = ".." Then Throw New InvalidArgumentException("Project path must not contain . or ..")
+    Next
+    ' Inspect ancestors too: opening /safe/link/project must not bypass link checks.
+    Dim current As FileSystemItem = New FileSystemItem(normalized)
+    While current <> Nil
+        SPCheckLocation(current)
+        Dim parent As FileSystemItem = current.Parent
+        If parent <> Nil Then
+            If SPExact(parent.FullPath(), current.FullPath()) Then Exit While
+        End If
+        current = parent
+    End While
+    Return normalized
+End Function
+
+Private Function SPPrivateDirectory(name As String) As Boolean
+    Return SPExact(name, ".git") Or SPExact(name, ".hg") Or SPExact(name, ".svn") Or SPExact(name, ".buoy")
+End Function
+
+Private Class SPInventoryCounter
+    Public Property Visited As Integer
+End Class
+
+Private Sub SPInventory(folder As FileSystemItem, relative As String, paths As Array Of String, depth As Integer, counter As SPInventoryCounter, auxiliary As Boolean = False)
+    If depth > 64 Then Throw New InvalidArgumentException("Project directory nesting exceeds 64")
+    SPCheckDirectory(folder)
+    Dim children As Array Of FileSystemItem = folder.Children()
+    For Each child As FileSystemItem In children
+        counter.Visited += 1
+        If counter.Visited > 100000 Then Throw New InvalidArgumentException("Project inventory exceeds 100000 entries")
+        If SPPrivateDirectory(child.Name()) Then Continue For
+        SPCheckLocation(child)
+        Dim name As String = child.Name()
+        If name = "" Or String.Contains(name, "\\") Or String.Contains(name, ":") Or String.Contains(name, "/") Then Throw New InvalidArgumentException("Unsupported project file name")
+        Dim childRelative As String = name
+        If relative <> "" Then childRelative = relative + "/" + name
+        If child.IsFolder() Then
+            SPInventory(child, childRelative, paths, depth + 1, counter, auxiliary)
+        ElseIf (Not auxiliary And SPSource(name)) Or (auxiliary And SPDocument(name)) Then
+            If Not child.IsFile() Then Throw New InvalidArgumentException("Project source is not a regular file: " + child.FullPath())
+            If Array.Count(paths) >= 4096 Then Throw New InvalidArgumentException("Project exceeds 4096 source files")
+            paths.Append(childRelative)
+        End If
+    Next
+End Sub
+
+' Import recognition scans all conditional branches. It strips actual comments and
+' strings first, so a commented-out import never supplies a false dependency.
+Private Function SPImports(text As String) As Array Of String
+    Dim imports As Array Of String = []
+    Dim blockComment As Boolean = False
+    Dim quoted As Boolean = False
+    Dim escaped As Boolean = False
+    For Each line As String In String.Split(text, "\n")
+        Dim clean As String = ""
+        Dim chars As Array Of String = String.Chars(line)
+        Dim i As Integer = 0
+        While i < Array.Count(chars)
+            Dim c As String = chars(i)
+            Dim following As String = ""
+            If i + 1 < Array.Count(chars) Then following = chars(i + 1)
+            If blockComment Then
+                If c = "*" And following = "/" Then
+                    blockComment = False
+                    i += 1
+                End If
+            ElseIf quoted Then
+                clean += c
+                If escaped Then
+                    escaped = False
+                ElseIf c = "\\" Then
+                    escaped = True
+                ElseIf c = "\"" Then
+                    quoted = False
+                End If
+            ElseIf c = "'" Or (c = "/" And following = "/") Then
+                Exit While
+            ElseIf c = "/" And following = "*" Then
+                blockComment = True
+                clean += " "
+                i += 1
+            ElseIf c = "\"" Then
+                quoted = True
+                clean += c
+            Else
+                clean += c
+            End If
+            i += 1
+        End While
+        clean = String.Trim(clean)
+        If String.StartsWith(clean, "Public ", False) Then clean = String.Trim(String.Mid(clean, 7))
+        If String.StartsWith(clean, "Import ", False) Then
+            Dim token As String = String.Trim(String.Mid(clean, 7))
+            If String.StartsWith(token, "\"") Then
+                Dim closeQuote As Integer = String.IndexOf(token, "\"", 1)
+                If closeQuote < 0 Then Throw New InvalidArgumentException("Unterminated import path")
+                imports.Append(String.Left(token, closeQuote + 1))
+                Continue For
+            End If
+        End If
+        Dim words As Array Of String = String.Split(String.Replace(clean, "\t", " ", True), " ")
+        If Array.Count(words) < 2 Then Continue For
+        If words(0) <> "Import" Then Continue For
+        Dim imported As String = ""
+        For j As Integer = 1 To Array.Count(words) - 1
+            If words(j) <> "" Then
+                imported = words(j)
+                Exit For
+            End If
+        Next
+        Dim selective As Integer = String.IndexOf(imported, ".{")
+        If selective >= 0 Then imported = String.Left(imported, selective)
+        While String.EndsWith(imported, ".")
+            imported = String.Left(imported, String.Len(imported) - 1)
+        End While
+        If imported = "" Then Throw New InvalidArgumentException("Unresolved project import")
+        imports.Append(imported)
+    Next
+    Return imports
+End Function
+
+''' One complete source snapshot. Open never runs project scripts or writes files.
+''' Call Validate immediately before planning AND again before applying a refactor.
+''' Workspace revisions must additionally be checked by the host after planning.
+Public Class StudioProjectSession
+    Private Property mRootPath As String
+    Private Property mWorkspace As ProjectWorkspace
+    Public Property RootPath As String
+        Get
+            Return Me.mRootPath
+        End Get
+    End Property
+    Public Property Workspace As ProjectWorkspace
+        Get
+            Return Me.mWorkspace
+        End Get
+    End Property
+    Private Property mPaths As Array Of String = []
+    Private Property mAuxiliary As Array Of String = []
+    Private Property mDisk As Map Of String, String = New Map Of String, String()
+    Private Property mIds As Map Of String, String = New Map Of String, String()
+    Private Property mPackages As Set Of String = New Set Of String()
+    Private Property mPackageDirectories As Array Of String = []
+
+    Public Shared Function Open(rootPath As String) As StudioProjectSession
+        Dim directories As Array Of String = []
+        Return StudioProjectSession.Open(rootPath, directories)
+    End Function
+
+    ''' Additional trusted compiler package directories support custom installs.
+    Public Shared Function Open(rootPath As String, packageDirectories As Array Of String) As StudioProjectSession
+        Dim session As New StudioProjectSession()
+        session.mRootPath = SPRoot(rootPath)
+        session.mPackageDirectories = Array.Clone(packageDirectories)
+        Dim counter As New SPInventoryCounter()
+        SPInventory(New FileSystemItem(session.RootPath), "", session.mPaths, 0, counter)
+        Array.Sort(session.mPaths)
+        If Array.Count(session.mPaths) = 0 Then Throw New InvalidArgumentException("Project has no .bui source files")
+        Dim modules As New Set Of String()
+        Dim sourceBytes As Integer = 0
+        session.mWorkspace = New ProjectWorkspace()
+        For i As Integer = 0 To Array.Count(session.mPaths) - 1
+            Dim relative As String = session.mPaths(i)
+            Dim file As New FileSystemItem(session.RootPath + "/" + relative)
+            Dim moduleName As String = String.LCase(file.NameWithoutExtension())
+            If modules.Contains(moduleName) Then Throw New InvalidArgumentException("Ambiguous source module basename: " + file.NameWithoutExtension())
+            modules.Add(moduleName)
+            Dim length As Integer = file.Length()
+            If length < 0 Then Throw New InvalidArgumentException("Unreadable project source: " + relative)
+            sourceBytes += length
+            If sourceBytes > 67108864 Then Throw New InvalidArgumentException("Project source inventory exceeds 64 MiB")
+            Dim content As String = SPReadSource(file)
+            Dim id As String = "project-" + SPIdentity(session.RootPath + "/" + relative)
+            session.mDisk.Set(relative, content)
+            session.mIds.Set(relative, id)
+            session.Workspace.RegisterItem(id, relative, "source", SPWorkspaceText(content))
+        Next
+        Dim auxiliaryCounter As New SPInventoryCounter()
+        SPInventory(New FileSystemItem(session.RootPath), "", session.mAuxiliary, 0, auxiliaryCounter, True)
+        Array.Sort(session.mAuxiliary)
+        For i As Integer = 0 To Array.Count(session.mAuxiliary) - 1
+            Dim relative As String = session.mAuxiliary(i)
+            Dim content As String = SPReadSource(New FileSystemItem(session.RootPath + "/" + relative))
+            sourceBytes += Bytes.FromString(content, Text.Encodings.UTF8).Count
+            If sourceBytes > 67108864 Then Throw New InvalidArgumentException("Project documents exceed 64 MiB")
+            Dim id As String = "document-" + SPIdentity(session.RootPath + "/" + relative)
+            session.mDisk.Set(relative, content)
+            session.mIds.Set(relative, id)
+            session.Workspace.RegisterItem(id, relative, "document", SPWorkspaceText(content))
+        Next
+        session.CollectPackages(New FileSystemItem(session.RootPath + "/packages"))
+        session.CollectPackages(New FileSystemItem("/usr/share/buoy/packages"))
+        session.CollectPackages(New FileSystemItem("/Applications/Buoy/packages"))
+        session.CollectPackages(New FileSystemItem(FileSystemItem.ExecutableDirectory() + "/packages"))
+        #If TargetWindows Then
+            session.CollectPackages(New FileSystemItem("C:/Program Files/Buoy/packages"))
+            session.CollectPackages(New FileSystemItem("C:/Program Files/Buoy/bin/packages"))
+        #End If
+        For Each directory As String In packageDirectories
+            session.CollectPackages(New FileSystemItem(directory))
+        Next
+        session.Validate(session.Workspace)
+        Return session
+    End Function
+
+    Private Sub CollectPackages(folder As FileSystemItem)
+        If Not folder.Exists() Then Return
+        SPCheckDirectory(folder)
+        For Each file As FileSystemItem In folder.Children()
+            If Not String.EndsWith(String.LCase(file.Name()), ".buipkg") Then Continue For
+            SPCheckLocation(file)
+            Dim name As String = String.Left(file.Name(), String.Len(file.Name()) - 7)
+            Dim parts As Array Of String = String.Split(name, "-")
+            If Array.Count(parts) < 2 Then Continue For
+            Dim packageName As String = parts(0)
+            Dim versionFound As Boolean = False
+            For i As Integer = 1 To Array.Count(parts) - 1
+                Dim first As String = String.Left(parts(i), 1)
+                If first <> "" Then
+                    Dim code As Integer = String.Asc(first)
+                    If code >= 48 And code <= 57 Then
+                        versionFound = True
+                        Exit For
+                    End If
+                End If
+                packageName += "-" + parts(i)
+            Next
+            If versionFound Then Me.mPackages.Add(String.LCase(packageName))
+        Next
+    End Sub
+
+    ''' Rebuild source inventory without losing unsaved source buffers. A dirty buffer
+    ''' whose baseline also changed on disk requires explicit conflict resolution.
+    Public Function Rescan(workspace As ProjectWorkspace) As StudioProjectSession
+        If workspace = Nil Then Throw New InvalidArgumentException("Project workspace is required")
+        Dim fresh As StudioProjectSession = StudioProjectSession.Open(Me.RootPath, Me.mPackageDirectories)
+        For Each item As ProjectItem In workspace.Items()
+            If Not item.IsDirty Then Continue For
+            If Not Me.mDisk.ContainsKey(item.RelativePath) Or Not fresh.mDisk.ContainsKey(item.RelativePath) Then Throw New InvalidArgumentException("Unsaved source is missing from disk; resolve it before rescanning: " + item.RelativePath)
+            If Not SPExact(Me.mDisk.Get(item.RelativePath).Value, fresh.mDisk.Get(item.RelativePath).Value) Then Throw New InvalidArgumentException("Unsaved source also changed on disk; resolve the conflict before rescanning: " + item.RelativePath)
+            Dim targetId As String = fresh.ItemId(item.RelativePath)
+            Dim target As ProjectItem = fresh.Workspace.ReadItem(targetId)
+            fresh.Workspace.ReplaceText(targetId, target.Version, item.Text)
+        Next
+        fresh.Validate(fresh.Workspace)
+        Return fresh
+    End Function
+
+    ' Rebind a freshly verified inventory to surviving item identities and histories.
+    Public Sub AdoptWorkspace(workspace As ProjectWorkspace)
+        If workspace = Nil Then Throw New InvalidArgumentException("Project workspace is required")
+        For Each scanned As ProjectItem In Me.Workspace.Items()
+            Dim existingId As String = ""
+            For Each item As ProjectItem In workspace.Items()
+                If SPExact(item.RelativePath, scanned.RelativePath) Then existingId = item.Id
+            Next
+            If existingId = "" Then
+                existingId = scanned.Id
+                workspace.RegisterItem(existingId, scanned.RelativePath, scanned.Kind, scanned.Text)
+            End If
+            Me.mIds.Set(scanned.RelativePath, existingId)
+        Next
+        Me.mWorkspace = workspace
+        Me.Validate(workspace)
+    End Sub
+
+    ' Accept a file Studio exclusively created, retaining the live workspace and histories.
+    Public Sub AcceptCreated(itemId As String)
+        Dim item As ProjectItem = Me.Workspace.ReadItem(itemId)
+        Dim relative As String = item.RelativePath
+        If Me.mIds.ContainsKey(relative) Then Throw New InvalidArgumentException("Project path is already registered")
+        For Each component As String In String.Split(String.Replace(relative, "\\", "/", True), "/")
+            If component = ".." Or component = "." Or SPPrivateDirectory(component) Then Throw New InvalidArgumentException("Choose a file outside private project stores")
+        Next
+        Dim source As Boolean = SPSource(relative)
+        Dim lower As String = String.LCase(relative)
+        If Not source And Not String.EndsWith(lower, ".txt") And Not String.EndsWith(lower, ".md") And Not String.EndsWith(lower, ".json") Then Throw New InvalidArgumentException("This document type is outside the project inventory")
+        If source Then
+            Dim stem As String = String.LCase(New FileSystemItem(relative).NameWithoutExtension())
+            For Each other As String In Me.mPaths
+                If String.LCase(New FileSystemItem(other).NameWithoutExtension()) = stem Then Throw New InvalidArgumentException("Ambiguous source module basename")
+            Next
+        End If
+        Dim file As New FileSystemItem(Me.RootPath + "/" + relative)
+        SPRoot(file.ParentPath())
+        SPCheckLocation(file)
+        Dim disk As String = SPReadSource(file)
+        If Not SPExact(SPWorkspaceText(disk), item.Text) Then Throw New InvalidArgumentException("Created file differs from its open buffer")
+        Me.mIds.Set(relative, itemId)
+        Me.mDisk.Set(relative, disk)
+        If source Then
+            Me.mPaths.Append(relative)
+            Array.Sort(Me.mPaths)
+        Else
+            Me.mAuxiliary.Append(relative)
+            Array.Sort(Me.mAuxiliary)
+        End If
+    End Sub
+
+    Public Function AuxiliaryPaths() As Array Of String
+        Return Array.Clone(Me.mAuxiliary)
+    End Function
+
+    Public Function ContainsItem(itemId As String) As Boolean
+        For Each item As ProjectItem In Me.Workspace.Items()
+            If item.Id = itemId And Me.mIds.ContainsKey(item.RelativePath) Then
+                Return Me.mIds.Get(item.RelativePath).Value = itemId
+            End If
+        Next
+        Return False
+    End Function
+
+    Public Function SourcePaths() As Array Of String
+        Return Array.Clone(Me.mPaths)
+    End Function
+
+    Public Function ItemId(relativePath As String) As String
+        If Not Me.mIds.ContainsKey(relativePath) Then Throw New InvalidArgumentException("Unknown project source path")
+        Return Me.mIds.Get(relativePath).Value
+    End Function
+
+    Public Function FilePath(itemId As String) As String
+        For Each item As ProjectItem In Me.Workspace.Items()
+            Dim relative As String = item.RelativePath
+            If Not Me.mIds.ContainsKey(relative) Then Continue For
+            If SPExact(Me.mIds.Get(relative).Value, itemId) Then Return Me.RootPath + "/" + relative
+        Next
+        Throw New InvalidArgumentException("Unknown project item")
+    End Function
+
+    Public Function SavedText(itemId As String) As String
+        For Each item As ProjectItem In Me.Workspace.Items()
+            Dim relative As String = item.RelativePath
+            If Not Me.mIds.ContainsKey(relative) Then Continue For
+            If SPExact(Me.mIds.Get(relative).Value, itemId) Then Return Me.mDisk.Get(relative).Value
+        Next
+        Throw New InvalidArgumentException("Unknown project item")
+    End Function
+
+    ''' True when an installed package of this name would compete with a project module.
+    Public Function HasPackage(name As String) As Boolean
+        Return Me.mPackages.Contains(String.LCase(name))
+    End Function
+
+    ''' Records an on-disk rename/move Studio performed: the item keeps its id, and the
+    ''' accepted disk snapshot moves to the new path. The workspace item must already
+    ''' carry the new path (ProjectWorkspace.RenameItem).
+    Public Sub RenameEntry(oldPath As String, newPath As String)
+        If Not Me.mIds.ContainsKey(oldPath) Then Throw New InvalidArgumentException("Unknown project path: " + oldPath)
+        If Me.mIds.ContainsKey(newPath) And Not SPExact(String.LCase(oldPath), String.LCase(newPath)) Then Throw New InvalidArgumentException("Project path already in use: " + newPath)
+        Dim id As String = Me.mIds.Get(oldPath).Value
+        Dim disk As String = Me.mDisk.Get(oldPath).Value
+        Me.mIds.Remove(oldPath)
+        Me.mDisk.Remove(oldPath)
+        Me.mIds.Set(newPath, id)
+        Me.mDisk.Set(newPath, disk)
+        For i As Integer = 0 To Array.Count(Me.mPaths) - 1
+            If SPExact(Me.mPaths(i), oldPath) Then Me.mPaths(i) = newPath
+        Next
+        For i As Integer = 0 To Array.Count(Me.mAuxiliary) - 1
+            If SPExact(Me.mAuxiliary(i), oldPath) Then Me.mAuxiliary(i) = newPath
+        Next
+        Array.Sort(Me.mPaths)
+        Array.Sort(Me.mAuxiliary)
+    End Sub
+
+    ''' Refresh a baseline only after Studio itself saved this exact buffer to disk.
+    Public Sub AcceptSaved(itemId As String, text As String)
+        Dim file As New FileSystemItem(Me.FilePath(itemId))
+        SPCheckLocation(file)
+        If Not SPExact(SPReadSource(file), text) Then Throw New InvalidArgumentException("Saved file differs from the project buffer")
+        Me.mDisk.Set(Me.Workspace.ReadItem(itemId).RelativePath, text)
+    End Sub
+
+    ''' Inventory and disk bytes must still equal the accepted project snapshot.
+    ''' Unsaved buffers override disk only for dependency analysis, never its baseline.
+    Public Sub Validate(workspace As ProjectWorkspace)
+        Me.ValidateState(workspace, True)
+    End Sub
+
+    ''' Preserve project state checks, omitting dependency closure so incomplete edits can be saved.
+    Public Sub ValidateForSave(workspace As ProjectWorkspace)
+        Me.ValidateState(workspace, False)
+    End Sub
+
+    ''' A single-file save checks its own identity and accepted bytes, independently
+    ''' of unrelated external edits. Refactors still validate the complete project.
+    Public Sub ValidateItemForSave(workspace As ProjectWorkspace, itemId As String)
+        If workspace = Nil Then Throw New InvalidArgumentException("Project workspace is required")
+        Dim item As ProjectItem = workspace.ReadItem(itemId)
+        If Not Me.mIds.ContainsKey(item.RelativePath) Then Throw New InvalidArgumentException("Unscanned source buffer: " + item.RelativePath)
+        If Not SPExact(Me.mIds.Get(item.RelativePath).Value, itemId) Then Throw New InvalidArgumentException("Source buffer identity differs from project inventory")
+        Dim filePath As String = Me.FilePath(itemId)
+        SPRoot(filePath)
+        Dim file As New FileSystemItem(filePath)
+        If Not SPExact(SPReadSource(file), Me.mDisk.Get(item.RelativePath).Value) Then Throw New InvalidArgumentException("Project source changed on disk: " + item.RelativePath)
+        For Each other As ProjectItem In workspace.Items()
+            If SPExact(other.RelativePath, item.RelativePath) And Not SPExact(other.Id, itemId) Then Throw New InvalidArgumentException("Duplicate source buffer path")
+        Next
+    End Sub
+
+    Private Sub ValidateState(workspace As ProjectWorkspace, requireClosure As Boolean)
+        If workspace = Nil Then Throw New InvalidArgumentException("Project workspace is required")
+        SPRoot(Me.RootPath)
+        Dim current As Array Of String = []
+        Dim counter As New SPInventoryCounter()
+        SPInventory(New FileSystemItem(Me.RootPath), "", current, 0, counter)
+        Array.Sort(current)
+        If Array.Count(current) <> Array.Count(Me.mPaths) Then Throw New InvalidArgumentException("Project source inventory changed; rescan the project")
+        For i As Integer = 0 To Array.Count(current) - 1
+            Dim relative As String = current(i)
+            If Not SPExact(relative, Me.mPaths(i)) Then Throw New InvalidArgumentException("Project source inventory changed; rescan the project")
+            Dim file As New FileSystemItem(Me.RootPath + "/" + relative)
+            If Not SPExact(SPReadSource(file), Me.mDisk.Get(relative).Value) Then Throw New InvalidArgumentException("Project source changed on disk: " + relative + "; rescan before refactoring")
+        Next
+        Dim texts As New Map Of String, String()
+        Dim count As Integer = 0
+        For Each item As ProjectItem In workspace.Items()
+            If Not SPSource(item.RelativePath) Then Continue For
+            If Not Me.mIds.ContainsKey(item.RelativePath) Then Throw New InvalidArgumentException("Unscanned source buffer: " + item.RelativePath)
+            If Not SPExact(Me.mIds.Get(item.RelativePath).Value, item.Id) Then Throw New InvalidArgumentException("Source buffer identity differs from project inventory")
+            If texts.ContainsKey(item.RelativePath) Then Throw New InvalidArgumentException("Duplicate source buffer path")
+            texts.Set(item.RelativePath, item.Text)
+            count += 1
+        Next
+        If count <> Array.Count(Me.mPaths) Then Throw New InvalidArgumentException("Complete project source buffers are required")
+        If Not requireClosure Then Exit Sub
+        For Each relative As String In Me.mPaths
+            For Each imported As String In SPImports(texts.Get(relative).Value)
+                If String.StartsWith(imported, "\"") Then
+                    Dim raw As String = String.Mid(imported, 1, String.Len(imported) - 2)
+                    If Not String.EndsWith(String.LCase(raw), ".bui") Then raw += ".bui"
+                    Dim resolved As String = New FileSystemItem(Me.RootPath + "/" + relative).Parent.FullPath() + "/" + raw
+                    resolved = New FileSystemItem(resolved).FullPath()
+                    If Not String.StartsWith(resolved, Me.RootPath + "/", True) Then Throw New InvalidArgumentException("Import escapes project")
+                    Dim key As String = String.Mid(resolved, String.Len(Me.RootPath) + 1)
+                    If Not texts.ContainsKey(key) Then Throw New InvalidArgumentException("Unresolved import " + imported)
+                    Continue For
+                End If
+                Dim localPath As String = String.Replace(imported, ".", "/", True) + ".bui"
+                Dim directory As String = ""
+                Dim slash As Integer = String.InStrRev(relative, "/")
+                If slash > 0 Then directory = String.Left(relative, slash)
+                Dim found As Boolean = texts.ContainsKey(directory + localPath)
+                For Each entryPath As String In Me.mPaths
+                    If String.LCase(New FileSystemItem(entryPath).Name()) <> "main.bui" Then Continue For
+                    Dim entryDirectory As String = ""
+                    Dim entrySlash As Integer = String.InStrRev(entryPath, "/")
+                    If entrySlash > 0 Then entryDirectory = String.Left(entryPath, entrySlash)
+                    If texts.ContainsKey(entryDirectory + localPath) Then found = True
+                Next
+                If Not found Then
+                    Dim first As String = String.Split(imported, ".")(0)
+                    If Not Me.mPackages.Contains(String.LCase(first)) Then Throw New InvalidArgumentException("Unresolved import " + imported + " in " + relative + "; project closure cannot be proven")
+                End If
+            Next
+        Next
+    End Sub
+End Class
+
+''' Validate ancestors before Save As reserves a missing destination.
+Public Sub StudioProjectCheckSaveDestination(filePath As String)
+    Dim file As New FileSystemItem(filePath)
+    SPRoot(file.ParentPath())
+    For Each character As String In String.Chars(file.Name())
+        If String.Asc(character) < 32 Or String.Asc(character) = 127 Then Throw New InvalidArgumentException("Control character in save filename")
+    Next
+End Sub

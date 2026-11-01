@@ -1,0 +1,54 @@
+' Per-process snapshot appearance. Never changes the user's system preferences.
+#If TargetMac Then
+    Private Declare Function AppearanceClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function AppearanceApplication Lib "AppKit" Selector "sharedApplication" (cls As Ptr) As Ptr
+    Private Declare Function AppearanceNamed Lib "AppKit" Selector "appearanceNamed:" (cls As Ptr, name As CFStringRef) As Ptr
+    Private Declare Sub AppearanceSet Lib "AppKit" Selector "setAppearance:" (application As Ptr, appearance As Ptr)
+    Private Declare Function AppearanceEffective Lib "AppKit" Selector "effectiveAppearance" (application As Ptr) As Ptr
+    Private Declare Function AppearanceName Lib "AppKit" Selector "name" (appearance As Ptr) As CFStringRef
+    Private Declare Sub AppearanceActivate Lib "AppKit" Selector "activateIgnoringOtherApps:" (application As Ptr, force As UInt8)
+    Private Declare Sub AppearanceRelease Lib "CoreFoundation" Alias "CFRelease" (value As CFStringRef)
+#End If
+
+''' Process-local appearance requested with --appearance. Windows and Linux have no
+''' per-application appearance API, so Studio's own glyph choice reads this instead.
+Private Class StudioAppearanceState
+    Public Shared Property Requested As String = ""
+End Class
+
+Public Sub StudioSnapshotAppearance(mode As String)
+    If mode = "" Or String.Compare(mode, "system", True) = 0 Then Return
+    If String.Compare(mode, "light", True) <> 0 And String.Compare(mode, "dark", True) <> 0 Then Throw New InvalidArgumentException("Snapshot appearance must be light, dark or system")
+    StudioAppearanceState.Requested = "light"
+    If String.Compare(mode, "dark", True) = 0 Then StudioAppearanceState.Requested = "dark"
+    #If TargetMac Then
+        Dim name As String = "NSAppearanceNameAqua"
+        If String.Compare(mode, "dark", True) = 0 Then name = "NSAppearanceNameDarkAqua"
+        Dim nativeName As CFStringRef = CType(name, CFStringRef)
+        Try
+            Dim appearance As Ptr = AppearanceNamed(AppearanceClass("NSAppearance"), nativeName)
+            If appearance = Nil Then Throw New InvalidArgumentException("Requested native appearance is unavailable")
+            AppearanceSet(AppearanceApplication(AppearanceClass("NSApplication")), appearance)
+        Finally
+            AppearanceRelease(nativeName)
+        End Try
+    #End If
+End Sub
+
+Public Sub StudioActivateSnapshot()
+    #If TargetMac Then
+        AppearanceActivate(AppearanceApplication(AppearanceClass("NSApplication")), 1)
+    #End If
+End Sub
+
+Public Function StudioUsesDarkAppearance() As Boolean
+    If StudioAppearanceState.Requested <> "" Then Return StudioAppearanceState.Requested = "dark"
+    #If TargetMac Then
+        Dim appearance As Ptr = AppearanceEffective(AppearanceApplication(AppearanceClass("NSApplication")))
+        If appearance <> Nil Then
+            Dim nativeName As CFStringRef = AppearanceName(appearance)
+            If nativeName <> Nil Then Return String.Contains(CType(nativeName, String), "Dark", True)
+        End If
+    #End If
+    Return System.IsDarkMode
+End Function

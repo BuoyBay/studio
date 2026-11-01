@@ -1,0 +1,245 @@
+' Offline programmer spelling. All offsets count codepoints, as in StudioSyntax.
+Import StudioSyntax
+Import StudioSpellingWords
+Import StudioFindEngine
+
+Public Class StudioSpellingWord
+    Public Property Start As Integer
+    Public Property Length As Integer
+    Public Property Word As String
+    Public Sub Constructor(start As Integer, word As String)
+        Me.Start = start
+        Me.Length = String.Len(word)
+        Me.Word = word
+    End Sub
+End Class
+
+Private Function SpellLower(c As String) As Boolean
+    Return String.Asc(c) >= 97 And String.Asc(c) <= 122
+End Function
+Private Function SpellUpper(c As String) As Boolean
+    Return String.Asc(c) >= 65 And String.Asc(c) <= 90
+End Function
+Private Function SpellLetter(c As String) As Boolean
+    Return SpellLower(c) Or SpellUpper(c)
+End Function
+Private Function SpellUnicodeLetter(c As String) As Boolean
+    If String.Asc(c) < 128 Then Return False
+    Return Array.Count(StudioRegexHits(c, "[\\p{L}\\p{M}]", True, False, False, False)) > 0
+End Function
+Private Function SpellAnyLetter(c As String) As Boolean
+    Return SpellLetter(c) Or SpellUnicodeLetter(c)
+End Function
+
+''' Keep contractions intact, skip complete non-English words, and split identifier
+''' casing and acronym boundaries. Unicode punctuation and emoji are separators.
+Public Function StudioSpellingParts(text As String, offset As Integer = 0) As Array Of StudioSpellingWord
+    Dim chars As Array Of String = String.Chars(text)
+    Dim output As Array Of StudioSpellingWord = []
+    Dim i As Integer = 0
+    While i < Array.Count(chars)
+        If Not SpellAnyLetter(chars(i)) Then
+            i += 1
+            Continue While
+        End If
+        Dim first As Integer = i
+        Dim wordChars As Array Of String = []
+        Dim unicode As Boolean = False
+        While i < Array.Count(chars)
+            Dim c As String = chars(i)
+            Dim letter As Boolean = SpellAnyLetter(c)
+            Dim apostrophe As Boolean = False
+            If (c = "'" Or c = "’") And i > first And i + 1 < Array.Count(chars) Then apostrophe = SpellAnyLetter(chars(i + 1))
+            If Not letter And Not apostrophe Then Exit While
+            If letter And Not SpellLetter(c) Then unicode = True
+            wordChars.Append(c)
+            i += 1
+        Wend
+        If unicode Then Continue While
+        Dim segment As Integer = 0
+        Dim pieces As Array Of String = []
+        For k As Integer = 0 To Array.Count(wordChars)
+            Dim boundary As Boolean = k = Array.Count(wordChars)
+            If Not boundary And k > segment Then
+                If SpellUpper(wordChars(k)) Then
+                    boundary = SpellLower(wordChars(k - 1))
+                    If k + 1 < Array.Count(wordChars) Then boundary = boundary Or SpellLower(wordChars(k + 1))
+                End If
+            End If
+            If boundary Then
+                If Array.Count(pieces) > 0 Then output.Append(New StudioSpellingWord(offset + first + segment, String.Join(pieces, "")))
+                pieces = []
+                segment = k
+            End If
+            If k < Array.Count(wordChars) Then pieces.Append(wordChars(k))
+        Next
+    Wend
+    Return output
+End Function
+
+Private Function SpellingCacheKey(info As StudioSyntaxLine) As String
+    If info.SpellingKey <> "" Then Return info.SpellingKey
+    Dim data As Bytes = Bytes.FromString(info.Source, Text.Encodings.UTF8)
+    Dim first As Integer = 0
+    Dim second As Integer = 7
+    For i As Integer = 0 To data.Count - 1
+        first = (first * 31 + data.Item(i)) Mod 2147483647
+        second = (second * 131 + data.Item(i)) Mod 1000000007
+    Next
+    Dim key As String = info.LanguageMode + ":" + String.From(info.StartsInComment) + ":" + String.From(data.Count) + ":" + String.From(first) + ":" + String.From(second)
+    For Each token As StudioSyntaxToken In info.Tokens
+        key += ":" + String.From(token.Kind.RawValue) + "," + String.From(token.Start) + "," + String.From(token.Length)
+    Next
+    info.SpellingKey = key
+    Return key
+End Function
+
+''' Mask only complete addresses and absolute paths, preserving positions. A slash
+''' between ordinary words or a comment delimiter does not hide either word.
+Private Sub SpellMaskAddresses(ByRef chars As Array Of String, source As String)
+    Dim pattern As String = "(?:https?://|ftp://|file://|www\\.)[^\\s<>()[\\]{}\"']+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|(?<!\\S)(?:[A-Za-z]:[\\\\/]|\\./|\\.\\./|~/|/(?![*/]))[^\\s<>()[\\]{}\"']+"
+    For Each hit As StudioFindHit In StudioRegexHits(source, pattern, False, False, False, False)
+        For n As Integer = hit.Start To hit.Start + hit.Length - 1
+            chars(n) = " "
+        Next
+    Next
+End Sub
+
+Private Sub SpellMaskEscapes(ByRef chars As Array Of String, source As String, start As Integer, length As Integer)
+    ' PCRE matching is case-sensitive: uXXXX and UXXXXXXXX have distinct widths.
+    Dim text As String = String.Substring(source, start, length)
+    Dim pattern As String = "\\\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|[nrt\"\\\\])"
+    For Each hit As StudioFindHit In StudioRegexHits(text, pattern, True, False, False, False)
+        Dim first As Integer = start + hit.Start
+        Dim last As Integer = first + hit.Length
+        Dim code As Integer = 0
+        If hit.Length > 2 Then
+            For n As Integer = first + 2 To last - 1
+                Dim digit As Integer = String.Asc(String.LCase(chars(n)))
+                If digit >= 97 Then
+                    digit -= 87
+                Else
+                    digit -= 48
+                End If
+                code = code * 16 + digit
+            Next
+        End If
+        ' A non-ASCII letter encoded in a string must not leave English fragments.
+        If code >= 128 And code <= &h10FFFF Then
+            If SpellUnicodeLetter(String.Chr(code)) Then
+                While first > start
+                    If Not SpellAnyLetter(chars(first - 1)) Then Exit While
+                    first -= 1
+                Wend
+                While last < start + length
+                    If Not SpellAnyLetter(chars(last)) Then Exit While
+                    last += 1
+                Wend
+            End If
+        End If
+        For n As Integer = first To last - 1
+            chars(n) = " "
+        Next
+    Next
+End Sub
+
+' Own the array in a class so cache reads do not unwrap Optional Of Array.
+' Buoy 0.72 retains class-array payloads when that optional is read.
+Public Class StudioSpellingCacheEntry
+    Public Property Words As Array Of StudioSpellingWord = []
+    Public Sub Constructor(words As Array Of StudioSpellingWord)
+        Me.Words = words
+    End Sub
+End Class
+
+Public Class StudioSpelling
+    Private Shared Property mWords As Map Of String, Boolean = New Map Of String, Boolean()
+    Private Shared Property mReady As Boolean = False
+    Private Property mIgnored As Map Of String, Boolean = New Map Of String, Boolean()
+    Private Property mCache As Map Of String, StudioSpellingCacheEntry = New Map Of String, StudioSpellingCacheEntry()
+    Private Property mOrder As Array Of String = []
+
+    Private Shared Sub Prepare()
+        If StudioSpelling.mReady Then Return
+        StudioLoadSpellingWords(StudioSpelling.mWords)
+        StudioSpelling.mReady = True
+    End Sub
+
+    Public Sub Ignore(word As String)
+        Me.mIgnored.Set(String.LCase(String.Replace(word, "’", "'", True)), True)
+        Me.mCache = New Map Of String, StudioSpellingCacheEntry()
+        Me.mOrder = []
+    End Sub
+
+    Public Function Known(word As String) As Boolean
+        StudioSpelling.Prepare()
+        Dim key As String = String.LCase(String.Replace(word, "’", "'", True))
+        Return String.Len(key) <= 2 Or Me.mIgnored.ContainsKey(key) Or StudioSpelling.mWords.ContainsKey(key)
+    End Function
+
+    Public Function Cached(info As StudioSyntaxLine) As StudioSpellingCacheEntry
+        Dim found As Optional Of StudioSpellingCacheEntry = Me.mCache.Get(SpellingCacheKey(info))
+        If Not found.HasValue Then Return Nil
+        Return found.Value
+    End Function
+
+    Public Function Check(info As StudioSyntaxLine) As Array Of StudioSpellingWord
+        Dim key As String = SpellingCacheKey(info)
+        Dim cached As StudioSpellingCacheEntry = Me.Cached(info)
+        If cached <> Nil Then Return cached.Words
+        Dim output As Array Of StudioSpellingWord = []
+        Dim chars As Array Of String = String.Chars(info.Source)
+        SpellMaskAddresses(chars, info.Source)
+        For Each token As StudioSyntaxToken In info.Tokens
+            Dim eligible As Boolean = token.Kind = StudioTokenKind.Plain Or token.Kind = StudioTokenKind.FunctionName Or token.Kind = StudioTokenKind.TypeName Or token.Kind = StudioTokenKind.Comment Or token.Kind = StudioTokenKind.Text
+            If info.LanguageMode = "markdown" And token.Kind = StudioTokenKind.Keyword Then eligible = True
+            If Not eligible Then Continue For
+            If token.Kind = StudioTokenKind.Text And (info.LanguageMode = "buoy" Or info.LanguageMode = "json") Then SpellMaskEscapes(chars, info.Source, token.Start, token.Length)
+            Dim pieces As Array Of String = []
+            For n As Integer = token.Start To token.Start + token.Length - 1
+                pieces.Append(chars(n))
+            Next
+            For Each word As StudioSpellingWord In StudioSpellingParts(String.Join(pieces, ""), token.Start)
+                If Not Me.Known(word.Word) Then output.Append(word)
+            Next
+        Next
+        ' Evict one old line instead of making every visible underline disappear.
+        If Array.Count(Me.mOrder) >= 512 Then
+            Me.mCache.Remove(Me.mOrder(0))
+            Array.RemoveAt(Me.mOrder, 0)
+        End If
+        Me.mOrder.Append(key)
+        Dim entry As New StudioSpellingCacheEntry(output)
+        Me.mCache.Set(key, entry)
+        Return output
+    End Function
+    ''' One-edit corrections (delete, insert, substitute, transpose), computed only on request.
+    Public Function Suggestions(word As String) As Array Of String
+        StudioSpelling.Prepare()
+        Dim key As String = String.LCase(word)
+        Dim found As Map Of String, Boolean = New Map Of String, Boolean()
+        Dim output As Array Of String = []
+        If String.Len(key) > 48 Then Return output
+        For i As Integer = 0 To String.Len(key) - 2
+            Me.AddSuggestion(String.Left(key, i) + String.Substring(key, i + 1, 1) + String.Substring(key, i, 1) + String.Substring(key, i + 2), found, output)
+        Next
+        For i As Integer = 0 To String.Len(key)
+            Dim left As String = String.Left(key, i)
+            Dim right As String = String.Substring(key, i)
+            Me.AddSuggestion(left + String.Substring(right, Math.Min(1, String.Len(right))), found, output)
+            If String.Len(right) >= 2 Then Me.AddSuggestion(left + String.Substring(right, 1, 1) + String.Left(right, 1) + String.Substring(right, 2), found, output)
+            For Each letter As String In String.Chars("abcdefghijklmnopqrstuvwxyz")
+                Me.AddSuggestion(left + letter + right, found, output)
+                If right <> "" Then Me.AddSuggestion(left + letter + String.Substring(right, 1), found, output)
+            Next
+        Next
+        Return output
+    End Function
+
+    Private Sub AddSuggestion(word As String, found As Map Of String, Boolean, ByRef output As Array Of String)
+        If Array.Count(output) >= 8 Or String.Len(word) < 3 Then Return
+        If found.ContainsKey(word) Or Not StudioSpelling.mWords.ContainsKey(word) Then Return
+        found.Set(word, True)
+        Array.Append(output, word)
+    End Sub
+End Class

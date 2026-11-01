@@ -1,0 +1,228 @@
+Import modelkit
+Import projectkit
+Import agentkit
+
+Private Function RPC(methodName As String, arguments As JSONItem, requestID As Integer = 1) As JSONItem
+    Dim message As JSONItem = JSONItem.NewObject()
+    message.Value("jsonrpc") = "2.0"
+    message.Value("id") = requestID
+    message.Value("method") = methodName
+    message.Value("params") = arguments
+    Return message
+End Function
+
+Private Function StudioToolArguments(source As String) As JSONItem
+    Dim encoded As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+    If encoded.Count > 1048576 Then Throw New InvalidArgumentException("Project tool arguments exceed 1 MiB")
+    Dim compact As New Bytes()
+    Dim quoted As Boolean = False
+    Dim escaped As Boolean = False
+    For i As Integer = 0 To encoded.Count - 1
+        Dim value As Integer = encoded.Item(i)
+        If Not quoted And (value = 10 Or value = 13) Then
+            compact.Append(32)
+        Else
+            compact.Append(value)
+        End If
+        If quoted Then
+            If escaped Then
+                escaped = False
+            ElseIf value = 92 Then
+                escaped = True
+            ElseIf value = 34 Then
+                quoted = False
+            End If
+        ElseIf value = 34 Then
+            quoted = True
+        End If
+    Next
+    compact.Append(10)
+    Dim decoder As New JSONLDecoder(1048576, 1048577, 1)
+    Dim decoded As Array Of JSONItem = decoder.Feed(compact)
+    decoder.Finish()
+    If Array.Count(decoded) <> 1 Then Throw New InvalidArgumentException("One project tool argument object is required")
+    Return decoded(0)
+End Function
+
+Private Class StudioModelRound
+    Public Property Client As ModelClient
+    Public Property Model As String
+    Public Property Input As JSONItem
+    Public Property Tools As JSONItem
+    Public Property Reply As ModelReply
+    Public Property ErrorText As String
+    Public Property Work As Task
+    Public Property KeepAlive As StudioModelRound
+End Class
+
+Private Sub RunModelRound(pointer As Ptr)
+    Dim operation As StudioModelRound = CType(pointer, StudioModelRound)
+    Try
+        operation.Reply = operation.Client.CreateResponse(operation.Model, operation.Input, operation.Tools)
+    Catch e As Exception
+        ' ModelClient has sanitized HTTP errors; avoid including arbitrary response bodies.
+        operation.ErrorText = "Model request failed: " + e.Message
+    End Try
+    operation.KeepAlive = Nil
+End Sub
+
+''' Call Poll from the main thread. Only HTTP executes on a background task.
+Public Class StudioModelJob
+    Private Property Host As ProjectMCPHost
+    Private Property Client As ModelClient
+    Private Property Model As String
+    Private Property History As JSONItem = JSONItem.NewArray()
+    Private Property Tools As JSONItem = JSONItem.NewArray()
+    Private Property AllowedTools As Set Of String = New Set Of String()
+    Private Property Current As StudioModelRound
+    Private Property Finished As Boolean = False
+    Private Property Stopped As Boolean = False
+    Private Property Turns As Integer = 0
+    Private Property OutputText As String
+    Private Property FailureText As String
+    Private Property ProposalValues As JSONItem = JSONItem.NewArray()
+    Private Property ActivityValues As JSONItem = JSONItem.NewArray()
+
+    Public Sub Constructor(host As ProjectMCPHost, client As ModelClient, model As String, prompt As String, context As JSONItem)
+        If host = Nil Or client = Nil Then Throw New InvalidArgumentException("Model job requires project host and client")
+        If String.Trim(model) = "" Or String.Trim(prompt) = "" Then Throw New InvalidArgumentException("Model and prompt are required")
+        Me.Host = host
+        Me.Client = client
+        Me.Model = model
+        Dim initialized As JSONItem = host.Handle(RPC("initialize", Json.Parse("{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"buoy-studio-models\",\"version\":\"0.1.0\"}}")))
+        Dim notified As JSONItem = host.Handle(Json.Parse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))
+        Dim listed As JSONItem = host.Handle(RPC("tools/list", JSONItem.NewObject()))
+        If listed.HasKey("error") Then Throw New InvalidArgumentException("Project tool host is not ready")
+        Dim declared As JSONItem = listed.Value("result").Value("tools")
+        For i As Integer = 0 To declared.Count() - 1
+            Dim tool As JSONItem = declared.ValueAt(i)
+            Me.AllowedTools.Add(tool.Value("name").AsString().Or(""))
+            Me.Tools.Add(FunctionTool(tool.Value("name").AsString().Or(""), tool.Value("description").AsString().Or(""), tool.Value("inputSchema")))
+        Next
+        Me.History.Add(TextMessage("developer", "Use the project tools to inspect authoritative unsaved buffers. Propose edits against exact revisions; never claim a proposal was applied. The user must approve changes."))
+        If context <> Nil Then Me.History.Add(TextMessage("user", "Attached project context:\n" + Json.Stringify(context)))
+        Me.History.Add(TextMessage("user", prompt))
+        Me.StartRound()
+    End Sub
+
+    Private Sub StartRound()
+        If Me.Stopped Then Return
+        If Me.Turns >= 8 Then
+            Me.Finished = True
+            Me.FailureText = "Model tool-turn limit reached"
+            Return
+        End If
+        Me.Turns += 1
+        Dim operation As New StudioModelRound()
+        operation.Client = Me.Client
+        operation.Model = Me.Model
+        operation.Input = Json.Parse(Json.Stringify(Me.History))
+        operation.Tools = Json.Parse(Json.Stringify(Me.Tools))
+        operation.KeepAlive = operation
+        operation.Work = Task.RunWithArg(AddressOf RunModelRound, CType(operation, Ptr))
+        Me.Current = operation
+    End Sub
+
+    Public Sub Poll()
+        If Me.Finished Or Me.Stopped Or Me.Current = Nil Then Return
+        If Not Me.Current.Work.IsComplete() Then Return
+        Dim operation As StudioModelRound = Me.Current
+        Me.Current = Nil
+        If operation.ErrorText <> "" Then
+            Me.FailureText = operation.ErrorText
+            Me.Finished = True
+            Return
+        End If
+        Dim reply As ModelReply = operation.Reply
+        If reply = Nil Then
+            Me.FailureText = "Model returned no response"
+            Me.Finished = True
+            Return
+        End If
+        If reply.Text <> "" Then Me.OutputText += reply.Text
+        reply.AppendOutputTo(Me.History)
+        Dim calls As Array Of ModelToolCall = reply.ToolCalls
+        If Array.Count(calls) = 0 Then
+            Me.Finished = True
+            Return
+        End If
+        If Array.Count(calls) > 32 Then
+            Me.FailureText = "Model tool-call limit reached"
+            Me.Finished = True
+            Return
+        End If
+        ' Main-thread dispatch keeps workspace reads/edits serialized with the editor.
+        For Each tool As ModelToolCall In calls
+            Dim payload As JSONItem = JSONItem.NewObject()
+            Dim output As JSONItem
+            Try
+                If Not Me.AllowedTools.Contains(tool.Name) Then Throw New InvalidArgumentException("Unknown project tool")
+                payload.Value("name") = tool.Name
+                payload.Value("arguments") = StudioToolArguments(tool.ArgumentsText)
+                output = Me.Host.Handle(RPC("tools/call", payload))
+            Catch e As Exception
+                output = Json.Parse("{\"error\":{\"message\":\"Invalid project tool arguments\"}}")
+            End Try
+            Dim activity As JSONItem = JSONItem.NewObject()
+            activity.Value("id") = tool.CallID
+            activity.Value("name") = tool.Name
+            activity.Value("response") = output
+            Me.ActivityValues.Add(activity)
+            If String.Compare(tool.Name, "project_propose_edits", True) = 0 And Not output.HasKey("error") Then
+                Dim content As JSONItem = output.Value("result")
+                If Not content.Value("isError").AsBoolean().Or(True) Then
+                    Dim text As String = content.Value("content").ValueAt(0).Value("text").AsString().Or("")
+                    Dim parsed As Optional Of JSONItem = Json.TryParse(text)
+                    If parsed.HasValue Then Me.ProposalValues.Add(parsed.Value)
+                End If
+            End If
+            Me.History.Add(tool.ResultItem(Json.Stringify(output)))
+        Next
+        Me.StartRound()
+    End Sub
+
+    Public Sub Stop()
+        Me.Host.Shutdown()
+        Me.Stopped = True
+        Me.Finished = True
+        Me.Current = Nil
+        Me.OutputText = ""
+        Me.ProposalValues = JSONItem.NewArray()
+        Me.ActivityValues = JSONItem.NewArray()
+    End Sub
+
+    Public Sub Destructor()
+        If Me.Host <> Nil Then Me.Host.Shutdown()
+    End Sub
+
+    Public Property IsComplete As Boolean
+        Get
+            Return Me.Finished
+        End Get
+    End Property
+    Public Property IsStopped As Boolean
+        Get
+            Return Me.Stopped
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return Me.OutputText
+        End Get
+    End Property
+    Public Property ErrorText As String
+        Get
+            Return Me.FailureText
+        End Get
+    End Property
+    Public Property Proposals As JSONItem
+        Get
+            Return Json.Parse(Json.Stringify(Me.ProposalValues))
+        End Get
+    End Property
+    Public Property Activities As JSONItem
+        Get
+            Return Json.Parse(Json.Stringify(Me.ActivityValues))
+        End Get
+    End Property
+End Class

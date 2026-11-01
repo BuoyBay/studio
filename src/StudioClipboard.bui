@@ -1,0 +1,26 @@
+''' Memory-only history. Call Record after successful Studio copy/cut; never polls OS.
+Public Class StudioClipboardHistory
+    Private Property Values As Array Of String = []
+    Public Property Limit As Integer = 20
+    Public Property MaxEntryBytes As Integer = 262144
+    Public Function Record(text As String) As Boolean
+        If text = "" Or String.LenBytes(text) > Math.Max(1, Me.MaxEntryBytes) Then Return False
+        Dim retained As Array Of String = []
+        retained.Append(text)
+        For Each old As String In Me.Values
+            If String.Compare(old, text, True) <> 0 And Array.Count(retained) < Math.Max(1, Math.Min(100, Me.Limit)) Then retained.Append(old)
+        Next
+        Me.Values = retained
+        Return True
+    End Function
+    Public Function Items() As Array Of String
+        Dim copies As Array Of String = []
+        For Each text As String In Me.Values
+            copies.Append(text)
+        Next
+        Return copies
+    End Function
+    Public Sub Clear()
+        Me.Values = []
+    End Sub
+End Class

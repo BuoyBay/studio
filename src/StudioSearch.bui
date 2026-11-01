@@ -1,0 +1,316 @@
+Import StudioProjectSearch
+Import StudioSearchHistory
+Import editorkit
+Import projectkit
+
+Public Interface StudioSearchHost
+    Function SearchSource(query As String, forward As Boolean, matchCase As Boolean, wholeWord As Boolean, regex As Boolean, multiline As Boolean, dotAll As Boolean, wrap As Boolean) As String
+    Function PreviewSource(query As String, replacement As String, matchCase As Boolean, wholeWord As Boolean, regex As Boolean, multiline As Boolean, dotAll As Boolean) As String
+    Function ReplaceSource(query As String, replacement As String, allMatches As Boolean, matchCase As Boolean, wholeWord As Boolean, regex As Boolean, multiline As Boolean, dotAll As Boolean, wrap As Boolean) As String
+End Interface
+
+Public Class StudioSearchLink
+    Public Property Host As StudioSearchHost
+End Class
+
+Private Class StudioSearchButton Inherits Button
+    Public Property Owner As Weak StudioSearchWindow
+    Public Property CommandName As String
+    Handle Action()
+        Dim target As StudioSearchWindow = Me.Owner
+        If target <> Nil Then target.Command(Me.CommandName)
+    End Handle
+End Class
+
+''' A modeless Find/Replace panel; edits always go through the source editor host.
+Public Class StudioSearchWindow Inherits Window
+    Public Property IsClosed As Boolean = False
+    Private Property Disposing As Boolean = False
+    Public Property HostLink As Weak StudioSearchLink
+    Public Property Query As TextField = New TextField()
+    Public Property Replacement As TextField = New TextField()
+    Public Property MatchCase As Checkbox = New Checkbox()
+    Public Property WholeWord As Checkbox = New Checkbox()
+    Public Property Grep As Checkbox = New Checkbox()
+    Public Property Multiline As Checkbox = New Checkbox()
+    Public Property DotAll As Checkbox = New Checkbox()
+    Public Property Wrap As Checkbox = New Checkbox()
+    Public Property Help As Label = New Label()
+    Public Property Status As TextArea = New TextArea()
+    Public Property FrozenScope As StudioFrozenSearchScope
+    Public Property History As StudioSearchHistory = New StudioSearchHistory()
+    Private Property HistoryIndex As Integer = -1
+    Private Property FrozenIndex As Integer = -1
+    Private Property FrozenQuery As String = ""
+    Private Property Labels As Array Of Label = []
+    Private Property Buttons As Array Of StudioSearchButton = []
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.Title = "Find and Replace"
+        Me.Move(180, 160, 760, 510)
+        Me.SetMinSize(760.0, 510.0)
+        For Each caption As String In ["Find", "Replace with"]
+            Dim label As New Label()
+            label.Text = caption
+            Me.Labels.Append(label)
+            Me.AddSubview(label)
+        Next
+        Me.Query.AccessibleLabel = "Find text"
+        Me.Replacement.AccessibleLabel = "Replacement text"
+        Me.MatchCase.Caption = "Match case"
+        Me.WholeWord.Caption = "Whole word"
+        Me.AddSubview(Me.Query)
+        Me.AddSubview(Me.Replacement)
+        Me.AddSubview(Me.MatchCase)
+        Me.AddSubview(Me.WholeWord)
+        Me.Grep.Caption = "Grep (PCRE regex)"
+        Me.Multiline.Caption = "^ and $ match lines"
+        Me.Multiline.Value = Checkbox.CheckState.True
+        Me.DotAll.Caption = "Dot matches newline"
+        Me.Wrap.Caption = "Wrap around"
+        Me.Wrap.Value = Checkbox.CheckState.True
+        Me.AddSubview(Me.Grep)
+        Me.AddSubview(Me.Multiline)
+        Me.AddSubview(Me.DotAll)
+        Me.AddSubview(Me.Wrap)
+        Me.Help.Text = "Current document · Grep: $1 or \\1, ${name}, \\U…\\E, \\n, \\t; $$ = dollar"
+        Me.AddSubview(Me.Help)
+        Me.Status.IsReadOnly = True
+        Me.Status.AccessibleLabel = "Search results and replacement preview"
+        Me.AddSubview(Me.Status)
+        Dim captions As Array Of String = ["Previous", "Next", "Preview", "Replace & Find", "Replace All", "Freeze selection", "Clear scope", "History", "Clear history"]
+        Dim actions As Array Of String = ["previous", "next", "preview", "replace", "replace-all", "freeze", "clear-scope", "history", "clear-history"]
+        For i As Integer = 0 To Array.Count(captions) - 1
+            Dim button As New StudioSearchButton()
+            button.Owner = Me
+            button.Caption = captions(i)
+            button.CommandName = actions(i)
+            Me.Buttons.Append(button)
+            Me.AddSubview(button)
+        Next
+        Me.History.Load()
+        If Me.History.LastError <> "" Then Me.Status.Text = Me.History.LastError
+        Me.LayoutControls(760, 510)
+    End Sub
+
+    Public Sub Command(action As String)
+        Dim link As StudioSearchLink = Me.HostLink
+        If link = Nil Then Return
+        Dim searchHost As StudioSearchHost = link.Host
+        If searchHost = Nil Then Return
+        Dim selectionHost As StudioSelectionSearchHost = TryCast(searchHost, StudioSelectionSearchHost)
+        Try
+            Select Case action
+                Case "freeze"
+                    If selectionHost = Nil Then Throw New InvalidArgumentException("This editor host does not support frozen-selection search.")
+                    Dim captured As StudioFrozenSearchScope = selectionHost.CaptureSearchSelection()
+                    If captured = Nil Then Throw New InvalidArgumentException("No selection to capture.")
+                    If captured.Length = 0 Then Throw New InvalidArgumentException("No selection to capture.")
+                    Me.FrozenScope = captured
+                    Me.FrozenIndex = -1
+                    Me.Help.Text = "Frozen selection: " + String.From(Me.FrozenScope.Start) + " + " + String.From(Me.FrozenScope.Length) + " codepoints"
+                    Me.Status.Text = "Selection captured. Finding matches will preserve this scope."
+                    Return
+                Case "clear-scope"
+                    Me.FrozenScope = Nil
+                    Me.Help.Text = "Current document · selection scope cleared"
+                    Return
+                Case "clear-history"
+                    Me.History.Clear()
+                    Me.HistoryIndex = -1
+                    Me.Status.Text = "Search history cleared."
+                    If Me.History.LastError <> "" Then Me.Status.Text = Me.History.LastError
+                    Return
+                Case "history"
+                    Me.History.Load()
+                    If Array.Count(Me.History.Entries) = 0 Then
+                        Me.Status.Text = "Search history is empty."
+                        Return
+                    End If
+                    Me.HistoryIndex = (Me.HistoryIndex + 1) Mod Array.Count(Me.History.Entries)
+                    Me.Query.Text = Me.History.Entries(Me.HistoryIndex).Query
+                    Me.Replacement.Text = Me.History.Entries(Me.HistoryIndex).Replacement
+                    Me.Status.Text = "History " + String.From(Me.HistoryIndex + 1) + "/" + String.From(Array.Count(Me.History.Entries))
+                    Return
+            End Select
+        Catch e As Exception
+            Me.Status.Text = e.Message
+            Return
+        End Try
+        If Me.Query.Text = "" Then
+            Me.Status.Text = "Enter text to find."
+            Return
+        End If
+        Dim sensitive As Boolean = Me.MatchCase.Value = Checkbox.CheckState.True
+        Dim words As Boolean = Me.WholeWord.Value = Checkbox.CheckState.True
+        Dim regex As Boolean = Me.Grep.Value = Checkbox.CheckState.True
+        Dim multiline As Boolean = Me.Multiline.Value = Checkbox.CheckState.True
+        Dim dotAll As Boolean = Me.DotAll.Value = Checkbox.CheckState.True
+        Dim wrap As Boolean = Me.Wrap.Value = Checkbox.CheckState.True
+        Me.History.Record(Me.Query.Text, Me.Replacement.Text)
+        Me.HistoryIndex = -1
+        Try
+            If Me.FrozenScope <> Nil Then
+                Me.CommandFrozen(action, selectionHost, sensitive, words, regex, multiline, dotAll, wrap)
+                If Me.History.LastError <> "" Then Me.Status.Text += " · " + Me.History.LastError
+                Return
+            End If
+            If action = "next" Or action = "previous" Then
+                Me.Status.Text = searchHost.SearchSource(Me.Query.Text, action = "next", sensitive, words, regex, multiline, dotAll, wrap)
+            ElseIf action = "preview" Then
+                Me.Status.Text = searchHost.PreviewSource(Me.Query.Text, Me.Replacement.Text, sensitive, words, regex, multiline, dotAll)
+            ElseIf action = "replace" Or action = "replace-all" Then
+                Me.Status.Text = searchHost.ReplaceSource(Me.Query.Text, Me.Replacement.Text, action = "replace-all", sensitive, words, regex, multiline, dotAll, wrap)
+            End If
+            If Me.History.LastError <> "" Then Me.Status.Text += " · " + Me.History.LastError
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+
+    Private Sub CommandFrozen(action As String, host As StudioSelectionSearchHost, sensitive As Boolean, words As Boolean, regex As Boolean, multiline As Boolean, dotAll As Boolean, wrap As Boolean)
+        If host = Nil Then Throw New InvalidArgumentException("Frozen-selection host is unavailable.")
+        Dim options As New StudioSearchOptions()
+        options.Query = Me.Query.Text
+        options.Replacement = Me.Replacement.Text
+        options.MatchCase = sensitive
+        options.WholeWord = words
+        options.Regex = regex
+        options.Multiline = multiline
+        options.DotAll = dotAll
+        Dim signature As String = Json.Stringify(JSONItem.From(Me.Query.Text)) + String.From(sensitive) + String.From(words) + String.From(regex) + String.From(multiline) + String.From(dotAll)
+        If String.Compare(signature, Me.FrozenQuery, True) <> 0 Then Me.FrozenIndex = -1
+        Me.FrozenQuery = signature
+        Dim current As StudioSearchDocument = host.ReadSearchSelectionDocument()
+        Dim scope As StudioFrozenSearchScope = Me.FrozenScope
+        Dim hits As Array Of StudioFindHit = scope.Hits(current, options, False)
+        Dim count As Integer = Array.Count(hits)
+        If count = 0 Then
+            Me.Status.Text = "No matches inside the frozen selection."
+            Return
+        End If
+        If action = "preview" Then
+            hits = scope.Hits(current, options, True)
+            Me.Status.Text = String.From(count) + " matches in frozen selection"
+            For i As Integer = 0 To Math.Min(count, 20) - 1
+                Me.Status.Text += "\n" + String.From(hits(i).Start) + ": " + String.Substring(current.Text, hits(i).Start, hits(i).Length) + " → " + hits(i).Replacement
+            Next
+            Return
+        End If
+        If action = "next" Or action = "previous" Then
+            Dim index As Integer = Me.FrozenIndex + 1
+            If action = "previous" Then
+                index = Me.FrozenIndex - 1
+                If Me.FrozenIndex = -1 Then index = count - 1
+            End If
+            If index < 0 Or index >= count Then
+                If Not wrap Then
+                    Me.Status.Text = "End of frozen selection."
+                    Return
+                End If
+                index = (index + count) Mod count
+            End If
+            Me.FrozenIndex = index
+            host.SelectSearchRange(hits(index).Start, hits(index).Length)
+            Me.Status.Text = "Frozen match " + String.From(index + 1) + "/" + String.From(count)
+            Return
+        End If
+        If action <> "replace" And action <> "replace-all" Then Return
+        If action = "replace" Then
+            Dim selected As StudioFrozenSearchScope = host.CaptureSearchSelection()
+            Dim ready As Boolean = Me.FrozenIndex >= 0 And Me.FrozenIndex < count
+            If ready Then
+                ready = selected <> Nil
+                If ready Then ready = selected.Start = hits(Me.FrozenIndex).Start And selected.Length = hits(Me.FrozenIndex).Length
+            End If
+            If Not ready Then
+                Me.FrozenIndex = 0
+                host.SelectSearchRange(hits(0).Start, hits(0).Length)
+                Me.Status.Text = "Match selected. Choose Replace to change it."
+                Return
+            End If
+        End If
+        hits = scope.Hits(current, options, True)
+        Dim chosen As Array Of StudioFindHit = hits
+        If action = "replace" Then chosen = [hits(Me.FrozenIndex)]
+        Dim fresh As String = StudioSearchReplaceHits(current.Text, chosen)
+        Dim request As New ProjectChangeRequest(current.Id, current.Version, [New EditorEdit(0, String.LenBytes(current.Text), fresh)])
+        host.ApplySearchSelection(request)
+        Dim after As StudioSearchDocument = host.ReadSearchSelectionDocument()
+        If after.Id <> current.Id Or String.Compare(after.Text, fresh, True) <> 0 Then
+            Me.FrozenScope = Nil
+            Throw New InvalidArgumentException("Host did not publish the expected replacement; selection scope cleared.")
+        End If
+        Me.FrozenScope = New StudioFrozenSearchScope(after, Me.FrozenScope.Start, Me.FrozenScope.Length + String.Len(fresh) - String.Len(current.Text))
+        Me.FrozenIndex = -1
+        Me.Status.Text = String.From(Array.Count(chosen)) + " replacements in frozen selection."
+        If action = "replace" Then
+            scope = Me.FrozenScope
+            Dim remaining As Array Of StudioFindHit = scope.Hits(after, options)
+            Dim nextIndex As Integer = -1
+            If String.Compare(current.Text, fresh, True) = 0 Then
+                ' Locate the replaced hit explicitly after resetting the navigation index.
+                For i As Integer = 0 To count - 1
+                    If hits(i) = chosen(0) Then nextIndex = i + 1
+                Next
+                If nextIndex >= Array.Count(remaining) Then nextIndex = -1
+            Else
+                Dim resumeAt As Integer = chosen(0).Start + String.Len(chosen(0).Replacement)
+                For i As Integer = 0 To Array.Count(remaining) - 1
+                    If remaining(i).Start >= resumeAt Then
+                        nextIndex = i
+                        Exit For
+                    End If
+                Next
+            End If
+            If nextIndex < 0 And wrap And Array.Count(remaining) > 0 Then nextIndex = 0
+            If nextIndex >= 0 Then
+                Me.FrozenIndex = nextIndex
+                host.SelectSearchRange(remaining(nextIndex).Start, remaining(nextIndex).Length)
+                Me.Status.Text += " Next: " + String.From(nextIndex + 1) + "/" + String.From(Array.Count(remaining))
+            End If
+        End If
+    End Sub
+
+    Private Sub LayoutControls(width As Integer, height As Integer)
+        Me.Labels(0).Move(16, 18, 100, 24)
+        Me.Labels(1).Move(16, 58, 100, 24)
+        Me.Query.Move(124, 14, width - 140, 30)
+        Me.Replacement.Move(124, 54, width - 140, 30)
+        Me.MatchCase.Move(124, 94, 150, 26)
+        Me.WholeWord.Move(286, 94, 150, 26)
+        Me.Grep.Move(460, 94, 240, 26)
+        Me.Wrap.Move(124, 126, 150, 26)
+        Me.Multiline.Move(286, 126, 170, 26)
+        Me.DotAll.Move(460, 126, 240, 26)
+        For i As Integer = 0 To Array.Count(Me.Buttons) - 1
+            Me.Buttons(i).Move(16 + (i Mod 5) * 144, 174 + (i \ 5) * 36, 136, 30)
+        Next
+        Me.Help.Move(16, 258, width - 32, 26)
+        Me.Status.Move(16, 298, width - 32, height - 314)
+    End Sub
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutControls(Math.Round(width), Math.Round(height))
+    End Handle
+
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+
+    Handle Closed()
+        Me.IsClosed = True
+    End Handle
+
+    Public Sub Dispose()
+        Me.HostLink = Nil
+        Me.Disposing = True
+        ' BUI-103: Close followed by owned-control release double-destroys GTK peers.
+        ' Release the hidden window normally until the upstream lifecycle repro passes.
+        Me.IsClosed = True
+        Me.Visible = False
+    End Sub
+End Class

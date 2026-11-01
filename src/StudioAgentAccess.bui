@@ -1,0 +1,50 @@
+Import projectkit
+
+''' Studio-owned permissions. Each new session receives a fresh immutable-by-convention snapshot.
+Public Class StudioAgentAccess
+    Public Property Mode As Integer = 1
+    Public Property DisabledTools As Set Of String = New Set Of String()
+    Public Property Resources As Boolean = True
+    Public Property Attachments As Boolean = True
+    Public Property Guidance As Boolean = True
+
+    Public Shared Function ToolNames() As Array Of String
+        Return ["project_workspace", "project_list_items", "project_read_item", "project_search", "project_proposal_status", "project_propose_edits", "buoy_search_docs", "buoy_read_doc_page", "project_check", "project_check_result", "project_render", "project_render_result", "project_script_help", "project_script", "project_script_result", "project_script_cancel"]
+    End Function
+
+    Public Function HostAccess() As ProjectToolAccess
+        Dim access As New ProjectToolAccess()
+        access.ResourcesEnabled = Me.Resources
+        For Each name As String In StudioAgentAccess.ToolNames()
+            If Me.DisabledTools.Contains(name) Then access.DisabledTools.Add(name)
+        Next
+        If Me.Mode = 0 Then
+            For Each name As String In ["project_propose_edits", "project_script", "project_render"]
+                access.DisabledTools.Add(name)
+            Next
+        End If
+        Return access
+    End Function
+
+    Public Sub Load(domain As String)
+        Me.Mode = Prefs.Get(domain, "agent.access.mode", 1)
+        If Me.Mode < 0 Or Me.Mode > 2 Then Me.Mode = 1
+        Me.DisabledTools = New Set Of String()
+        Me.Resources = Prefs.Get(domain, "agent.access.resources", True)
+        Me.Attachments = Prefs.Get(domain, "agent.access.attachments", True)
+        Me.Guidance = Prefs.Get(domain, "agent.access.guidance", True)
+        For Each name As String In StudioAgentAccess.ToolNames()
+            If Not Prefs.Get(domain, "agent.access.tool." + name, True) Then Me.DisabledTools.Add(name)
+        Next
+    End Sub
+
+    Public Sub Save(domain As String)
+        Prefs.Set(domain, "agent.access.mode", Me.Mode)
+        Prefs.Set(domain, "agent.access.resources", Me.Resources)
+        Prefs.Set(domain, "agent.access.attachments", Me.Attachments)
+        Prefs.Set(domain, "agent.access.guidance", Me.Guidance)
+        For Each name As String In StudioAgentAccess.ToolNames()
+            Prefs.Set(domain, "agent.access.tool." + name, Not Me.DisabledTools.Contains(name))
+        Next
+    End Sub
+End Class

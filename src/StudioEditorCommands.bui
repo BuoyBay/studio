@@ -1,0 +1,141 @@
+' The command vocabulary of Studio's source editor, for menus, the command palette and
+' key binding hosts. Every Id is accepted by StudioCodeEditor.PerformCommand(id) (the
+' TextInputCanvas DoCommand vocabulary). Shortcut is a hint in "Primary+Shift+K"
+' form ("Primary" = Command on macOS, Ctrl elsewhere; "Alt" = Option); "" = none.
+' Pure data; no GUI dependency.
+
+Public Class StudioEditorCommandInfo
+    Public Property Id As String
+    Public Property Title As String
+    Public Property Category As String
+    Public Property Shortcut As String
+    ''' True when the command changes the text (disabled for read-only editors).
+    Public Property Edits As Boolean
+
+    Public Sub Constructor(id As String, title As String, category As String, shortcut As String, edits As Boolean)
+        Me.Id = id
+        Me.Title = title
+        Me.Category = category
+        Me.Shortcut = shortcut
+        Me.Edits = edits
+    End Sub
+End Class
+
+Private Sub CommandAdd(list As Array Of StudioEditorCommandInfo, id As String, title As String, category As String, shortcut As String, edits As Boolean)
+    Array.Append(list, New StudioEditorCommandInfo(id, title, category, shortcut, edits))
+End Sub
+
+''' Human-readable hint; editor shortcuts remain scoped to the focused canvas.
+Public Function StudioEditorShortcutLabel(shortcut As String) As String
+    Dim primary As String = "Ctrl+"
+    Dim alternate As String = "Alt+"
+    #If TargetMac Then
+        primary = "Cmd+"
+        alternate = "Option+"
+    #End If
+    Return String.Replace(String.Replace(shortcut, "Primary+", primary), "Alt+", alternate)
+End Function
+
+''' Every user-facing editor command, grouped by Category (Edit, Selection, Multi-Cursor,
+''' Lines, Transform, Folding, Snippets, Macros, Navigation, View, Language).
+Public Function StudioEditorCommandList() As Array Of StudioEditorCommandInfo
+    Dim list As Array Of StudioEditorCommandInfo = []
+    CommandAdd(list, "toggleComment", "Toggle Line Comment", "Edit", "Primary+/", True)
+    CommandAdd(list, "indent", "Indent Lines", "Edit", "Primary+]", True)
+    CommandAdd(list, "outdent", "Outdent Lines", "Edit", "Primary+[", True)
+    CommandAdd(list, "duplicateLines", "Duplicate Lines", "Lines", "", True)
+    ' Linux follows VS Code's Linux keymap: Ctrl+Alt+Up/Down belong to the desktop
+    ' (GNOME workspaces), so cursors move to Shift+Alt and copy lines to Ctrl+Shift+Alt.
+    ' These hints become host bindings, so they must match StudioCodeEditor.KeyCommand.
+    Dim copyUp As String = "Alt+Shift+Up"
+    Dim cursorUp As String = "Primary+Alt+Up"
+    Dim cursorDown As String = "Primary+Alt+Down"
+    Dim columnUp As String = "Primary+Alt+Shift+Up"
+    Dim columnDown As String = "Primary+Alt+Shift+Down"
+    #If TargetLinux Then
+        copyUp = "Primary+Alt+Shift+Up"
+        cursorUp = "Alt+Shift+Up"
+        cursorDown = "Alt+Shift+Down"
+        columnUp = ""
+        columnDown = ""
+    #End If
+    CommandAdd(list, "copyLinesUp", "Copy Lines Up", "Lines", copyUp, True)
+    CommandAdd(list, "moveLinesUp", "Move Lines Up", "Lines", "Alt+Up", True)
+    CommandAdd(list, "moveLinesDown", "Move Lines Down", "Lines", "Alt+Down", True)
+    CommandAdd(list, "joinLines", "Join Lines", "Lines", "Primary+J", True)
+    CommandAdd(list, "sortLinesAscending", "Sort Lines Ascending", "Lines", "", True)
+    CommandAdd(list, "sortLinesDescending", "Sort Lines Descending", "Lines", "", True)
+    CommandAdd(list, "sortLinesCaseInsensitive", "Sort Lines (Ignore Case)", "Lines", "", True)
+    CommandAdd(list, "sortLinesNatural", "Sort Lines (Natural Order)", "Lines", "", True)
+    CommandAdd(list, "reverseLines", "Reverse Lines", "Lines", "", True)
+    CommandAdd(list, "uniqueLines", "Delete Duplicate Lines", "Lines", "", True)
+    CommandAdd(list, "trimTrailingWhitespace", "Trim Trailing Whitespace", "Lines", "", True)
+    CommandAdd(list, "transformUppercase", "Transform to Uppercase", "Transform", "", True)
+    CommandAdd(list, "transformLowercase", "Transform to Lowercase", "Transform", "", True)
+    CommandAdd(list, "transformTitlecase", "Transform to Title Case", "Transform", "", True)
+    CommandAdd(list, "transformSnakecase", "Transform to snake_case", "Transform", "", True)
+    CommandAdd(list, "transformCamelcase", "Transform to camelCase", "Transform", "", True)
+    CommandAdd(list, "transformKebabcase", "Transform to kebab-case", "Transform", "", True)
+    CommandAdd(list, "expandSelection", "Expand Selection", "Selection", "Alt+Shift+Right", False)
+    CommandAdd(list, "shrinkSelection", "Shrink Selection", "Selection", "Alt+Shift+Left", False)
+    CommandAdd(list, "selectLine", "Select Line", "Selection", "Primary+L", False)
+    CommandAdd(list, "addCursorAbove", "Add Cursor Above", "Multi-Cursor", cursorUp, False)
+    CommandAdd(list, "addCursorBelow", "Add Cursor Below", "Multi-Cursor", cursorDown, False)
+    CommandAdd(list, "addNextOccurrence", "Add Next Occurrence", "Multi-Cursor", "Primary+D", False)
+    CommandAdd(list, "skipOccurrence", "Skip to Next Occurrence", "Multi-Cursor", "", False)
+    CommandAdd(list, "selectAllOccurrences", "Select All Occurrences", "Multi-Cursor", "Primary+Shift+L", False)
+    CommandAdd(list, "cursorsAtLineEnds", "Add Cursors to Line Ends", "Multi-Cursor", "Alt+Shift+I", False)
+    CommandAdd(list, "columnSelectUp", "Column Select Up", "Multi-Cursor", columnUp, False)
+    CommandAdd(list, "columnSelectDown", "Column Select Down", "Multi-Cursor", columnDown, False)
+    CommandAdd(list, "columnSelectLeft", "Column Select Left", "Multi-Cursor", "Primary+Alt+Shift+Left", False)
+    CommandAdd(list, "columnSelectRight", "Column Select Right", "Multi-Cursor", "Primary+Alt+Shift+Right", False)
+    CommandAdd(list, "undoCursor", "Undo Last Cursor Operation", "Multi-Cursor", "Primary+U", False)
+    CommandAdd(list, "collapseSelections", "Single Cursor", "Multi-Cursor", "Escape", False)
+    CommandAdd(list, "pasteColumn", "Paste as Column", "Multi-Cursor", "Primary+Alt+Shift+V", True)
+    CommandAdd(list, "jumpToBracket", "Go to Matching Bracket", "Navigation", "Primary+Shift+\\", False)
+    CommandAdd(list, "selectToBracket", "Select to Matching Bracket", "Navigation", "", False)
+    CommandAdd(list, "jumpToBlockPartner", "Go to Matching Block Line", "Navigation", "Primary+Alt+\\", False)
+    CommandAdd(list, "goToNextMarker", "Next Problem", "Navigation", "Primary+'", False)
+    CommandAdd(list, "goToPreviousMarker", "Previous Problem", "Navigation", "Primary+Shift+'", False)
+    CommandAdd(list, "fold", "Fold", "Folding", "Primary+Alt+[", False)
+    CommandAdd(list, "unfold", "Unfold", "Folding", "Primary+Alt+]", False)
+    CommandAdd(list, "toggleFold", "Toggle Fold", "Folding", "", False)
+    CommandAdd(list, "foldRecursively", "Fold Recursively", "Folding", "", False)
+    CommandAdd(list, "unfoldRecursively", "Unfold Recursively", "Folding", "", False)
+    CommandAdd(list, "foldAll", "Fold All", "Folding", "", False)
+    CommandAdd(list, "unfoldAll", "Unfold All", "Folding", "", False)
+    CommandAdd(list, "foldComments", "Fold All Comments", "Folding", "", False)
+    For level As Integer = 1 To 7
+        CommandAdd(list, "foldLevel" + String.From(level), "Fold Level " + String.From(level), "Folding", "", False)
+    Next
+    CommandAdd(list, "expandSnippet", "Expand Snippet", "Snippets", "Tab", True)
+    CommandAdd(list, "nextTabstop", "Next Snippet Placeholder", "Snippets", "Tab", False)
+    CommandAdd(list, "previousTabstop", "Previous Snippet Placeholder", "Snippets", "Shift+Tab", False)
+    CommandAdd(list, "exitSnippet", "Leave Snippet", "Snippets", "Escape", False)
+    CommandAdd(list, "toggleMacroRecording", "Start/Stop Recording Macro", "Macros", "Primary+Alt+R", False)
+    CommandAdd(list, "replayMacro", "Replay Macro", "Macros", "Primary+Alt+P", True)
+    CommandAdd(list, "toggleWhitespace", "Render Whitespace", "View", "", False)
+    CommandAdd(list, "toggleIndentGuides", "Indent Guides", "View", "", False)
+    CommandAdd(list, "toggleStickyScopes", "Sticky Scopes", "View", "", False)
+    CommandAdd(list, "toggleOccurrences", "Highlight Occurrences", "View", "", False)
+    CommandAdd(list, "toggleMinimap", "Minimap", "View", "", False)
+    CommandAdd(list, "toggleFolding", "Code Folding", "View", "", False)
+    CommandAdd(list, "toggleWordWrap", "Word Wrap", "View", "", False)
+    CommandAdd(list, "triggerCompletion", "Trigger Completion", "Language", "Primary+Space", False)
+    CommandAdd(list, "triggerParameterHints", "Trigger Parameter Hints", "Language", "Primary+Shift+Space", False)
+    Return list
+End Function
+
+''' The catalog entry for an id, or Nil.
+Public Function StudioEditorCommandInfoFor(id As String) As StudioEditorCommandInfo
+    For Each command As StudioEditorCommandInfo In StudioEditorCommandList()
+        If command.Id = id Then Return command
+    Next
+    Return Nil
+End Function
+
+''' Editor reports acceptance only after the insertion succeeds.
+Public Interface StudioCompletionFeedback
+    Sub CompletionShown()
+    Sub CompletionAccepted()
+End Interface

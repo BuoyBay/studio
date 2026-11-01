@@ -1,0 +1,1 @@
+{"schema":1,"resources":[{"kind":"AppIcon","path":"AppIcon.icns","platforms":["Mac"]},{"kind":"AppIcon","path":"AppIcon.ico","platforms":["Windows"]},{"kind":"AppIcon","path":"AppIcon.png","platforms":["Linux"]}]}

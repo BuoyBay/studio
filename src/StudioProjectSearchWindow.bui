@@ -1,0 +1,379 @@
+Import StudioProjectSearch
+Import StudioSearchHistory
+
+Private Class StudioProjectSearchButton Inherits Button
+    Public Property Owner As Weak StudioProjectSearchWindow
+    Public Property CommandName As String
+    Handle Action()
+        Dim target As StudioProjectSearchWindow = Me.Owner
+        If target <> Nil Then target.Command(Me.CommandName)
+    End Handle
+End Class
+
+Private Class StudioProjectSearchTimer Inherits Timer
+    Public Property Owner As Weak StudioProjectSearchWindow
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioProjectSearchWindow = Me.Owner
+        If target <> Nil Then target.Tick()
+    End Sub
+End Class
+
+Private Class StudioProjectSearchList Inherits ListBox
+    Public Property Owner As Weak StudioProjectSearchWindow
+    Handle SelectionChanged()
+        Dim target As StudioProjectSearchWindow = Me.Owner
+        If target <> Nil Then target.ResultSelectionChanged(Me.SelectedRow)
+    End Handle
+End Class
+
+Private Class StudioProjectSearchRows Inherits ListBoxDataSource
+    Public Property Items As Array Of StudioProjectSearchResult = []
+    Public Overrides Function RowCount() As Integer
+        Return Array.Count(Me.Items)
+    End Function
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        Dim label As New Label()
+        label.Move(4, 2, 380, 20)
+        cell.AddSubview(label)
+    End Sub
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        If row < 0 Or row >= Array.Count(Me.Items) Or cell.SubviewCount() = 0 Then Return
+        Dim label As Label = TryCast(cell.Subview(0), Label)
+        If label = Nil Then Return
+        Dim item As StudioProjectSearchResult = Me.Items(row)
+        Select Case column
+            Case 0
+                label.Text = ""
+                If item.Selected Then label.Text = "✓"
+            Case 1
+                label.Text = item.Document.Path
+            Case 2
+                label.Text = String.From(item.Line) + ":" + String.From(item.Column)
+            Case Else
+                label.Text = String.Replace(item.Preview, "\n", " ↵ ", True)
+        End Select
+    End Sub
+End Class
+
+''' Standalone modeless project search, replacement preview and comment task list.
+''' Parent owns host; call Dispose before dropping parent to release host references.
+Public Class StudioProjectSearchWindow Inherits Window
+    Public Property Host As StudioProjectSearchHost
+    Public Property Job As StudioProjectSearchJob
+    Private Property Jobs As Map Of String, StudioProjectSearchJob = New Map Of String, StudioProjectSearchJob()
+    Public Property History As StudioSearchHistory = New StudioSearchHistory()
+    Public Property Query As TextField = New TextField()
+    Public Property Replacement As TextField = New TextField()
+    Public Property IncludePaths As TextField = New TextField()
+    Public Property ExcludePaths As TextField = New TextField()
+    Public Property MatchCase As Checkbox = New Checkbox()
+    Public Property WholeWord As Checkbox = New Checkbox()
+    Public Property Regex As Checkbox = New Checkbox()
+    Public Property Multiline As Checkbox = New Checkbox()
+    Public Property DotAll As Checkbox = New Checkbox()
+    Public Property Status As Label = New Label()
+    Public Property Detail As TextArea = New TextArea()
+    Public Property IsClosed As Boolean = False
+    Private Property Labels As Array Of Label = []
+    Private Property Buttons As Array Of StudioProjectSearchButton = []
+    Private Property Rows As StudioProjectSearchRows = New StudioProjectSearchRows()
+    Private Property ResultsList As StudioProjectSearchList = New StudioProjectSearchList()
+    Private Property Pulse As StudioProjectSearchTimer = New StudioProjectSearchTimer()
+    Private Property HistoryIndex As Integer = -1
+    Private Property Disposing As Boolean = False
+    Private Property SelectingResult As Boolean = False
+
+    Public Sub Constructor(host As StudioProjectSearchHost)
+        Super.Constructor()
+        Me.Host = host
+        Me.Title = "Project Results — Search, Spelling and Tasks"
+        Me.Move(120, 110, 1000, 690)
+        Me.SetMinSize(1000.0, 600.0)
+        For Each caption As String In ["Find", "Replace", "Include globs", "Exclude globs"]
+            Dim label As New Label()
+            label.Text = caption
+            Me.Labels.Append(label)
+            Me.AddSubview(label)
+        Next
+        Me.Query.AccessibleLabel = "Project find text"
+        Me.Replacement.AccessibleLabel = "Project replacement text"
+        Me.IncludePaths.AccessibleLabel = "Include path globs separated by semicolons"
+        Me.ExcludePaths.AccessibleLabel = "Exclude path globs separated by semicolons"
+        Me.AddSubview(Me.Query)
+        Me.AddSubview(Me.Replacement)
+        Me.AddSubview(Me.IncludePaths)
+        Me.AddSubview(Me.ExcludePaths)
+        Me.MatchCase.Caption = "Match case"
+        Me.WholeWord.Caption = "Whole word"
+        Me.Regex.Caption = "PCRE regex"
+        Me.Multiline.Caption = "Line anchors"
+        Me.Multiline.Value = Checkbox.CheckState.True
+        Me.DotAll.Caption = "Dot matches newline"
+        Me.AddSubview(Me.MatchCase)
+        Me.AddSubview(Me.WholeWord)
+        Me.AddSubview(Me.Regex)
+        Me.AddSubview(Me.Multiline)
+        Me.AddSubview(Me.DotAll)
+        Dim captions As Array Of String = ["Search / Preview", "TODO / FIXME", "Check Spelling", "Previous", "Next", "Cancel", "Toggle row", "Select all", "Select none", "Apply selected", "History", "Clear history"]
+        Dim actions As Array Of String = ["search", "todo", "spelling", "previous", "next", "cancel", "toggle", "all", "none", "apply", "history", "clear-history"]
+        For i As Integer = 0 To Array.Count(actions) - 1
+            Dim button As New StudioProjectSearchButton()
+            button.Owner = Me
+            button.Caption = captions(i)
+            button.CommandName = actions(i)
+            Me.Buttons.Append(button)
+            Me.AddSubview(button)
+        Next
+        Me.ResultsList.Owner = Me
+        Me.ResultsList.AddColumn("Use", 45.0)
+        Me.ResultsList.AddColumn("File (grouped)", 300.0)
+        Me.ResultsList.AddColumn("Line:Column", 110.0)
+        Me.ResultsList.AddColumn("Match / spelling / task", 490.0)
+        Me.ResultsList.AccessibleLabel = "Project search, spelling and task results"
+        Me.ResultsList.DataSource = Me.Rows
+        Me.ResultsList.DefaultRowHeight = 24.0
+        Me.AddSubview(Me.ResultsList)
+        Me.AddSubview(Me.Status)
+        Me.Detail.IsReadOnly = True
+        Me.AddSubview(Me.Detail)
+        Me.Pulse.Owner = Me
+        Me.Pulse.Period = 20
+        Me.History.Load()
+        Me.Status.Text = "Preview replacements, toggle rows, then Apply selected. Globs: * and ?; separate with ;"
+        If Me.History.LastError <> "" Then Me.Status.Text = Me.History.LastError
+        Me.LayoutControls(1000, 690)
+    End Sub
+
+    Public Sub Command(action As String)
+        Try
+            Select Case action
+                Case "search", "todo", "spelling"
+                    If Me.Jobs.ContainsKey(action) Then Me.Jobs.Get(action).Value.Cancel()
+                    Dim options As New StudioSearchOptions()
+                    options.Query = Me.Query.Text
+                    options.Replacement = Me.Replacement.Text
+                    options.MatchCase = Me.MatchCase.Value = Checkbox.CheckState.True
+                    options.WholeWord = Me.WholeWord.Value = Checkbox.CheckState.True
+                    options.Regex = Me.Regex.Value = Checkbox.CheckState.True
+                    options.Multiline = Me.Multiline.Value = Checkbox.CheckState.True
+                    options.DotAll = Me.DotAll.Value = Checkbox.CheckState.True
+                    options.IncludePaths = Me.IncludePaths.Text
+                    options.ExcludePaths = Me.ExcludePaths.Text
+                    Me.Job = New StudioProjectSearchJob(Me.Host, options, action = "todo", action = "spelling")
+                    Me.Jobs.Set(action, Me.Job)
+                    If action = "search" Then
+                        Me.History.Record(options.Query, options.Replacement)
+                        Me.HistoryIndex = -1
+                    End If
+                    Me.Rows.Items = []
+                    Me.ReloadResults()
+                    Me.Detail.Text = ""
+                    Me.RefreshActions()
+                    Me.Pulse.Start()
+                    Me.Tick()
+                Case "previous", "next"
+                    Me.NavigateResult(action = "next")
+                Case "cancel"
+                    If Me.Job <> Nil Then Me.Job.Cancel()
+                    Me.Tick()
+                Case "all", "none", "toggle"
+                    If Me.Job = Nil Then Return
+                    If Me.Job.TodoMode Or Me.Job.SpellingMode Then Return
+                    For i As Integer = 0 To Array.Count(Me.Job.Results) - 1
+                        If action = "all" Then Me.Job.Results(i).Selected = True
+                        If action = "none" Then Me.Job.Results(i).Selected = False
+                        If action = "toggle" And i = Me.ResultsList.SelectedRow Then Me.Job.Results(i).Selected = Not Me.Job.Results(i).Selected
+                    Next
+                    Me.ReloadResults()
+                Case "apply"
+                    If Me.Job = Nil Then Return
+                    Dim applyingJob As StudioProjectSearchJob = Me.Job
+                    applyingJob.ApplySelected()
+                    Me.Status.Text = "Selected replacements applied atomically. Search again for a new preview."
+                    Me.Detail.Text = ""
+                Case "history"
+                    Me.History.Load()
+                    If Array.Count(Me.History.Entries) = 0 Then
+                        Me.Status.Text = "Search history is empty."
+                        Return
+                    End If
+                    Me.HistoryIndex = (Me.HistoryIndex + 1) Mod Array.Count(Me.History.Entries)
+                    Dim entry As StudioSearchHistoryEntry = Me.History.Entries(Me.HistoryIndex)
+                    Me.Query.Text = entry.Query
+                    Me.Replacement.Text = entry.Replacement
+                    Me.Status.Text = "History " + String.From(Me.HistoryIndex + 1) + "/" + String.From(Array.Count(Me.History.Entries))
+                Case "clear-history"
+                    Me.History.Clear()
+                    Me.HistoryIndex = -1
+                    Me.Status.Text = "Search history cleared."
+            End Select
+            If Me.History.LastError <> "" Then Me.Status.Text += " · " + Me.History.LastError
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+
+    Public Sub Tick()
+        If Me.Job = Nil Then Return
+        Dim countBefore As Integer = Array.Count(Me.Job.Results)
+        Dim active As Boolean = False
+        For Each mode As String In ["search", "todo", "spelling"]
+            If Not Me.Jobs.ContainsKey(mode) Then Continue For
+            Dim pending As StudioProjectSearchJob = Me.Jobs.Get(mode).Value
+            pending.Step()
+            If pending.IsActive() Then active = True
+        Next
+        Me.Status.Text = Me.Job.Summary()
+        If countBefore <> Array.Count(Me.Job.Results) Then
+            Me.Rows.Items = Me.Job.Results
+            Me.ReloadResults()
+        End If
+        Me.RefreshActions()
+        If Not active Then Me.Pulse.Stop()
+    End Sub
+
+    Private Sub ReloadResults()
+        Me.SelectingResult = True
+        Try
+            Me.ResultsList.ReloadData()
+            If Me.Job <> Nil Then
+                If Me.Job.SelectedResult >= 0 And Me.Job.SelectedResult < Array.Count(Me.Rows.Items) Then Me.ResultsList.SelectedRow = Me.Job.SelectedResult
+            End If
+        Finally
+            Me.SelectingResult = False
+        End Try
+    End Sub
+
+    Private Sub RefreshActions()
+        Dim replacementMode As Boolean = False
+        If Me.Job <> Nil Then replacementMode = Not Me.Job.TodoMode And Not Me.Job.SpellingMode
+        For Each button As StudioProjectSearchButton In Me.Buttons
+            Select Case button.CommandName
+                Case "all", "none", "toggle"
+                    button.Enabled = replacementMode
+                Case "apply"
+                    button.Enabled = False
+                    If replacementMode Then button.Enabled = Me.Job.Complete And Not Me.Job.Cancelled And Me.Job.ErrorMessage = "" And Me.Job.ReplacementError = ""
+                Case "previous", "next"
+                    button.Enabled = False
+                    If Me.Job <> Nil Then button.Enabled = Array.Count(Me.Job.Results) > 0
+            End Select
+        Next
+    End Sub
+
+    ''' The one results surface retains independent searches, spelling and task scans.
+    ''' Menu commands can switch back to a retained mode without rerunning its scan.
+    Public Sub NavigateResult(forward As Boolean, mode As String = "")
+        If mode <> "" Then
+            If Not Me.Jobs.ContainsKey(mode) Then
+                Me.Status.Text = "Run a project " + mode + " scan first."
+                Return
+            End If
+            Me.Job = Me.Jobs.Get(mode).Value
+            Me.Rows.Items = Me.Job.Results
+            Me.ReloadResults()
+        End If
+        If Me.Job = Nil Then
+            Me.Status.Text = "Run a project scan first."
+            Return
+        End If
+        Dim index As Integer = Me.Job.MoveResult(forward)
+        Me.RefreshActions()
+        If index < 0 Then
+            Me.Status.Text = Me.Job.Summary() + " · No results to navigate."
+            Return
+        End If
+        Me.SelectingResult = True
+        Me.ResultsList.SelectedRow = index
+        Me.SelectingResult = False
+        Me.Reveal(index)
+    End Sub
+
+    Public Sub ResultSelectionChanged(index As Integer)
+        If Not Me.SelectingResult Then Me.Reveal(index)
+    End Sub
+
+    Public Sub Reveal(index As Integer)
+        If index < 0 Or index >= Array.Count(Me.Rows.Items) Then Return
+        Dim item As StudioProjectSearchResult = Me.Rows.Items(index)
+        Dim document As StudioSearchDocument = item.Document
+        If Me.Job <> Nil Then Me.Job.SelectedResult = index
+        Me.Detail.Text = document.Path + ":" + String.From(item.Line) + ":" + String.From(item.Column) + "\n" + item.Preview
+        If Me.Job <> Nil Then
+            If Me.Job.SpellingMode Then
+                Me.Detail.Text += "\nPossible misspelling. Use the editor's spelling suggestions to correct it; rescan after edits."
+            ElseIf Not Me.Job.TodoMode Then
+                If Me.Job.ReplacementError <> "" Then
+                    Me.Detail.Text += "\nReplacement error: " + Me.Job.ReplacementError
+                Else
+                    Me.Detail.Text += "\nReplace with:\n" + item.Hit.Replacement
+                End If
+            End If
+        End If
+        Dim searchHost As StudioProjectSearchHost = Me.Host
+        Try
+            Dim current As StudioSearchDocument = searchHost.ReadSearchItem(document.Id)
+            If current.Version <> document.Version Or String.Compare(current.Text, document.Text, True) <> 0 Then Throw New InvalidArgumentException("Result is stale; search again before opening this location.")
+            searchHost.OpenSearchLocation(document.Id, item.Hit.Start, item.Hit.Length)
+            Me.Status.Text = "Result " + String.From(index + 1) + " of " + String.From(Array.Count(Me.Rows.Items)) + " · " + Me.Job.Summary()
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+
+    Private Sub LayoutControls(width As Integer, height As Integer)
+        Me.Labels(0).Move(16, 16, 110, 24)
+        Me.Labels(1).Move(16, 52, 110, 24)
+        Me.Labels(2).Move(16, 88, 110, 24)
+        Me.Labels(3).Move(510, 88, 110, 24)
+        Me.Query.Move(130, 12, width - 146, 30)
+        Me.Replacement.Move(130, 48, width - 146, 30)
+        Me.IncludePaths.Move(130, 84, 360, 30)
+        Me.ExcludePaths.Move(630, 84, width - 646, 30)
+        Me.MatchCase.Move(16, 122, 150, 26)
+        Me.WholeWord.Move(174, 122, 150, 26)
+        Me.Regex.Move(332, 122, 150, 26)
+        Me.Multiline.Move(490, 122, 150, 26)
+        Me.DotAll.Move(648, 122, 260, 26)
+        For i As Integer = 0 To Array.Count(Me.Buttons) - 1
+            Me.Buttons(i).Move(16 + (i Mod 6) * 160, 160 + (i \ 6) * 36, 152, 30)
+        Next
+        Me.Status.Move(16, 238, width - 32, 26)
+        Me.ResultsList.Move(16, 270, width - 32, height - 410)
+        Me.Detail.Move(16, height - 130, width - 32, 114)
+    End Sub
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutControls(Math.Round(width), Math.Round(height))
+    End Handle
+    Handle Closing() As Boolean
+        For Each mode As String In ["search", "todo", "spelling"]
+            If Me.Jobs.ContainsKey(mode) Then
+                Dim pending As StudioProjectSearchJob = Me.Jobs.Get(mode).Value
+                If pending.IsActive() Then pending.Cancel()
+            End If
+        Next
+        Me.Pulse.Stop()
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+    Handle Closed()
+        Me.IsClosed = True
+    End Handle
+    Public Sub Dispose()
+        Me.Pulse.Stop()
+        Me.Pulse.Owner = Nil
+        For Each mode As String In ["search", "todo", "spelling"]
+            If Not Me.Jobs.ContainsKey(mode) Then Continue For
+            Dim pending As StudioProjectSearchJob = Me.Jobs.Get(mode).Value
+            pending.Cancel()
+            pending.Host = Nil
+        Next
+        Me.Jobs = New Map Of String, StudioProjectSearchJob()
+        Me.Job = Nil
+        Me.Host = Nil
+        Me.Disposing = True
+        Me.IsClosed = True
+        Me.Visible = False
+    End Sub
+End Class

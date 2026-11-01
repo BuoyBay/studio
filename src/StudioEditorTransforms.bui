@@ -1,0 +1,260 @@
+' Line and case transforms for Studio's source editor (StudioCodeEditor commands
+' sortLines*, reverseLines, uniqueLines, trimTrailingWhitespace, joinLines and the
+' transform*case family). Pure text functions; no GUI dependency. Lines are LF-free
+' strings; case transforms work on codepoints (String.UCase/LCase, Unicode simple
+' mappings) so Unicode text is never split inside a character.
+
+Private Function TransformIsDigit(code As Integer) As Boolean
+    Return code >= 48 And code <= 57
+End Function
+
+' String = and <> ignore case in Buoy; case tests compare exactly.
+Private Function TransformSame(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Private Function TransformIsLetter(ch As String) As Boolean
+    Return Not TransformSame(String.UCase(ch), String.LCase(ch))
+End Function
+
+Private Function TransformIsWordChar(ch As String) As Boolean
+    Dim code As Integer = String.Asc(ch)
+    If TransformIsDigit(code) Or code = 95 Then Return True
+    If TransformIsLetter(ch) Then Return True
+    Return code > 127 And ch <> " " And code <> 160
+End Function
+
+''' Natural comparison: digit runs compare by numeric value ("item2" before "item10"),
+''' other text case-insensitively, ties broken case-sensitively.
+Public Function StudioNaturalCompare(a As String, b As String) As Integer
+    Dim x As Array Of String = String.Chars(a)
+    Dim y As Array Of String = String.Chars(b)
+    Dim i As Integer = 0
+    Dim j As Integer = 0
+    While i < Array.Count(x) And j < Array.Count(y)
+        Dim cx As Integer = String.Asc(x(i))
+        Dim cy As Integer = String.Asc(y(j))
+        If TransformIsDigit(cx) And TransformIsDigit(cy) Then
+            Dim si As Integer = i
+            Dim sj As Integer = j
+            While si < Array.Count(x)
+                If String.Asc(x(si)) <> 48 Then Exit While
+                si += 1
+            Wend
+            While sj < Array.Count(y)
+                If String.Asc(y(sj)) <> 48 Then Exit While
+                sj += 1
+            Wend
+            Dim ei As Integer = si
+            Dim ej As Integer = sj
+            While ei < Array.Count(x)
+                If Not TransformIsDigit(String.Asc(x(ei))) Then Exit While
+                ei += 1
+            Wend
+            While ej < Array.Count(y)
+                If Not TransformIsDigit(String.Asc(y(ej))) Then Exit While
+                ej += 1
+            Wend
+            If ei - si <> ej - sj Then
+                If ei - si < ej - sj Then Return -1
+                Return 1
+            End If
+            For k As Integer = 0 To ei - si - 1
+                Dim dx As Integer = String.Asc(x(si + k))
+                Dim dy As Integer = String.Asc(y(sj + k))
+                If dx <> dy Then
+                    If dx < dy Then Return -1
+                    Return 1
+                End If
+            Next
+            i = ei
+            j = ej
+        Else
+            Dim c As Integer = String.Compare(x(i), y(j))
+            If c <> 0 Then Return c
+            i += 1
+            j += 1
+        End If
+    Wend
+    If Array.Count(x) - i <> Array.Count(y) - j Then
+        If Array.Count(x) - i < Array.Count(y) - j Then Return -1
+        Return 1
+    End If
+    Return String.Compare(a, b, True)
+End Function
+
+Private Function TransformExactCompare(a As String, b As String) As Integer
+    Return String.Compare(a, b, True)
+End Function
+
+Private Function TransformFoldedCompare(a As String, b As String) As Integer
+    Dim c As Integer = String.Compare(a, b)
+    If c <> 0 Then Return c
+    Return String.Compare(a, b, True)
+End Function
+
+''' Sorted copy of `lines`. `mode`: "ascending" (codepoint order, case-sensitive),
+''' "descending", "caseInsensitive" or "natural". Stable.
+Public Function StudioSortLines(lines As Array Of String, mode As String) As Array Of String
+    Dim sorted As Array Of String = Array.AsResizable(lines)
+    Select Case mode
+    Case "caseInsensitive"
+        Array.Sort(sorted, AddressOf TransformFoldedCompare)
+    Case "natural"
+        Array.Sort(sorted, AddressOf StudioNaturalCompare)
+    Case "descending"
+        Array.Sort(sorted, AddressOf TransformExactCompare)
+        sorted = Array.AsResizable(Array.Reversed(sorted))
+    Case Else
+        Array.Sort(sorted, AddressOf TransformExactCompare)
+    End Select
+    Return sorted
+End Function
+
+Public Function StudioReverseLines(lines As Array Of String) As Array Of String
+    Return Array.AsResizable(Array.Reversed(lines))
+End Function
+
+''' First occurrence of every exactly-equal line, in order.
+Public Function StudioUniqueLines(lines As Array Of String) As Array Of String
+    Dim seen As New Set Of String()
+    Dim kept As Array Of String = []
+    For Each line As String In lines
+        If Not seen.Contains(line) Then
+            seen.Add(line)
+            Array.Append(kept, line)
+        End If
+    Next
+    Return kept
+End Function
+
+''' Strips trailing spaces and tabs (only those; other whitespace is content).
+Public Function StudioTrimTrailing(line As String) As String
+    Dim count As Integer = String.Len(line)
+    While count > 0
+        Dim ch As String = String.Substring(line, count - 1, 1)
+        If ch <> " " And ch <> "\t" Then Exit While
+        count -= 1
+    Wend
+    Return String.Left(line, count)
+End Function
+
+''' Joins lines with one space, trimming the indentation of every joined line and the
+''' trailing whitespace before each join. Empty pieces add no space.
+Public Function StudioJoinLines(lines As Array Of String) As String
+    If Array.Count(lines) = 0 Then Return ""
+    Dim joinedText As String = StudioTrimTrailing(lines(0))
+    For i As Integer = 1 To Array.LastIndex(lines)
+        Dim piece As String = String.Trim(lines(i))
+        If piece = "" Then Continue For
+        If joinedText = "" Or String.EndsWith(joinedText, " ") Then
+            joinedText += piece
+        Else
+            joinedText += " " + piece
+        End If
+    Next
+    Return joinedText
+End Function
+
+''' Words of an identifier-ish text: splits on non-word characters, case changes
+''' (camelCase, HTTPServer -> HTTP Server) and letter/digit boundaries.
+Public Function StudioSplitWords(text As String) As Array Of String
+    Dim words As Array Of String = []
+    Dim chars As Array Of String = String.Chars(text)
+    Dim current As String = ""
+    For i As Integer = 0 To Array.LastIndex(chars)
+        Dim ch As String = chars(i)
+        If Not TransformIsWordChar(ch) Or ch = "_" Or ch = "-" Then
+            If current <> "" Then Array.Append(words, current)
+            current = ""
+            Continue For
+        End If
+        If current <> "" Then
+            Dim previous As String = chars(i - 1)
+            Dim upper As Boolean = TransformIsLetter(ch) And TransformSame(String.UCase(ch), ch)
+            Dim previousLower As Boolean = TransformIsLetter(previous) And TransformSame(String.LCase(previous), previous)
+            Dim previousUpper As Boolean = TransformIsLetter(previous) And TransformSame(String.UCase(previous), previous)
+            Dim nextLower As Boolean = False
+            If i < Array.LastIndex(chars) Then nextLower = TransformIsLetter(chars(i + 1)) And TransformSame(String.LCase(chars(i + 1)), chars(i + 1))
+            Dim digitEdge As Boolean = TransformIsDigit(String.Asc(ch)) <> TransformIsDigit(String.Asc(previous))
+            If (upper And previousLower) Or (upper And previousUpper And nextLower) Or digitEdge Then
+                Array.Append(words, current)
+                current = ""
+            End If
+        End If
+        current += ch
+    Next
+    If current <> "" Then Array.Append(words, current)
+    Return words
+End Function
+
+Private Function TransformCapitalized(word As String) As String
+    If word = "" Then Return ""
+    Return String.UCase(String.Left(word, 1)) + String.LCase(String.Substring(word, 1))
+End Function
+
+''' Applies a case transform: "upper", "lower", "title" (each word capitalized, the
+''' separators kept), "snake", "camel", "kebab" (identifier styles).
+Public Function StudioTransformCase(text As String, mode As String) As String
+    Select Case mode
+    Case "upper"
+        Return String.UCase(text)
+    Case "lower"
+        Return String.LCase(text)
+    Case "title"
+        Dim joinedText As String = ""
+        Dim atStart As Boolean = True
+        For Each ch As String In String.Chars(text)
+            If TransformIsWordChar(ch) And ch <> "_" Then
+                If atStart Then
+                    joinedText += String.UCase(ch)
+                Else
+                    joinedText += String.LCase(ch)
+                End If
+                atStart = False
+            Else
+                joinedText += ch
+                atStart = True
+            End If
+        Next
+        Return joinedText
+    Case "snake", "kebab", "camel"
+        ' Leading/trailing non-word characters (indent, quotes) stay put.
+        Dim chars As Array Of String = String.Chars(text)
+        Dim first As Integer = 0
+        While first < Array.Count(chars)
+            If TransformIsWordChar(chars(first)) Then Exit While
+            first += 1
+        Wend
+        Dim last As Integer = Array.LastIndex(chars)
+        While last >= first
+            If TransformIsWordChar(chars(last)) Then Exit While
+            last -= 1
+        Wend
+        If first > last Then Return text
+        Dim core As String = String.Substring(text, first, last - first + 1)
+        Dim words As Array Of String = StudioSplitWords(core)
+        Dim joined As String = ""
+        For k As Integer = 0 To Array.LastIndex(words)
+            Dim word As String = words(k)
+            If mode = "camel" Then
+                If k = 0 Then
+                    joined += String.LCase(word)
+                Else
+                    joined += TransformCapitalized(word)
+                End If
+            Else
+                If k > 0 Then
+                    If mode = "snake" Then
+                        joined += "_"
+                    Else
+                        joined += "-"
+                    End If
+                End If
+                joined += String.LCase(word)
+            End If
+        Next
+        Return String.Left(text, first) + joined + String.Substring(text, last + 1)
+    End Select
+    Return text
+End Function

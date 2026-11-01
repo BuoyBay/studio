@@ -1,0 +1,89 @@
+Import gitkit
+Import diffkit
+Import StudioDiff
+
+''' Baseline text must be the index snapshot for working-buffer markers (HEAD for staged).
+Public Interface StudioGitHost
+    Sub UpdateGitMarkers(documentID As String, revision As Integer, hunks As Array Of LineHunk, errorText As String)
+End Interface
+
+Public Class StudioGitController
+    Private Property Repository As GitRepository
+    Private Property EntriesValue As Array Of GitStatusEntry
+    Private Property HeadValue As GitHead
+    Public Property ErrorText As String
+    Public Sub Constructor(directory As String)
+        Try
+            Me.Repository = New GitRepository(directory)
+            Me.Refresh()
+        Catch e As Exception
+            Me.ErrorText = e.Message
+        End Try
+    End Sub
+    Public Function Refresh() As Boolean
+        Me.EntriesValue = []
+        Me.HeadValue = Nil
+        Me.ErrorText = ""
+        Try
+            If Me.Repository = Nil Then Throw New InvalidArgumentException("Repository is unavailable; open a local Git working directory")
+            If Me.Repository.IsBare Then Throw New InvalidArgumentException("A bare repository has no working tree")
+            Dim entries As Array Of GitStatusEntry = Me.Repository.Status()
+            Dim head As GitHead = Me.Repository.Head()
+            Me.EntriesValue = entries
+            Me.HeadValue = head
+            Return True
+        Catch e As Exception
+            Me.ErrorText = e.Message
+            Return False
+        End Try
+    End Function
+    Public Property Entries As Array Of GitStatusEntry
+        Get
+            Return Array.Clone(Me.EntriesValue)
+        End Get
+    End Property
+    Public Function Summary() As String
+        If Me.ErrorText <> "" Then Return "Git unavailable: " + Me.ErrorText
+        Dim output As String = "Local Git · " + Me.HeadValue.BranchName
+        If Me.HeadValue.IsDetached Then output += " (detached HEAD)"
+        If Me.HeadValue.IsUnborn Then output += " (unborn HEAD)"
+        output += "\n" + String.From(Array.Count(Me.EntriesValue)) + " changed paths\n"
+        For Each entry As GitStatusEntry In Me.EntriesValue
+            Dim statusText As String = ""
+            If entry.HasIndexChanges Then statusText += "staged "
+            If entry.HasWorktreeChanges Then statusText += "working "
+            If entry.IsUntracked Then statusText += "untracked "
+            If entry.IsConflicted Then statusText += "CONFLICT "
+            output += statusText + "· " + entry.RelativePath
+            If entry.OldPath <> "" And entry.OldPath <> entry.RelativePath Then output += " (from " + entry.OldPath + ")"
+            output += "\n"
+        Next
+        Return output
+    End Function
+    Public Function Patch(staged As Boolean) As String
+        If Me.Repository = Nil Then Return "Git unavailable: " + Me.ErrorText
+        Try
+            Dim patch As String = Me.Repository.DiffText(staged, 3, 4194304)
+            If patch = "" Then Return "No tracked changes in this view. Untracked paths are listed in Status; their contents are not included."
+            Return patch
+        Catch e As Exception
+            Return "Git comparison unavailable: " + e.Message
+        End Try
+    End Function
+    ''' Snapshot comparison is also the hunk-revert model; it never changes Git's index or disk.
+    Public Function PublishGutter(host As StudioGitHost, documentID As String, indexText As String, buffer As StudioDiffSnapshot) As StudioDiffSession
+        If buffer = Nil Or host = Nil Then Throw New InvalidArgumentException("Buffer and marker host are required")
+        If documentID <> buffer.DocumentID Then Throw New InvalidArgumentException("Marker document does not match snapshot")
+        Dim baseline As New StudioDiffSnapshot(documentID, "Git index", indexText, 0)
+        Dim session As New StudioDiffSession(baseline, buffer)
+        host.UpdateGitMarkers(documentID, buffer.Revision, session.Hunks, session.ErrorText)
+        Return session
+    End Function
+    Public Sub Close()
+        If Me.Repository <> Nil Then Me.Repository.Close()
+        Me.Repository = Nil
+        Me.HeadValue = Nil
+        Me.EntriesValue = []
+        Me.ErrorText = "Repository is closed"
+    End Sub
+End Class

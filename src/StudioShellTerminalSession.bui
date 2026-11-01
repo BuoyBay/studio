@@ -1,0 +1,109 @@
+#If TargetWindows Then
+' These symbols are linked from StudioShellTerminal.c by build_studio.py.
+    Private Declare Function SSNew Lib "BuoyStudioShellTerminal" Alias "sst_new" () As Ptr
+    Private Declare Function SSArgument Lib "BuoyStudioShellTerminal" Alias "sst_argument" (handle As Ptr, value As String) As Integer
+    Private Declare Function SSStart Lib "BuoyStudioShellTerminal" Alias "sst_start" (handle As Ptr, executable As String, cwd As String, columns As Integer, rows As Integer) As Integer
+    Private Declare Function SSError Lib "BuoyStudioShellTerminal" Alias "sst_error" (handle As Ptr) As String
+    Private Declare Function SSPoll Lib "BuoyStudioShellTerminal" Alias "sst_poll" (handle As Ptr) As Integer
+    Private Declare Function SSExit Lib "BuoyStudioShellTerminal" Alias "sst_exit" (handle As Ptr) As Integer
+    Private Declare Function SSRead Lib "BuoyStudioShellTerminal" Alias "sst_read" (handle As Ptr, buffer As Ptr, capacity As Integer) As Integer
+    Private Declare Function SSWrite Lib "BuoyStudioShellTerminal" Alias "sst_write" (handle As Ptr, buffer As Ptr, count As Integer) As Integer
+    Private Declare Function SSResize Lib "BuoyStudioShellTerminal" Alias "sst_resize" (handle As Ptr, columns As Integer, rows As Integer) As Integer
+    Private Declare Sub SSStop Lib "BuoyStudioShellTerminal" Alias "sst_stop" (handle As Ptr)
+    Private Declare Function SSRelease Lib "BuoyStudioShellTerminal" Alias "sst_release_poll" (handle As Ptr) As Integer
+
+#Else
+' These symbols are linked from StudioShellTerminal.c by build_studio.py.
+    Private Declare Function SSNew Lib "" Alias "sst_new" () As Ptr
+    Private Declare Function SSArgument Lib "" Alias "sst_argument" (handle As Ptr, value As String) As Integer
+    Private Declare Function SSStart Lib "" Alias "sst_start" (handle As Ptr, executable As String, cwd As String, columns As Integer, rows As Integer) As Integer
+    Private Declare Function SSError Lib "" Alias "sst_error" (handle As Ptr) As String
+    Private Declare Function SSPoll Lib "" Alias "sst_poll" (handle As Ptr) As Integer
+    Private Declare Function SSExit Lib "" Alias "sst_exit" (handle As Ptr) As Integer
+    Private Declare Function SSRead Lib "" Alias "sst_read" (handle As Ptr, buffer As Ptr, capacity As Integer) As Integer
+    Private Declare Function SSWrite Lib "" Alias "sst_write" (handle As Ptr, buffer As Ptr, count As Integer) As Integer
+    Private Declare Function SSResize Lib "" Alias "sst_resize" (handle As Ptr, columns As Integer, rows As Integer) As Integer
+    Private Declare Sub SSStop Lib "" Alias "sst_stop" (handle As Ptr)
+    Private Declare Function SSRelease Lib "" Alias "sst_release_poll" (handle As Ptr) As Integer
+
+#End If
+
+Private Sub SSValidateArgument(value As String)
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then Throw New InvalidArgumentException("Terminal paths and arguments cannot contain NUL")
+    Next
+End Sub
+
+Public Class StudioShellTerminalSession
+    Private Property Handle As Ptr
+    Private Property Releasing As Boolean = False
+    Public Property ExitCode As Integer = -1
+    Public Property ErrorText As String
+    Public Sub Constructor(executable As String, argv As Array Of String, cwd As String, columns As Integer, rows As Integer)
+        If executable = "" Or Array.Count(argv) > 256 Then Throw New InvalidArgumentException("Invalid terminal executable/argument count")
+        SSValidateArgument(executable)
+        SSValidateArgument(cwd)
+        Dim count As Integer = String.LenBytes(executable) + 1
+        For Each argument As String In argv
+            SSValidateArgument(argument)
+            count += String.LenBytes(argument) + 1
+        Next
+        If count > 65536 Then Throw New InvalidArgumentException("Terminal arguments exceed 64 KiB")
+        Me.Handle = SSNew()
+        If Me.Handle = Nil Then Throw New InvalidArgumentException("Cannot allocate program terminal")
+        If SSArgument(Me.Handle, executable) = 0 Then
+            Me.ErrorText = "Cannot allocate terminal executable"
+            Me.Releasing = True
+            Return
+        End If
+        For Each argument As String In argv
+            If SSArgument(Me.Handle, argument) = 0 Then
+                Me.ErrorText = "Cannot allocate terminal argument"
+                Me.Releasing = True
+                Return
+            End If
+        Next
+        If SSStart(Me.Handle, executable, cwd, columns, rows) = 0 Then
+            Me.ErrorText = SSError(Me.Handle)
+            Me.Releasing = True
+        End If
+    End Sub
+    Public Function Poll() As Boolean
+        If Me.Handle = Nil Then Return False
+        If Not Me.Releasing Then
+            Dim state As Integer = SSPoll(Me.Handle)
+            If state = 1 Then Return True
+            If state < 0 Then Me.ErrorText = SSError(Me.Handle)
+            Me.ExitCode = SSExit(Me.Handle)
+            Me.Releasing = True
+        End If
+        If SSRelease(Me.Handle) = 0 Then Return True
+        Me.Handle = Nil
+        Return False
+    End Function
+    Public Function Read() As Bytes
+        Dim data As New Bytes()
+        If Me.Handle = Nil Or Me.Releasing Then Return data
+        For i As Integer = 1 To 65536
+            data.Append(0)
+        Next
+        Dim count As Integer = SSRead(Me.Handle, data.DataPtr(), data.Count)
+        If count < 0 Then Throw New InvalidArgumentException(SSError(Me.Handle))
+        Dim output As New Bytes()
+        If count > 0 Then output.Append(data.DataPtr(), count)
+        Return output
+    End Function
+    Public Function Write(data As Bytes) As Integer
+        If Me.Handle = Nil Or Me.Releasing Then Return 0
+        Dim count As Integer = SSWrite(Me.Handle, data.DataPtr(), data.Count)
+        If count < 0 Then Throw New InvalidArgumentException(SSError(Me.Handle))
+        Return count
+    End Function
+    Public Sub Resize(columns As Integer, rows As Integer)
+        If Me.Handle <> Nil And Not Me.Releasing Then SSResize(Me.Handle, columns, rows)
+    End Sub
+    Public Sub Stop()
+        If Me.Handle <> Nil And Not Me.Releasing Then SSStop(Me.Handle)
+    End Sub
+End Class

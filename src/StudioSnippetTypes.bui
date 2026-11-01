@@ -1,0 +1,38 @@
+' Data types shared by Studio's source editor and its snippet library. No GUI or
+' parser dependency, so StudioCodeEditor can import it without importing the shared
+' SnippetTemplates grammar (StudioSnippetEngine bridges the two).
+
+''' A placeholder-annotated snippet ready for insertion
+''' (StudioCodeEditor.InsertSnippetExpansion). Occurrence k of placeholder Indexes(k)
+''' covers codepoints [Starts(k), Starts(k)+Lengths(k)) of Text, in occurrence order;
+''' FinalCaret is $0 (-1 = end of Text).
+Public Class StudioSnippetExpansion
+    Public Property Text As String = ""
+    Public Property Indexes As Array Of Integer = []
+    Public Property Starts As Array Of Integer = []
+    Public Property Lengths As Array Of Integer = []
+    Public Property FinalCaret As Integer = -1
+
+    ''' Positive placeholder indexes in traversal order (ascending, unique).
+    Public Function TraversalOrder() As Array Of Integer
+        Dim order As Array Of Integer = []
+        For Each index As Integer In Me.Indexes
+            If index > 0 And Array.IndexOf(order, index) < 0 Then Array.Append(order, index)
+        Next
+        Array.Sort(order)
+        Return order
+    End Function
+End Class
+
+''' Snippet source for an editor: Tab expansion, completion snippets and the context
+''' menu's Insert Snippet submenu. StudioSnippetLibrary implements it.
+Public Interface IStudioSnippetProvider
+    ''' Expansion for a typed prefix in a language mode, or Nil.
+    Function ExpandPrefix(prefix As String, mode As String) As StudioSnippetExpansion
+    ''' Expansion of a raw snippet body, or Nil when it is invalid.
+    Function ExpandBody(body As String) As StudioSnippetExpansion
+    ''' Display names of the snippets offered in a mode (menu order).
+    Function Choices(mode As String) As Array Of String
+    ''' Expansion of Choices(mode)(index), or Nil.
+    Function ExpandChoice(index As Integer, mode As String) As StudioSnippetExpansion
+End Interface

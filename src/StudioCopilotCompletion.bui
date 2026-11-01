@@ -1,0 +1,328 @@
+Import StudioInlineEdits
+Import processkit
+Import lspkit
+Import StudioLanguageServer
+Import StudioCompletionSettings
+Import StudioEditorCommands
+
+''' Convert a Copilot replacement to a pure insertion only when its replaced text
+''' exactly matches the existing prefix up to the caret. Never drop a deletion.
+Public Function StudioCopilotInsertion(item As JSONItem, lineText As String, line As Integer, column As Integer) As String
+    Dim text As String = item.Value("insertText").AsString().Or("")
+    If item.HasKey("range") Then
+        Dim range As JSONItem = item.Value("range")
+        Dim start As JSONItem = range.Value("start")
+        Dim finish As JSONItem = range.Value("end")
+        If start.Value("line").AsNumber().Or(-1.0) <> line Or finish.Value("line").AsNumber().Or(-1.0) <> line Then Return ""
+        Dim endUnits As Integer = StudioLanguageUtf16Column(lineText, column)
+        If finish.Value("character").AsNumber().Or(-1.0) <> endUnits Then Return ""
+        Dim startUnits As Integer = Math.Round(start.Value("character").AsNumber().Or(-1.0))
+        Dim startColumn As Integer = -1
+        For i As Integer = 0 To column
+            If StudioLanguageUtf16Column(lineText, i) = startUnits Then
+                startColumn = i
+                Exit For
+            End If
+        Next
+        If startColumn < 0 Then Return ""
+        Dim existing As String = String.Substring(lineText, startColumn, column - startColumn)
+        If Not String.StartsWith(text, existing, True) Then Return ""
+        text = String.Substring(text, String.Len(existing))
+    End If
+    If String.Len(text) > 8192 Or String.Contains(text, "```") Then Return ""
+    Return text
+End Function
+
+Public Function StudioCopilotEdits(item As JSONItem, source As String, position As Integer) As Array Of StudioInlineEdit
+    If position < 0 Or position > String.Len(source) Or Not item.Value("insertText").IsString() Then Return []
+    Dim text As String = item.Value("insertText").AsString().Or("")
+    text = String.Replace(String.Replace(text, "\r\n", "\n", True), "\r", "\n", True)
+    Dim start As Integer = position
+    Dim finish As Integer = position
+    If item.HasKey("range") Then
+        Dim range As JSONItem = item.Value("range")
+        Dim a As JSONItem = range.Value("start")
+        Dim b As JSONItem = range.Value("end")
+        Dim coordinates As Array Of Double = [a.Value("line").AsNumber().Or(-1.0), a.Value("character").AsNumber().Or(-1.0), b.Value("line").AsNumber().Or(-1.0), b.Value("character").AsNumber().Or(-1.0)]
+        For Each coordinate As Double In coordinates
+            If coordinate < 0.0 Or coordinate > String.Len(source) * 2 + 1 Or coordinate <> Math.Round(coordinate) Then Return []
+        Next
+        start = StudioInlineLspOffset(source, Math.Round(coordinates(0)), Math.Round(coordinates(1)))
+        finish = StudioInlineLspOffset(source, Math.Round(coordinates(2)), Math.Round(coordinates(3)))
+        If start < 0 Or finish < start Then Return []
+        ' Keep ordinary prefix-repeating completions as insertions at the caret.
+        If finish = position And start <= position Then
+            Dim prefix As String = String.Substring(source, start, position - start)
+            If String.StartsWith(text, prefix, True) Then
+                text = String.Substring(text, String.Len(prefix))
+                start = position
+            End If
+        End If
+    End If
+    If start = finish Then text = StudioInlineInsertion(text, String.Substring(source, start))
+    Dim edits As Array Of StudioInlineEdit = [New StudioInlineEdit(start, finish - start, text)]
+    If Not StudioInlineValidate(source, edits) Then Return []
+    Return edits
+End Function
+
+Private Class CopilotFeedback Implements StudioCompletionFeedback
+    Public Property Owner As StudioCopilotCompletion
+    Public Property Item As JSONItem
+    Public Sub CompletionShown()
+        Me.Owner.ReportShown(Me.Item)
+    End Sub
+    Public Sub CompletionAccepted()
+        Me.Owner.ReportAccepted(Me.Item)
+    End Sub
+End Class
+
+Public Class StudioCopilotCompletion
+    Private Property Process As PipeProcess
+    Private Property Decoder As LSPFrameDecoder = New LSPFrameDecoder(1048576)
+    Private Property Output As Bytes = New Bytes()
+    Private Property Offset As Integer = 0
+    Private Property Sequence As Integer = 0
+    Private Property InitId As Integer = -1
+    Private Property LoginId As Integer = -1
+    Private Property CompletionId As Integer = -1
+    Private Property LoginCommand As JSONItem
+    Private Property Item As JSONItem
+    Private Property Uri As String
+    Private Property Version As Integer = 0
+    Private Property LineText As String
+    Private Property Line As Integer
+    Private Property Column As Integer
+    Private Property Started As Integer
+    Private Property Requested As Integer
+    Public Property Failed As Boolean = False
+    Public Property Ready As Boolean = False
+    Public Property Done As Boolean = False
+    Public Property Text As String
+    Public Property Edits As Array Of StudioInlineEdit = []
+    Private Property Snapshot As String
+    Private Property Position As Integer
+    Public Property Status As String
+    Public Property LoginCode As String
+    Public Property Notices As Array Of JSONItem = []
+
+    Public Sub Constructor(executable As String, directory As String, arguments As Array Of String)
+        Me.Process = New PipeProcess(executable, arguments, directory, True)
+        Me.Started = System.Microseconds()
+        Dim params As JSONItem = Json.Parse("{\"capabilities\":{},\"initializationOptions\":{\"editorInfo\":{\"name\":\"Buoy Studio\",\"version\":\"0.1.0\"},\"editorPluginInfo\":{\"name\":\"Buoy Studio Copilot\",\"version\":\"0.1.0\"}}}")
+        params.Value("rootUri") = StudioLanguagePathToUri(directory)
+        Me.InitId = Me.Send("initialize", params)
+    End Sub
+
+    Private Sub Queue(message As JSONItem)
+        If Me.Output.Count + 8192 > 2097152 Then Throw New InvalidArgumentException("Copilot input queue exceeded limit")
+        Me.Output.Append(lspkit.EncodeFrame(message, 1048576))
+    End Sub
+
+    Private Function Send(method As String, params As JSONItem) As Integer
+        Me.Sequence += 1
+        Dim request As JSONItem = JSONItem.NewObject()
+        request.Value("jsonrpc") = "2.0"
+        request.Value("id") = Me.Sequence
+        request.Value("method") = method
+        request.Value("params") = params
+        Me.Queue(request)
+        Return Me.Sequence
+    End Function
+
+    Private Sub Notify(method As String, params As JSONItem)
+        Me.Queue(lspkit.Notification(method, params))
+    End Sub
+
+    Public Sub Respond(id As JSONItem, payload As JSONItem)
+        Me.Queue(lspkit.SuccessResponse(id, payload))
+    End Sub
+
+    Public Sub SignIn()
+        If Not Me.Ready Then Throw New InvalidArgumentException("Copilot is starting; try Sign in again shortly")
+        Me.LoginId = Me.Send("signIn", JSONItem.NewObject())
+    End Sub
+
+    Public Sub FinishSignIn()
+        If Me.LoginCommand <> Nil Then
+            Dim ignored As Integer = Me.Send("workspace/executeCommand", Me.LoginCommand)
+            Me.LoginCommand = Nil
+        End If
+        Me.LoginCode = ""
+    End Sub
+
+    Public Sub Cancel()
+        If Me.CompletionId >= 0 Then
+            Dim params As JSONItem = JSONItem.NewObject()
+            params.Value("id") = Me.CompletionId
+            Me.Notify("$/cancelRequest", params)
+        End If
+        Me.CompletionId = -1
+        Me.Done = False
+        Me.Text = ""
+        Me.Edits = []
+        Me.Item = Nil
+    End Sub
+
+    Public Sub Complete(pathValue As String, language As String, text As String, position As Integer, automatic As Boolean)
+        If Not Me.Ready Then Throw New InvalidArgumentException("Copilot is starting; request a suggestion again shortly")
+        Me.Cancel()
+        Me.Snapshot = text
+        Me.Position = position
+        Dim uri As String = StudioLanguagePathToUri(pathValue)
+        If Me.Uri <> "" Then
+            Dim closed As JSONItem = JSONItem.NewObject()
+            Dim previous As JSONItem = JSONItem.NewObject()
+            previous.Value("uri") = Me.Uri
+            closed.Value("textDocument") = previous
+            Me.Notify("textDocument/didClose", closed)
+        End If
+        Me.Uri = uri
+        Me.Version += 1
+        Dim doc As JSONItem = JSONItem.NewObject()
+        doc.Value("uri") = uri
+        doc.Value("languageId") = language
+        doc.Value("version") = Me.Version
+        doc.Value("text") = text
+        Dim opened As JSONItem = JSONItem.NewObject()
+        opened.Value("textDocument") = doc
+        Me.Notify("textDocument/didOpen", opened)
+        Dim identifier As JSONItem = JSONItem.NewObject()
+        identifier.Value("uri") = uri
+        identifier.Value("version") = Me.Version
+        Dim params As JSONItem = JSONItem.NewObject()
+        params.Value("textDocument") = identifier
+        Me.Notify("textDocument/didFocus", params)
+        Dim lines As Array Of String = String.Split(String.Left(text, position), "\n")
+        Me.Line = Array.Count(lines) - 1
+        Me.LineText = lines(Me.Line)
+        Me.Column = String.Len(Me.LineText)
+        Dim at As JSONItem = JSONItem.NewObject()
+        at.Value("line") = Me.Line
+        at.Value("character") = StudioLanguageUtf16Column(Me.LineText, Me.Column)
+        params.Value("position") = at
+        Dim context As JSONItem = JSONItem.NewObject()
+        context.Value("triggerKind") = If(automatic, 2, 1)
+        params.Value("context") = context
+        params.Value("formattingOptions") = Json.Parse("{\"tabSize\":4,\"insertSpaces\":true}")
+        Me.CompletionId = Me.Send("textDocument/inlineCompletion", params)
+        Me.Requested = System.Microseconds()
+    End Sub
+
+    Private Sub Receive(message As JSONItem)
+        If message.HasKey("method") Then
+            Dim method As String = message.Value("method").AsString().Or("")
+            Dim params As JSONItem = message.Value("params")
+            If method = "didChangeStatus" Then Me.Status = params.Value("message").AsString().Or(params.Value("kind").AsString().Or(""))
+            If method = "window/showMessage" Or method = "window/showMessageRequest" Then
+                Me.Notices.Append(message)
+                If method = "window/showMessageRequest" And message.HasKey("id") Then Me.Respond(message.Value("id"), JSONItem.Null())
+            ElseIf message.HasKey("id") Then
+                If method = "workspace/configuration" Then
+                    Dim settings As JSONItem = JSONItem.NewArray()
+                    Dim items As JSONItem = params.Value("items")
+                    For i As Integer = 0 To items.Count() - 1
+                        settings.Add(JSONItem.Null())
+                    Next
+                    Me.Respond(message.Value("id"), settings)
+                ElseIf method <> "window/showMessageRequest" Then
+                    Me.Queue(lspkit.ErrorResponse(message.Value("id"), -32601, "Unsupported Copilot client request", Nil))
+                End If
+            End If
+            Return
+        End If
+        Dim id As Integer = Math.Round(message.Value("id").AsNumber().Or(-1.0))
+        If message.HasKey("error") Then
+            If id = Me.CompletionId Then
+                Me.CompletionId = -1
+                Me.Done = True
+                Me.Text = ""
+            End If
+            Me.Status = "Copilot request failed; check sign-in, quota and server version"
+            Return
+        End If
+        Dim payload As JSONItem = message.Value("result")
+        If id = Me.InitId Then
+            Me.InitId = -1
+            Me.Ready = True
+            Me.Notify("initialized", JSONItem.NewObject())
+            Me.Notify("workspace/didChangeConfiguration", Json.Parse("{\"settings\":{}}"))
+            Me.Status = "Copilot ready"
+        ElseIf id = Me.LoginId Then
+            Me.LoginId = -1
+            Me.LoginCode = payload.Value("userCode").AsString().Or("")
+            If payload.HasKey("command") Then Me.LoginCommand = payload.Value("command")
+            If Me.LoginCode = "" Then Me.Status = "Copilot sign-in complete or already signed in"
+        ElseIf id = Me.CompletionId And Me.CompletionId >= 0 Then
+            Me.CompletionId = -1
+            Me.Done = True
+            Dim items As JSONItem = payload.Value("items")
+            If items.IsArray() And items.Count() > 0 Then
+                Me.Item = items.ValueAt(0)
+                Me.Text = StudioCopilotInsertion(Me.Item, Me.LineText, Me.Line, Me.Column)
+                Me.Edits = StudioCopilotEdits(Me.Item, Me.Snapshot, Me.Position)
+            End If
+        End If
+    End Sub
+
+    Public Function Feedback() As StudioCompletionFeedback
+        Dim feedback As New CopilotFeedback()
+        feedback.Owner = Me
+        feedback.Item = Me.Item
+        Return feedback
+    End Function
+
+    Public Sub ReportShown(item As JSONItem)
+        If item = Nil Or Me.Process = Nil Then Return
+        Dim params As JSONItem = JSONItem.NewObject()
+        params.Value("item") = item
+        Me.Notify("textDocument/didShowCompletion", params)
+    End Sub
+
+    Public Sub ReportAccepted(item As JSONItem)
+        If item = Nil Or Me.Process = Nil Then Return
+        If item.HasKey("command") Then
+            Dim ignored As Integer = Me.Send("workspace/executeCommand", item.Value("command"))
+        End If
+    End Sub
+
+    Public Sub Poll()
+        If Me.Process = Nil Then Return
+        Try
+            For i As Integer = 0 To 7
+                Dim chunk As Bytes = Me.Process.ReadOutput(65536)
+                Dim errors As Bytes = Me.Process.ReadError(65536)
+                If chunk.Count = 0 Then Exit For
+                For Each message As JSONItem In Me.Decoder.Feed(chunk)
+                    Me.Receive(message)
+                Next
+            Next
+            If Not Me.Process.Poll() Then Throw New InvalidArgumentException("Copilot server exited")
+            If Not Me.Ready And System.Microseconds() - Me.Started > 30000000 Then Throw New InvalidArgumentException("Copilot initialization timed out")
+            If Me.CompletionId >= 0 And System.Microseconds() - Me.Requested > 10000000 Then
+                Me.Cancel()
+                Me.Done = True
+                Me.Status = "Copilot completion timed out"
+            End If
+            If Me.Offset < Me.Output.Count Then Me.Offset += Me.Process.WriteInput(Me.Output, Me.Offset)
+            If Me.Offset = Me.Output.Count Then
+                Me.Output = New Bytes()
+                Me.Offset = 0
+            End If
+        Catch e As Exception
+            Me.Close()
+            Me.Failed = True
+            Me.Status = "Copilot connection stopped; check the configured executable"
+            Me.Done = True
+        End Try
+    End Sub
+
+    Public Sub Close()
+        Me.Cancel()
+        Me.Ready = False
+        If Me.Process <> Nil Then
+            Me.Process.TerminateTree()
+            Me.Process.Close()
+            Me.Process = Nil
+        End If
+    End Sub
+End Class

@@ -1,0 +1,620 @@
+Import StudioProject
+Import StudioScriptSession
+Import StudioAgentScript
+Import StudioScripts
+Import StudioEditorSettings
+Import StudioCodeEditor
+Import StudioLanguageController
+Import StudioLanguageServer
+Import StudioShellLanguage
+Import StudioScriptHelp
+Import StudioDocumentation
+Import StudioShellFiles
+Import atomicfilekit
+Import desktopmenus
+
+Private Class ScriptEditor Inherits StudioCodeEditor
+    Public Property Owner As Weak StudioScriptsWindow
+    Handle TextChanged()
+        Dim owner As StudioScriptsWindow = Me.Owner
+        If owner <> Nil Then owner.Edited()
+    End Handle
+    Handle UndoRequested(redo As Boolean)
+        Dim owner As StudioScriptsWindow = Me.Owner
+        If owner <> Nil Then owner.Undo(redo)
+    End Handle
+    Handle CompletionRequested(trigger As String, position As Integer, prefix As String)
+        Dim owner As StudioScriptsWindow = Me.Owner
+        If owner <> Nil Then
+            If trigger = "parameters" Then
+                owner.Language.Command("signature", "", True)
+            Else
+                owner.Language.Command("completion", "", trigger <> "invoke")
+            End If
+        End If
+    End Handle
+End Class
+Private Class ScriptButton Inherits Button
+    Public Property Owner As Weak StudioScriptsWindow
+    Handle Action()
+        Dim owner As StudioScriptsWindow = Me.Owner
+        If owner <> Nil Then owner.Command(Me.Tag)
+    End Handle
+End Class
+Private Class ScriptViewTimer Inherits Timer
+    Public Property Owner As Weak StudioScriptsWindow
+    Public Overrides Sub NotifyTick()
+        Dim owner As StudioScriptsWindow = Me.Owner
+        If owner <> Nil Then owner.Poll()
+    End Sub
+End Class
+
+''' Shared Studio editor and native controls; hiding preserves the unsaved playground.
+Public Class StudioScriptsWindow Inherits Window Implements StudioLanguageHost, StudioLanguageInlineHost
+    Public Property Session As StudioScriptSession
+    Public Property Editor As ScriptEditor = New ScriptEditor()
+    Public Property Language As StudioLanguageController = New StudioLanguageController()
+    Private Property Scope As ComboBox = New ComboBox()
+    Private Property FileReferences As Array Of String = []
+    Private Property Files As ComboBox = New ComboBox()
+    Private Property NameField As TextField = New TextField()
+    Private Property TaskField As TextField = New TextField()
+    Private Property Mode As ComboBox = New ComboBox()
+    Private Property RunTimeout As TextField = New TextField()
+    Private Property BuildTimeout As TextField = New TextField()
+    Private Property RunTimeoutLabel As Label = New Label()
+    Private Property BuildTimeoutLabel As Label = New Label()
+    Private Property Console As TextArea = New TextArea()
+    Private Property Status As Label = New Label()
+    Private Property RunnerLabel As Label = New Label()
+    Private Property LanguageRoot As String
+    Private Property Buttons As Array Of ScriptButton = []
+    Private Property Poller As ScriptViewTimer = New ScriptViewTimer()
+    Private Property OpenLibrary As StudioScriptLibrary
+    Private Property OpenName As String
+    Private Property DiskBaseline As String
+    Private Property Baseline As String
+    Private Property UndoTexts As Array Of String = []
+    Private Property UndoIndex As Integer = 0
+    Private Property HistoryIndex As Integer = -1
+    Private Property Revision As Integer = 0
+    Private Property Help As StudioDocumentationWindow
+    Private Property VirtualPath As String
+    Private Property Menus As MenuBar = New MenuBar()
+    Private Property LastConsole As String
+
+    Public Sub Constructor(session As StudioScriptSession)
+        Super.Constructor()
+        Me.Session = session
+        Me.Title = "BuoyScript — Library, Playground & Console"
+        Me.Move(120, 80, 1060, 740)
+        Me.SetMinSize(800.0, 560.0)
+        Me.Scope.AddItem("Project scripts")
+        Me.Scope.AddItem("Studio scripts")
+        Me.Scope.SelectedIndex = 0
+        Me.Scope.AccessibleLabel = "Save destination scope"
+        Me.Files.AccessibleLabel = "Saved scripts and project task references"
+        Me.NameField.AccessibleLabel = "Script name without extension"
+        Me.NameField.Placeholder = "Script name (without extension)"
+        Me.TaskField.AccessibleLabel = "Project task or build event name"
+        Me.TaskField.Placeholder = "Task name or before-build / after-build"
+        Me.TaskField.Text = "before-build"
+        Me.Mode.AddItem("Function body → String")
+        Me.Mode.AddItem("Expression → String.From")
+        Me.Mode.SelectedIndex = 0
+        Me.Mode.AccessibleLabel = "Playground evaluation mode"
+        Me.Console.IsReadOnly = True
+        Me.Console.AccessibleLabel = "BuoyScript console: Print, results and errors"
+        Me.Editor.Owner = Me
+        Me.Editor.LanguageMode = "buoy"
+        Me.Editor.AccessibleLabel = "BuoyScript source editor"
+        Me.Editor.CompletionOnType = True
+        Me.Editor.AutoClosePairs = True
+        Me.Editor.Text = "Print \"Hello from BuoyScript\"\nReturn \"Done\""
+        Me.Baseline = Me.Editor.Text
+        Me.UndoTexts.Append(Me.Editor.Text)
+        Me.AddSubview(Me.Scope)
+        Me.AddSubview(Me.Files)
+        Me.AddSubview(Me.NameField)
+        Me.AddSubview(Me.TaskField)
+        Me.AddSubview(Me.Mode)
+        Me.AddSubview(Me.Editor)
+        Me.AddSubview(Me.Console)
+        Me.RunTimeout.Text = String.From(session.RunTimeoutMs)
+        Me.BuildTimeout.Text = String.From(session.BuildTimeoutMs)
+        Me.RunTimeout.AccessibleLabel = "Run timeout in milliseconds, 100 to 3600000"
+        Me.BuildTimeout.AccessibleLabel = "Build event timeout in milliseconds, 100 to 3600000"
+        Me.RunTimeoutLabel.Text = "Run timeout (ms)"
+        Me.BuildTimeoutLabel.Text = "Build timeout (ms)"
+        Me.AddSubview(Me.RunTimeout)
+        Me.AddSubview(Me.BuildTimeout)
+        Me.AddSubview(Me.RunTimeoutLabel)
+        Me.AddSubview(Me.BuildTimeoutLabel)
+        Me.AddSubview(Me.Status)
+        Me.RunnerLabel.AccessibleLabel = "BuoyScript runner availability"
+        Me.AddSubview(Me.RunnerLabel)
+        For Each action As String In ["New", "Open", "Save", "Import", "Export", "Delete", "Run", "Stop", "Previous", "Bind Task", "Run Task", "Events Off", "Help", "Clear Console", "Undo", "Redo", "Complete", "Signature", "Type Info", "Symbols", "Format", "Definition", "Unbind Task", "Verify Runner"]
+            Dim button As New ScriptButton()
+            button.Owner = Me
+            button.Caption = action
+            button.Tag = action
+            Me.Buttons.Append(button)
+            Me.AddSubview(button)
+        Next
+        Me.BuildMenus()
+        Me.RefreshFiles()
+        Me.Place(1060, 740)
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 60
+        Me.Poller.Start()
+        Dim folder As FileSystemItem = System.Folders.Temporary().Child("studio-buoyscript-lsp-" + String.From(System.Microseconds()))
+        If Not folder.CreateFolder(False) Then Throw New InvalidArgumentException("Cannot create BuoyScript language workspace")
+        Me.LanguageRoot = folder.FullPath()
+        Me.VirtualPath = Me.LanguageRoot + "/playground.bui"
+        Me.Language.Attach(Me, Me.LanguageRoot)
+        If Me.Status.Text = "" Then Me.Status.Text = "Fresh process per run · native user privileges · build events off · Help for setup"
+    End Sub
+    Private Sub BuildMenus()
+        Dim menu As New Menu()
+        Dim primary As String = "Ctrl+"
+        #If TargetMac Then
+            primary = "Cmd+"
+        #End If
+        For Each action As String In ["New", "Open", "Save", "Run", "Stop", "Undo", "Redo", "Cut", "Copy", "Paste", "Complete", "Signature", "Type Info", "Help"]
+            Dim item As New MenuItem()
+            item.Caption = action
+            item.Tag = action
+            If action = "Save" Then item.Shortcut = primary + "S"
+            If action = "Run" Then item.Shortcut = primary + "R"
+            If action = "Undo" Then item.Shortcut = primary + "Z"
+            If action = "Redo" Then item.Shortcut = primary + "Y"
+            If action = "Cut" Then item.Shortcut = primary + "X"
+            If action = "Copy" Then item.Shortcut = primary + "C"
+            If action = "Paste" Then item.Shortcut = primary + "V"
+            menu.AddItem(item)
+        Next
+        Me.Menus.AddMenu(menu, "BuoyScript")
+        Dim helpMenu As New Menu()
+        Dim helpItem As New MenuItem()
+        helpItem.Caption = "BuoyScript Help & Examples…"
+        helpItem.Tag = "Help"
+        helpMenu.AddItem(helpItem)
+        Me.Menus.AddMenu(helpMenu, "Help")
+        Me.MenuBar = Me.Menus
+        RegisterSystemMenus()
+    End Sub
+    Handle MenuSelected(item As MenuItem) As Boolean
+        If item.Tag = "Undo" Or item.Tag = "Redo" Or item.Tag = "Cut" Or item.Tag = "Copy" Or item.Tag = "Paste" Then
+            If Not Me.Editor.HasFocus() Then Return False
+        End If
+        Me.Command(item.Tag)
+        Return True
+    End Handle
+    Handle Activated()
+        RegisterSystemMenus()
+    End Handle
+    Private Sub Place(width As Integer, height As Integer)
+        Me.Scope.Move(12, 12, 150, 28)
+        Me.Files.Move(174, 12, width - 186, 28)
+        Me.NameField.Move(12, 48, 200, 28)
+        Me.TaskField.Move(224, 48, 200, 28)
+        Me.Mode.Move(436, 48, width - 448, 28)
+        Me.RunTimeoutLabel.Move(12, 86, 136, 26)
+        Me.RunTimeout.Move(152, 84, 110, 28)
+        Me.BuildTimeoutLabel.Move(284, 86, 144, 26)
+        Me.BuildTimeout.Move(432, 84, 110, 28)
+        For i As Integer = 0 To Array.LastIndex(Me.Buttons)
+            Dim row As Integer = i \ 8
+            Dim column As Integer = i Mod 8
+            Dim cell As Integer = (width - 24) \ 8
+            Me.Buttons(i).Move(12 + column * cell, 122 + row * 36, cell - 6, 30)
+        Next
+        Dim editorTop As Integer = 122 + ((Array.Count(Me.Buttons) + 7) \ 8) * 36 + 6
+        Dim editorHeight As Integer = Math.Max(120, (height - editorTop - 60) * 2 \ 3)
+        Me.Editor.Move(12, editorTop, width - 24, editorHeight)
+        Me.Console.Move(12, editorTop + 10 + editorHeight, width - 24, height - editorTop - editorHeight - 76)
+        Me.RunnerLabel.Move(12, height - 58, width - 24, 24)
+        Me.Status.Move(12, height - 32, width - 24, 28)
+    End Sub
+    Public Function ResolveDraft() As Boolean
+        If String.Compare(Me.Editor.Text, Me.Baseline, True) = 0 Then Return True
+        Dim answer As String = MessageBox.Show(Me, "Unsaved BuoyScript", "Save the script or discard this draft before continuing.", "Save", "Discard", "Cancel")
+        If answer = "Discard" Then Return True
+        If answer <> "Save" Then Return False
+        Try
+            Me.Save()
+            Return True
+        Catch e As Exception
+            Me.Status.Text = e.Message
+            Return False
+        End Try
+    End Function
+    Private Function Destination() As StudioScriptLibrary
+        If Me.Scope.SelectedIndex = 1 Then Return Me.Session.UserLibrary
+        Return Me.Session.ProjectLibrary
+    End Function
+    Public Sub RefreshFiles()
+        Dim selected As String
+        If Me.Files.SelectedIndex >= 0 And Me.Files.SelectedIndex < Array.Count(Me.FileReferences) Then selected = Me.FileReferences(Me.Files.SelectedIndex)
+        If Me.OpenLibrary <> Nil And Me.OpenName <> "" Then
+            selected = "project:" + Me.OpenName
+            If Me.OpenLibrary = Me.Session.UserLibrary Then selected = "studio:" + Me.OpenName
+        End If
+        Me.Files.RemoveAllItems()
+        Me.FileReferences = []
+        Dim issues As String
+        For Each library As StudioScriptLibrary In [Me.Session.ProjectLibrary, Me.Session.UserLibrary]
+            Dim prefix As String = "project:"
+            If library = Me.Session.UserLibrary Then prefix = "studio:"
+            Try
+                For Each name As String In library.Names()
+                    Me.Files.AddItem(prefix + name)
+                    Me.FileReferences.Append(prefix + name)
+                Next
+            Catch e As Exception
+                issues += prefix + " " + e.Message + " · "
+            End Try
+        Next
+        Try
+            For Each taskName As String In Me.Session.ProjectLibrary.References().Keys()
+                Me.Files.AddItem("task:" + taskName)
+                Me.FileReferences.Append("task:" + taskName)
+            Next
+        Catch e As Exception
+            issues += "Project tasks: " + e.Message
+        End Try
+        If issues <> "" Then Me.Status.Text = "Library needs attention: " + issues
+        If Me.Files.Count > 0 Then Me.Files.SelectedIndex = 0
+        Dim index As Integer = Array.IndexOf(Me.FileReferences, selected)
+        If index >= 0 Then Me.Files.SelectedIndex = index
+        Me.Session.LibraryRevision += 1
+    End Sub
+    Private Sub Load(source As String, library As StudioScriptLibrary, name As String, imported As Boolean = False)
+        Me.Editor.Text = source
+        Me.OpenLibrary = library
+        Me.OpenName = name
+        Me.NameField.Text = name
+        Me.Mode.SelectedIndex = 0
+        Me.Baseline = Me.Editor.Text
+        Me.DiskBaseline = source
+        If imported Then Me.Baseline = ""
+        Me.UndoTexts = []
+        Me.UndoTexts.Append(source)
+        Me.UndoIndex = 0
+        Me.Revision += 1
+        Me.Editor.CloseCompletionPopup()
+        Me.Language.Sync()
+    End Sub
+    Public Sub Edited()
+        Me.Revision += 1
+        Me.Editor.ClearMarkers()
+        While Array.Count(Me.UndoTexts) > Me.UndoIndex + 1
+            Array.RemoveAt(Me.UndoTexts, Array.LastIndex(Me.UndoTexts))
+        Wend
+        Me.UndoTexts.Append(Me.Editor.Text)
+        If Array.Count(Me.UndoTexts) > 100 Then Array.RemoveAt(Me.UndoTexts, 0)
+        Me.UndoIndex = Array.LastIndex(Me.UndoTexts)
+        Me.Status.Text = "Unsaved script · Run evaluates the current buffer"
+        Me.Language.Sync()
+    End Sub
+    Public Sub Undo(redo As Boolean)
+        Dim index As Integer = Me.UndoIndex - 1
+        If redo Then index = Me.UndoIndex + 1
+        If index < 0 Or index >= Array.Count(Me.UndoTexts) Then Return
+        Me.UndoIndex = index
+        Me.Editor.Text = Me.UndoTexts(index)
+        Me.Revision += 1
+        Me.Language.Sync()
+    End Sub
+    Private Sub Save()
+        If Me.Mode.SelectedIndex <> 0 Then Throw New InvalidArgumentException("Save scripts as function bodies returning String; expressions are playground-only")
+        Dim library As StudioScriptLibrary = Me.Destination()
+        Dim name As String = StudioScriptName(Me.NameField.Text)
+        Dim existing As Boolean = library = Me.OpenLibrary And String.Compare(name, Me.OpenName, True) = 0
+        Dim expected As String = ""
+        If existing Then expected = Me.DiskBaseline
+        library.Save(name, Me.Editor.Text, expected, Not existing)
+        Me.OpenLibrary = library
+        Me.OpenName = name
+        Me.Baseline = Me.Editor.Text
+        Me.DiskBaseline = Me.Editor.Text
+        Me.RefreshFiles()
+        Me.Status.Text = "Saved " + library.FilePath(name)
+    End Sub
+    Public Sub ConfigureTimeouts()
+        Dim runMs As Integer = Integer.Parse(Me.RunTimeout.Text).Or(0)
+        Dim buildMs As Integer = Integer.Parse(Me.BuildTimeout.Text).Or(0)
+        If runMs < 100 Or runMs > 3600000 Or buildMs < 100 Or buildMs > 3600000 Then Throw New InvalidArgumentException("Run and build timeouts must be 100..3600000 milliseconds")
+        Me.Session.RunTimeoutMs = runMs
+        Me.Session.BuildTimeoutMs = buildMs
+    End Sub
+    Public Sub Command(action As String)
+        Try
+            Select Case action
+            Case "Cut", "Copy", "Paste"
+                Me.Editor.PerformCommand(String.LCase(action))
+            Case "New"
+                If Not Me.ResolveDraft() Then Return
+                Me.Load("Return \"\"", Nil, "")
+            Case "Open"
+                If Not Me.ResolveDraft() Then Return
+                If Me.Files.SelectedIndex < 0 Or Me.Files.SelectedIndex >= Array.Count(Me.FileReferences) Then Throw New InvalidArgumentException("Choose a script first")
+                Dim choice As String = Me.FileReferences(Me.Files.SelectedIndex)
+                If String.StartsWith(choice, "task:") Then
+                    Me.TaskField.Text = String.Substring(choice, 5)
+                    choice = "project:" + Me.Session.ProjectLibrary.References().Value(Me.TaskField.Text).AsString().Value
+                End If
+                Dim library As StudioScriptLibrary = Me.Session.ProjectLibrary
+                Me.Scope.SelectedIndex = 0
+                Dim name As String
+                If String.StartsWith(choice, "studio:") Then
+                    library = Me.Session.UserLibrary
+                    Me.Scope.SelectedIndex = 1
+                    name = String.Substring(choice, 7)
+                ElseIf String.StartsWith(choice, "project:") Then
+                    name = String.Substring(choice, 8)
+                Else
+                    Throw New InvalidArgumentException("Choose a script to open")
+                End If
+                Me.Load(library.Read(name), library, name)
+            Case "Save"
+                Me.Save()
+            Case "Import"
+                If Not Me.ResolveDraft() Then Return
+                Dim dialog As New OpenFileDialog()
+                dialog.Title = "Import BuoyScript — opens a draft; Save adds it to the chosen library"
+                dialog.AddFilter("BuoyScript", "*.buoyscript")
+                If Not dialog.Show(Me) Then Return
+                Me.Load(StudioScriptRead(dialog.SelectedItem.FullPath()), Nil, "imported-script", True)
+                Me.Status.Text = "Imported draft; review then Save. Nothing has run."
+            Case "Export"
+                If String.LenBytes(Me.Editor.Text) > 65536 Then Throw New InvalidArgumentException("Script export exceeds 64 KiB")
+                Dim dialog As New SaveFileDialog()
+                dialog.Title = "Export BuoyScript"
+                dialog.SuggestedFileName = Me.NameField.Text + ".buoyscript"
+                If Not dialog.Show(Me) Then Return
+                Dim filePath As String = dialog.SelectedItem.FullPath()
+                StudioScriptExportConfirmed(filePath, Me.Editor.Text)
+            Case "Delete"
+                If Me.OpenLibrary = Nil Then Throw New InvalidArgumentException("Open a saved script first")
+                If String.Compare(Me.Editor.Text, Me.Baseline, True) <> 0 Then Throw New InvalidArgumentException("Save or discard the draft before deleting")
+                If MessageBox.Show(Me, "Delete script?", Me.OpenLibrary.FilePath(Me.OpenName), "Delete", "", "Cancel") <> "Delete" Then Return
+                Me.OpenLibrary.Delete(Me.OpenName, Me.DiskBaseline)
+                Me.Load("", Nil, "")
+                Me.RefreshFiles()
+            Case "Run"
+                Me.ConfigureTimeouts()
+                Me.HistoryIndex = -1
+                Me.Session.Start(Me.Editor.Text, "Playground / " + Me.NameField.Text, Me.Mode.SelectedIndex = 1)
+            Case "Stop"
+                StudioStopActiveScript()
+            Case "Previous"
+                If Array.Count(Me.Session.History) = 0 Then Return
+                If Not Me.ResolveDraft() Then Return
+                If Me.HistoryIndex < 0 Or Me.HistoryIndex >= Array.Count(Me.Session.History) Then Me.HistoryIndex = Array.Count(Me.Session.History)
+                Me.HistoryIndex -= 1
+                If Me.HistoryIndex < 0 Then Me.HistoryIndex = Array.LastIndex(Me.Session.History)
+                Me.Load(Me.Session.History(Me.HistoryIndex), Nil, "")
+                If Me.Session.HistoryModes(Me.HistoryIndex) Then Me.Mode.SelectedIndex = 1
+            Case "Bind Task"
+                If Me.OpenLibrary <> Me.Session.ProjectLibrary Then Throw New InvalidArgumentException("Save a project script before binding a project task")
+                If String.Compare(Me.Editor.Text, Me.Baseline, True) <> 0 Then Throw New InvalidArgumentException("Save edits before binding")
+                Me.Session.ProjectLibrary.Bind(Me.TaskField.Text, Me.OpenName)
+                Me.RefreshFiles()
+                Me.Status.Text = "Project task reference saved: " + Me.TaskField.Text + " → " + Me.OpenName
+            Case "Unbind Task"
+                Me.Session.ProjectLibrary.Unbind(Me.TaskField.Text)
+                Me.RefreshFiles()
+                Me.Status.Text = "Removed project task reference: " + Me.TaskField.Text
+            Case "Verify Runner"
+                Me.ConfigureTimeouts()
+                Me.Session.VerifyRunner()
+            Case "Run Task"
+                Me.ConfigureTimeouts()
+                Dim source As String = Me.Session.ProjectLibrary.TaskSource(Me.TaskField.Text)
+                If source = "" Then Throw New InvalidArgumentException("No project task with that name; Bind Task first")
+                Me.Session.Start(source, "Task: " + Me.TaskField.Text)
+            Case "Events Off"
+                Me.ConfigureTimeouts()
+                If Me.Session.IsActive() Or Me.Session.BuildBusy Then Throw New InvalidArgumentException("Wait for the build and active script before changing build events")
+                If Not Me.Session.BuildEventsEnabled Then
+                    Me.Session.Runner()
+                    If MessageBox.Show(Me, "Enable project build events?", "before-build and after-build tasks run native code with your OS privileges. Review project scripts before enabling. This applies only to this Studio session.", "Enable", "", "Cancel") <> "Enable" Then Return
+                End If
+                Me.Session.BuildEventsEnabled = Not Me.Session.BuildEventsEnabled
+                For Each button As ScriptButton In Me.Buttons
+                    If button.Tag <> "Events Off" Then Continue For
+                    button.Caption = "Events Off"
+                    If Me.Session.BuildEventsEnabled Then button.Caption = "Events On"
+                Next
+                Me.Status.Text = "Build events off for this session"
+                If Me.Session.BuildEventsEnabled Then Me.Status.Text = "Build events on for this session"
+            Case "Help"
+                If Me.Help = Nil Then Me.Help = New StudioDocumentationWindow(Me.Session.ProjectRoot, "")
+                Me.Help.Title = "BuoyScript Help & Examples"
+                Me.Help.Show()
+                Me.Help.ShowPage("/studio/buoyscript/")
+            Case "Clear Console"
+                Me.Session.Transcript = ""
+            Case "Complete"
+                Me.Language.Command("completion")
+            Case "Signature"
+                Me.Language.Command("signature")
+            Case "Type Info"
+                Me.Language.Command("hover")
+            Case "Symbols"
+                Me.Language.Command("symbols")
+            Case "Format"
+                Me.Editor.SelectRange(0, String.Len(Me.Editor.Text))
+                Me.Language.Command("formatSelection")
+            Case "Definition"
+                Me.Language.Command("definition")
+            Case "Undo", "Redo"
+                Me.Undo(action = "Redo")
+            End Select
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+    Public Function HasDirtyBuildScript() As Boolean
+        If Me.OpenLibrary <> Me.Session.ProjectLibrary Or Me.OpenName = "" Then Return False
+        If String.Compare(Me.Editor.Text, Me.Baseline, True) = 0 Then Return False
+        Dim references As JSONItem = Me.Session.ProjectLibrary.References()
+        For Each eventName As String In ["before-build", "after-build"]
+            If references.Value(eventName).AsString().Or("") = Me.OpenName Then Return True
+        Next
+        Return False
+    End Function
+    Public Sub Poll()
+        Me.Session.Poll()
+        Me.RunnerLabel.Text = Me.Session.RunnerState()
+        If Me.Mode.SelectedIndex = 1 Then Me.Editor.ClearMarkers()
+        Me.Language.Poll()
+        If String.Compare(Me.LastConsole, Me.Session.Transcript, True) <> 0 Then
+            Me.LastConsole = Me.Session.Transcript
+            Me.Console.Text = Me.LastConsole
+        End If
+    End Sub
+    Public Sub Dispose()
+        Me.Session.Stop()
+        Me.Poller.Stop()
+        Me.Language.Stop()
+        Me.Editor.Close()
+        If Me.Help <> Nil Then Me.Help.Visible = False
+        Me.Visible = False
+        If Me.LanguageRoot <> "" Then
+            Dim folder As New FileSystemItem(Me.LanguageRoot)
+            folder.Delete(True)
+        End If
+    End Sub
+    Handle Opening()
+        Me.Editor.Open()
+    End Handle
+    Handle Closing() As Boolean
+        Me.Visible = False
+        Return True
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.Place(width, height)
+    End Handle
+
+    ' The LSP sees the exact runner wrapper, with a four-line prefix. It is never saved.
+    Public Function LanguageBuffer() As StudioLanguageBuffer
+        If Me.Mode.SelectedIndex = 1 Then Return Nil
+        Dim buffer As New StudioLanguageBuffer()
+        buffer.Path = Me.VirtualPath
+        buffer.Text = "Declare Function ProjectTool Lib \"host\" (name As String, argumentsJson As String) As String\nDeclare Sub StudioResult Lib \"host\" (value As String)\nDeclare Sub StudioFailure Lib \"host\" (value As String)\nFunction StudioBody() As String\n" + Me.Editor.Text + "\nEnd Function\nExport Sub StudioRun()\nTry\nStudioResult(StudioBody())\nCatch e As Exception\nStudioFailure(e.Message)\nEnd Try\nEnd Sub"
+        buffer.Revision = Me.Revision
+        Dim first As EditorPosition = StudioShellPosition(Me.Editor.Text, Me.Editor.SelectionStart)
+        Dim last As EditorPosition = StudioShellPosition(Me.Editor.Text, Me.Editor.SelectionStart + Me.Editor.SelectionLength)
+        buffer.Line = first.Line + 4
+        buffer.Column = first.Character
+        buffer.EndLine = last.Line + 4
+        buffer.EndColumn = last.Character
+        Return buffer
+    End Function
+    Public Function LanguageRevisionToken() As String
+        Return String.From(Me.Revision) + ":" + String.From(Me.Mode.SelectedIndex)
+    End Function
+    Public Function LanguageScratchPath() As String
+        Return Me.VirtualPath
+    End Function
+    Public Sub LanguageStatus(message As String)
+        Me.Status.Text = "BuoyScript language: " + message
+    End Sub
+    Public Sub PublishLanguageDiagnostics(answer As StudioLanguageResult)
+        If Me.Mode.SelectedIndex = 1 Then Return
+        If String.Compare(answer.Path, Me.VirtualPath, True) <> 0 Then Return
+        If String.Compare(answer.SourceText, Me.LanguageBuffer().Text, True) <> 0 Then Return
+        Dim markers As Array Of StudioEditorMarker = []
+        For Each location As StudioLanguageLocation In answer.Locations
+            If location.Line < 4 Or location.Line - 4 >= Me.Editor.LineCount Then Continue For
+            Dim length As Integer = 0
+            If location.EndLine = location.Line Then length = Math.Max(0, location.EndColumn - location.Column)
+            markers.Append(New StudioEditorMarker(location.Line - 4, location.Column, length, StudioMarkerSeverityFromLsp(location.Kind), location.Detail))
+        Next
+        Me.Editor.SetMarkers(markers)
+    End Sub
+    Public Sub OpenLanguageLocation(location As StudioLanguageLocation)
+        If String.Compare(location.Path, Me.VirtualPath, True) <> 0 Or location.Line < 4 Then
+            Me.Status.Text = "Language location is outside the script body: " + location.Path
+            Return
+        End If
+        Dim start As Integer = StudioShellOffset(Me.Editor.Text, location.Line - 4, location.Column)
+        If start >= 0 Then Me.Editor.SelectRange(start, 0)
+    End Sub
+    Public Function ApplyLanguageEdits(edits As Array Of StudioLanguageLocation, expectedToken As String) As Boolean
+        Try
+            Return Me.ApplyScriptLanguageEdits(edits, expectedToken)
+        Catch e As Exception
+            Me.Status.Text = "Language edit rejected: " + e.Message
+            Return False
+        End Try
+    End Function
+    Private Function ApplyScriptLanguageEdits(edits As Array Of StudioLanguageLocation, expectedToken As String) As Boolean
+        If expectedToken <> Me.LanguageRevisionToken() Then Return False
+        Dim text As String = Me.Editor.Text
+        Dim starts As Array Of Integer = []
+        Dim ends As Array Of Integer = []
+        Dim values As Array Of String = []
+        For Each edit As StudioLanguageLocation In edits
+            If String.Compare(edit.Path, Me.VirtualPath, True) <> 0 Or edit.Line < 4 Or edit.EndLine < 4 Then Return False
+            Dim first As Integer = StudioShellOffset(text, edit.Line - 4, edit.Column)
+            Dim last As Integer
+            Dim replacement As String = edit.NewText
+            If (Me.Language.ActiveKind = "format" Or Me.Language.ActiveKind = "formatSelection") And edit.EndLine = 4 + Me.Editor.LineCount And edit.EndColumn = 0 Then
+                ' Range formatting may include the generated separator before End Function.
+                ' Keep that separator in the wrapper and apply only the body replacement.
+                last = String.Len(text)
+                If String.EndsWith(replacement, "\r\n", True) Then
+                    replacement = String.Left(replacement, String.Len(replacement) - 2)
+                ElseIf String.EndsWith(replacement, "\n", True) Then
+                    replacement = String.Left(replacement, String.Len(replacement) - 1)
+                Else
+                    Return False
+                End If
+            Else
+                last = StudioShellOffset(text, edit.EndLine - 4, edit.EndColumn)
+            End If
+            If first < 0 Or last < first Then Return False
+            For i As Integer = 0 To Array.LastIndex(starts)
+                If first < ends(i) And last > starts(i) Then Return False
+                If first = last And starts(i) = ends(i) And first = starts(i) Then Return False
+                If first = last And first > starts(i) And first < ends(i) Then Return False
+                If starts(i) = ends(i) And starts(i) > first And starts(i) < last Then Return False
+            Next
+            starts.Append(first)
+            ends.Append(last)
+            values.Append(replacement)
+        Next
+        While Array.Count(starts) > 0
+            Dim best As Integer = 0
+            For i As Integer = 1 To Array.LastIndex(starts)
+                If starts(i) > starts(best) Or (starts(i) = starts(best) And ends(i) > ends(best)) Then best = i
+            Next
+            text = String.Left(text, starts(best)) + values(best) + String.Substring(text, ends(best))
+            Array.RemoveAt(starts, best)
+            Array.RemoveAt(ends, best)
+            Array.RemoveAt(values, best)
+        Wend
+        Me.Editor.Text = text
+        Me.Edited()
+        Return True
+    End Function
+    Public Sub ShowLanguageCompletions(choices As Array Of StudioLanguageChoice, automatic As Boolean)
+        Dim items As Array Of StudioEditorCompletionItem = []
+        For Each choice As StudioLanguageChoice In choices
+            If choice.InsertText = "" Then Continue For
+            Dim item As New StudioEditorCompletionItem()
+            item.Label = choice.Title
+            item.Detail = choice.Detail
+            item.InsertText = choice.InsertText
+            item.Kind = choice.Kind
+            items.Append(item)
+        Next
+        Me.Editor.ShowCompletionItems(items)
+    End Sub
+    Public Sub ShowLanguageSignature(label As String)
+        Me.Editor.ShowCompletionHint(label)
+    End Sub
+End Class

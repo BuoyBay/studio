@@ -1,0 +1,214 @@
+Import projectkit
+
+#If TargetWindows Then
+    Private Declare Function SDAttributes Lib "kernel32" Alias "GetFileAttributesW" (name As Ptr) As UInt32
+#Else
+    Private Declare Function SDReadLink Lib "c" Alias "readlink" (name As String, buffer As Ptr, count As UInt64) As Int64
+#End If
+
+Private Sub SDRejectLink(file As FileSystemItem)
+    #If TargetWindows Then
+        Dim attributes As UInt32 = SDAttributes(file.Handle)
+        If attributes = &hffffffff Or (attributes And &h400) <> 0 Then Throw New InvalidArgumentException("Documentation path is unavailable or redirects outside its root")
+    #Else
+        Dim buffer As New Bytes()
+        buffer.Append(0)
+        If SDReadLink(file.FullPath(), buffer.DataPtr(), 1) >= 0 Then Throw New InvalidArgumentException("Documentation links are not followed")
+    #End If
+End Sub
+
+Private Function SDRelative(value As String) As Boolean
+    If value = "" Or String.LenBytes(value) > 512 Then Return False
+    If String.Contains(value, "\\", True) Or String.Contains(value, ":", True) Then Return False
+    For Each part As String In String.Split(value, "/")
+        If part = "" Or part = "." Or part = ".." Then Return False
+        For Each character As String In String.Chars(part)
+            If String.Asc(character) < 32 Or String.Asc(character) = 127 Then Return False
+        Next
+    Next
+    Return True
+End Function
+
+Private Function SDFile(root As String, relative As String) As FileSystemItem
+    If Not SDRelative(relative) Then Throw New InvalidArgumentException("Expected a relative documentation path without traversal")
+    Dim current As New FileSystemItem(root)
+    Dim parts As Array Of String = String.Split(relative, "/")
+    For i As Integer = 0 To Array.Count(parts) - 1
+        current = current.Child(parts(i))
+        SDRejectLink(current)
+        If i < Array.Count(parts) - 1 Then
+            If Not current.IsFolder() Then Throw New InvalidArgumentException("Documentation directory is unavailable")
+        End If
+    Next
+    If Not current.IsFile() Then Throw New InvalidArgumentException("Documentation page is unavailable")
+    Return current
+End Function
+
+Private Function SDRead(file As FileSystemItem) As String
+    Dim length As Integer = file.Length()
+    If length < 0 Or length > 2097152 Then Throw New InvalidArgumentException("Documentation file exceeds the 2 MiB read limit")
+    Dim opened = BinaryStream.Open(file, False)
+    If Not opened.IsOk Then Throw New InvalidArgumentException("Documentation file could not be opened")
+    Dim stream As BinaryStream = opened.Value
+    Try
+        Dim data As Bytes = stream.Read(length)
+        If data.Count <> length Or file.Length() <> length Then Throw New InvalidArgumentException("Documentation file changed during read")
+        For i As Integer = 0 To data.Count - 1
+            If data.Item(i) = 0 Then Throw New InvalidArgumentException("Documentation contains invalid text")
+        Next
+        Dim content As String = data.ToString(Text.Encodings.UTF8)
+        If String.LenBytes(content) <> length Then Throw New InvalidArgumentException("Documentation is not valid UTF-8 text")
+        Return String.Replace(String.Replace(content, "\r\n", "\n", True), "\r", "\n", True)
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+Private Sub SDKeys(input As JSONItem, allowed As Array Of String)
+    If input = Nil Or Not input.IsObject() Then Throw New InvalidArgumentException("Documentation tool arguments must be an object")
+    For Each key As String In input.Keys()
+        Dim known As Boolean = False
+        For Each candidate As String In allowed
+            If String.Compare(key, candidate, True) = 0 Then known = True
+        Next
+        If Not known Then Throw New InvalidArgumentException("Unknown documentation tool argument")
+    Next
+End Sub
+
+Private Function SDInteger(input As JSONItem, key As String, defaultValue As Integer, maximum As Integer) As Integer
+    If Not input.HasKey(key) Then Return defaultValue
+    Dim field As JSONItem = input.Value(key)
+    If Not field.IsNumber() Then Throw New InvalidArgumentException("Documentation range must be an integer")
+    Dim number As Double = field.AsNumber().Or(0.0)
+    If number < 1.0 Or number > maximum Then Throw New InvalidArgumentException("Documentation range is outside the permitted bounds")
+    Dim integerValue As Integer = number
+    If integerValue <> number Then Throw New InvalidArgumentException("Documentation range must be an integer")
+    Return integerValue
+End Function
+
+''' Immutable, read-only documentation extension bound to one selected compiler install.
+''' Recreate it when the compiler/resource fingerprint changes; it never reads project files.
+Public Class StudioAgentDocs Implements ProjectToolExtension
+    Private Property Root As String
+    Private Property Version As String
+
+    Public Sub Constructor(toolchainRoot As String, compilerVersion As String)
+        If toolchainRoot <> "" Then
+            If New FileSystemItem(Path.Join(toolchainRoot, "docs")).IsFolder() Then Me.Root = toolchainRoot
+        End If
+        Me.Version = compilerVersion
+    End Sub
+
+    Public Function Tools() As JSONItem
+        Dim tools As JSONItem = JSONItem.NewArray()
+        If Me.Root = "" Then Return tools
+        Dim search As JSONItem = JSONItem.NewObject()
+        search.Value("name") = "buoy_search_docs"
+        search.Value("description") = "Search the selected Buoy compiler's local documentation index (titles, paths and summaries), not full page text. Use buoy_read_doc_page on a returned path. Compiler: " + Me.Version
+        search.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":256},\"maxResults\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":20}},\"required\":[\"query\"],\"additionalProperties\":false}")
+        search.Value("annotations") = Json.Parse("{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}")
+        tools.Add(search)
+        Dim read As JSONItem = JSONItem.NewObject()
+        read.Value("name") = "buoy_read_doc_page"
+        read.Value("description") = "Read a selected compiler documentation page by relative docs path. Returns up to 200 lines and 32 KiB with range/version metadata; request later startLine values for additional content."
+        read.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"startLine\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000},\"maxLines\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200}},\"required\":[\"path\"],\"additionalProperties\":false}")
+        read.Value("annotations") = search.Value("annotations")
+        tools.Add(read)
+        Return tools
+    End Function
+
+    Private Function ResultBase(source As String) As JSONItem
+        Dim output As JSONItem = JSONItem.NewObject()
+        output.Value("compilerVersion") = Me.Version
+        output.Value("toolchainRoot") = Me.Root
+        output.Value("source") = source
+        Return output
+    End Function
+
+    Private Function Search(input As JSONItem) As JSONItem
+        SDKeys(input, ["query", "maxResults"])
+        If Not input.Value("query").IsString() Then Throw New InvalidArgumentException("Documentation query is required")
+        Dim query As String = String.Trim(input.Value("query").AsString().Or(""))
+        If query = "" Or String.LenBytes(query) > 256 Then Throw New InvalidArgumentException("Documentation query must contain 1 to 256 UTF-8 bytes")
+        Dim maximum As Integer = SDInteger(input, "maxResults", 5, 20)
+        Dim file As FileSystemItem = SDFile(Me.Root, "ai/llms.txt")
+        Dim lines As Array Of String = String.Split(SDRead(file), "\n")
+        Dim terms As Array Of String = String.Split(String.LCase(String.Replace(query, "\t", " ", True)), " ")
+        Dim hits As JSONItem = JSONItem.NewArray()
+        Dim truncated As Boolean = False
+        Dim responseBytes As Integer = 0
+        For Each line As String In lines
+            If Not String.StartsWith(line, "- [", True) Then Continue For
+            Dim matches As Boolean = True
+            Dim lower As String = String.LCase(line)
+            For Each term As String In terms
+                If term <> "" And Not String.Contains(lower, term, True) Then matches = False
+            Next
+            If Not matches Then Continue For
+            Dim marker As Integer = String.IndexOf(line, "](", 0, True)
+            If marker < 3 Then Continue For
+            Dim endPath As Integer = String.IndexOf(line, "):", marker + 2, True)
+            If endPath < 0 Then Continue For
+            Dim pathValue As String = String.Substring(line, marker + 2, endPath - marker - 2)
+            If Not String.StartsWith(pathValue, "docs/", True) Then Continue For
+            pathValue = String.Substring(pathValue, 5)
+            If Not SDRelative(pathValue) Then Continue For
+            If hits.Count() >= maximum Then
+                truncated = True
+                Exit For
+            End If
+            Dim hit As JSONItem = JSONItem.NewObject()
+            hit.Value("title") = String.Left(String.Substring(line, 3, marker - 3), 160)
+            hit.Value("path") = pathValue
+            hit.Value("summary") = String.Left(String.Trim(String.Substring(line, endPath + 2)), 400)
+            Dim hitBytes As Integer = String.LenBytes(hit.ToString())
+            If responseBytes + hitBytes > 24000 Then
+                truncated = True
+                Exit For
+            End If
+            responseBytes += hitBytes
+            hits.Add(hit)
+        Next
+        Dim output As JSONItem = Me.ResultBase(file.FullPath())
+        output.Value("query") = query
+        output.Value("results") = hits
+        output.Value("truncated") = truncated
+        Return output
+    End Function
+
+    Private Function ReadPage(input As JSONItem) As JSONItem
+        SDKeys(input, ["path", "startLine", "maxLines"])
+        If Not input.Value("path").IsString() Then Throw New InvalidArgumentException("Documentation path is required")
+        Dim relative As String = input.Value("path").AsString().Or("")
+        If Not SDRelative(relative) Or Not String.EndsWith(relative, ".md", True) Then Throw New InvalidArgumentException("Expected a relative Markdown documentation path")
+        Dim first As Integer = SDInteger(input, "startLine", 1, 100000)
+        Dim maximum As Integer = SDInteger(input, "maxLines", 200, 200)
+        Dim file As FileSystemItem = SDFile(Me.Root, "docs/" + relative)
+        Dim lines As Array Of String = String.Split(SDRead(file), "\n")
+        If first > Array.Count(lines) Then Throw New InvalidArgumentException("Requested documentation range is past the end of the page")
+        Dim content As String = ""
+        Dim last As Integer = first - 1
+        For i As Integer = first - 1 To Math.Min(Array.Count(lines) - 1, first + maximum - 2)
+            Dim nextLine As String = lines(i) + "\n"
+            If String.LenBytes(content) + String.LenBytes(nextLine) > 32768 Then Exit For
+            content += nextLine
+            last = i + 1
+        Next
+        If last < first Then Throw New InvalidArgumentException("Documentation line exceeds the 32 KiB response limit")
+        Dim output As JSONItem = Me.ResultBase(file.FullPath())
+        output.Value("path") = relative
+        output.Value("startLine") = first
+        output.Value("endLine") = last
+        output.Value("totalLines") = Array.Count(lines)
+        output.Value("text") = content
+        output.Value("truncated") = first > 1 Or last < Array.Count(lines)
+        Return output
+    End Function
+
+    Public Function Call(name As String, input As JSONItem) As JSONItem
+        If Me.Root = "" Then Throw New InvalidArgumentException("Selected compiler documentation is unavailable")
+        If String.Compare(name, "buoy_search_docs", True) = 0 Then Return Me.Search(input)
+        If String.Compare(name, "buoy_read_doc_page", True) = 0 Then Return Me.ReadPage(input)
+        Throw New InvalidArgumentException("Unknown documentation tool")
+    End Function
+End Class

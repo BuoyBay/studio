@@ -1,0 +1,139 @@
+Private Function BuildText(data As JSONItem, key As String) As String
+    Return data.Value(key).AsString().Or("Not recorded")
+End Function
+
+Private Class StudioBuildCache
+    Public Shared Property Metadata As JSONItem
+    Public Shared Property TitlePrefix As String = ""
+End Class
+
+Public Function StudioBuildLabel(data As JSONItem) As String
+    Dim identity As String = data.Value("buildId").AsString().Or("")
+    If identity = "" Then Return "unrecorded build"
+    Return identity
+End Function
+
+Public Function StudioCurrentWindowTitle(caption As String) As String
+    If StudioBuildCache.TitlePrefix = "" Then StudioBuildCache.TitlePrefix = StudioWindowTitle("", StudioBuildMetadata())
+    If caption <> "" And caption <> "Buoy Studio" Then Return StudioBuildCache.TitlePrefix + " · " + caption
+    Return StudioBuildCache.TitlePrefix
+End Function
+
+Public Function StudioWindowTitle(caption As String, data As JSONItem) As String
+    Dim title As String = "Buoy Studio [" + StudioBuildLabel(data) + "]"
+    If caption <> "" And caption <> "Buoy Studio" Then title += " · " + caption
+    Return title
+End Function
+
+Public Function StudioBuildMetadata() As JSONItem
+    If StudioBuildCache.Metadata <> Nil Then Return StudioBuildCache.Metadata
+    StudioBuildCache.Metadata = JSONItem.NewObject()
+    Dim resource As FileSystemItem = FileSystemItem.AppResource("studio-build-info.json")
+    If resource = Nil Then Return JSONItem.NewObject()
+    Dim loaded As Result Of String, String = resource.ReadAllText()
+    If loaded.IsErr Then Return JSONItem.NewObject()
+    Dim parsed As Optional Of JSONItem = Json.TryParse(loaded.Value)
+    If Not parsed.HasValue Then Return JSONItem.NewObject()
+    If Not parsed.Value.IsObject() Then Return JSONItem.NewObject()
+    StudioBuildCache.Metadata = parsed.Value
+    Return StudioBuildCache.Metadata
+End Function
+
+Public Function StudioBuildDetails(data As JSONItem, rendering As String) As String
+    Dim git As JSONItem = data.Value("git")
+    Dim state As String = "Not recorded"
+    If git.Value("dirty").IsBoolean() Then
+        state = "Clean"
+        If git.Value("dirty").AsBoolean().Or(False) Then state = "Modified (includes local changes)"
+    End If
+    Dim details As String = "Buoy Studio · " + BuildText(data, "version") + "\n\n"
+    details += "Build ID: " + BuildText(data, "buildId") + "\n"
+    details += "Built (UTC): " + BuildText(data, "builtAtUtc") + "\n"
+    details += "Git commit: " + BuildText(git, "commit") + "\n"
+    details += "Branch: " + BuildText(git, "branch") + "\n"
+    details += "Source state: " + state + "\n"
+    details += "Commit time: " + BuildText(git, "commitTime") + "\n"
+    details += "Git description: " + BuildText(git, "description") + "\n"
+    details += "Source SHA-256: " + BuildText(data, "sourceFingerprint") + "\n\n"
+    details += "Target: " + BuildText(data, "target") + "\n"
+    details += "Build OS: " + BuildText(data, "buildOS") + "\n"
+    details += "Compiler: " + BuildText(data.Value("compiler"), "version") + "\n"
+    details += "Compiler executable: " + BuildText(data.Value("compiler"), "path") + "\n"
+    details += "Compiler executable SHA-256: " + BuildText(data.Value("compiler"), "sha256") + "\n"
+    details += "Packager: " + BuildText(data.Value("packager"), "version") + "\n\n"
+    details += "Canvas rendering: " + rendering + "\n"
+    details += "Executable: " + Application.Executable.FullPath() + "\n\n"
+    details += "Bundled packages:\n"
+    Dim packages As JSONItem = data.Value("packages")
+    For i As Integer = 0 To packages.Count - 1
+        Dim item As JSONItem = packages.ValueAt(i)
+        details += "  " + BuildText(item, "file") + "\n    SHA-256: " + BuildText(item, "sha256") + "\n"
+    Next
+    Return details
+End Function
+
+Private Class AboutCopyButton Inherits Button
+    Public Property Owner As StudioAboutWindow
+    Handle Action()
+        Dim writer As New Clipboard()
+        writer.Text = Me.Owner.Details.Text
+        writer.Close()
+    End Handle
+End Class
+
+Private Class AboutCloseButton Inherits Button
+    Public Property Owner As StudioAboutWindow
+    Handle Action()
+        Me.Owner.Visible = False
+    End Handle
+End Class
+
+Public Class StudioAboutWindow Inherits Window
+    Public Property Details As TextArea = New TextArea()
+    Private Property Heading As Label = New Label()
+    Private Property CopyButton As AboutCopyButton = New AboutCopyButton()
+    Private Property CloseButton As AboutCloseButton = New AboutCloseButton()
+    Public Sub Constructor()
+        Me.Title = "About Buoy Studio"
+        Me.Move(160, 120, 780, 600)
+        Me.Heading.Text = "Buoy Studio · Build Details"
+        Me.Heading.FontSize = 18.0
+        Me.Heading.Bold = True
+        Me.Details.IsReadOnly = True
+        Me.Details.FontSize = 11.0
+        #If TargetMac Then
+            Me.Details.FontName = "Menlo"
+        #ElseIf TargetWindows Then
+            Me.Details.FontName = "Consolas"
+        #Else
+            Me.Details.FontName = "monospace"
+        #End If
+        Me.CopyButton.Caption = "Copy Details"
+        Me.CopyButton.Owner = Me
+        Me.CloseButton.Caption = "Close"
+        Me.CloseButton.Owner = Me
+        Me.AddSubview(Me.Heading)
+        Me.AddSubview(Me.Details)
+        Me.AddSubview(Me.CopyButton)
+        Me.AddSubview(Me.CloseButton)
+        Me.LayoutDetails(780, 600)
+    End Sub
+    Public Sub Refresh(rendering As String)
+        Dim metadata As JSONItem = StudioBuildMetadata()
+        Me.Title = "About Buoy Studio [" + StudioBuildLabel(metadata) + "]"
+        Me.Details.Text = StudioBuildDetails(metadata, rendering)
+    End Sub
+    Private Sub LayoutDetails(width As Integer, height As Integer)
+        Me.Heading.Move(20, 16, width - 40, 30)
+        Me.Details.Move(20, 58, width - 40, height - 120)
+        Me.CopyButton.Move(20, height - 46, 130, 28)
+        Me.CloseButton.Move(width - 110, height - 46, 90, 28)
+    End Sub
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutDetails(Math.Max(400, Math.Round(width)), Math.Max(300, Math.Round(height)))
+    End Handle
+    Handle Closing() As Boolean
+        Me.Visible = False
+        Return True
+    End Handle
+End Class

@@ -1,0 +1,138 @@
+' Resolve a native Codex executable without relying on a terminal's shell setup.
+' npm's codex/codex.cmd wrappers require Node and are not native executables.
+
+Private Function StudioCodexTarget() As String
+    #If TargetMac Then
+        #If TargetArm Then
+            Return "aarch64-apple-darwin"
+        #Else
+            Return "x86_64-apple-darwin"
+        #End If
+    #ElseIf TargetWindows Then
+        #If TargetArm Then
+            Return "aarch64-pc-windows-msvc"
+        #Else
+            Return "x86_64-pc-windows-msvc"
+        #End If
+    #Else
+        #If TargetArm Then
+            Return "aarch64-unknown-linux-musl"
+        #Else
+            Return "x86_64-unknown-linux-musl"
+        #End If
+    #End If
+End Function
+
+Private Function StudioCodexPlatformPackage() As String
+    Dim platform As String = "linux"
+    #If TargetMac Then
+        platform = "darwin"
+    #ElseIf TargetWindows Then
+        platform = "win32"
+    #End If
+    Dim architecture As String = "x64"
+    #If TargetArm Then
+        architecture = "arm64"
+    #End If
+    Return "codex-" + platform + "-" + architecture
+End Function
+
+Private Function StudioCodexNativeFile(pathValue As String) As Boolean
+    Dim item As New FileSystemItem(pathValue)
+    If Not item.IsFile() Then Return False
+    #If Not TargetWindows Then
+        If Not item.Permissions.OwnerExecute And Not item.Permissions.GroupExecute And Not item.Permissions.OtherExecute Then Return False
+    #End If
+    ' Read only the file magic; never load an entire large executable into memory.
+    Dim opened = BinaryStream.Open(item, False)
+    If Not opened.IsOk Then Return False
+    Dim stream As BinaryStream = opened.Value
+    Try
+        Dim magic As Bytes = stream.Read(4)
+        If magic.Count < 2 Then Return False
+        #If TargetWindows Then
+            Return magic.Item(0) = 77 And magic.Item(1) = 90
+        #Else
+            ' A Node shebang is unusable when the GUI's PATH omits Node. Find its
+            ' native npm payload below instead of spawning an untrusted shell.
+            Return Not (magic.Item(0) = 35 And magic.Item(1) = 33)
+        #End If
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+Private Function StudioCodexNpmPayload(packageRoot As String) As String
+    Dim fileName As String = "codex"
+    #If TargetWindows Then
+        fileName = "codex.exe"
+    #End If
+    Dim suffix As String = "vendor/" + StudioCodexTarget() + "/bin/" + fileName
+    Dim roots As Array Of String = [Path.Join(packageRoot, "node_modules/@openai/" + StudioCodexPlatformPackage()), packageRoot]
+    For Each root As String In roots
+        Dim candidate As String = Path.Join(root, suffix)
+        If StudioCodexNativeFile(candidate) Then Return candidate
+    Next
+    Return ""
+End Function
+
+''' Deterministic discovery helper, also used by isolated installation-layout tests.
+''' Empty and relative PATH entries are ignored: Studio never launches a project-local codex.
+Public Function StudioFindCodexInFolders(folders As Array Of String) As String
+    Dim fileName As String = "codex"
+    #If TargetWindows Then
+        fileName = "codex.exe"
+    #End If
+    For Each folder As String In folders
+        If folder = "" Then Continue For
+        Dim absolute As Boolean = String.StartsWith(folder, "/", True)
+        #If TargetWindows Then
+            absolute = String.Len(folder) > 2 And String.Substring(folder, 1, 1) = ":"
+            If String.StartsWith(folder, "\\\\", True) Then absolute = True
+        #End If
+        If Not absolute Then Continue For
+        Dim directory As New FileSystemItem(folder)
+        Dim packageRoots As Array Of String = [Path.Join(folder, "node_modules/@openai/codex"), Path.Join(directory.ParentPath(), "lib/node_modules/@openai/codex")]
+        For Each root As String In packageRoots
+            Dim payload As String = StudioCodexNpmPayload(root)
+            If payload <> "" Then Return payload
+        Next
+        Dim candidate As String = Path.Join(folder, fileName)
+        If StudioCodexNativeFile(candidate) Then Return candidate
+    Next
+    Return ""
+End Function
+
+''' An explicit executable override wins; otherwise discover native PATH/npm/Homebrew installs.
+Public Function FindStudioCodexExecutable() As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_CODEX_EXECUTABLE").Or("")
+    If configured <> "" Then Return configured
+    Dim separator As String = ":"
+    #If TargetWindows Then
+        separator = ";"
+    #End If
+    ' String.Split returns a fixed-size array; build a resizable list before
+    ' appending the platform's standard GUI installation directories.
+    Dim folders As Array Of String = []
+    For Each folder As String In String.Split(System.EnvironmentVariable("PATH").Or(""), separator)
+        folders.Append(folder)
+    Next
+    #If TargetMac Then
+        folders.Append("/opt/homebrew/bin")
+        folders.Append("/usr/local/bin")
+    #ElseIf TargetWindows Then
+        Dim appData As String = System.EnvironmentVariable("APPDATA").Or("")
+        If appData <> "" Then folders.Append(Path.Join(appData, "npm"))
+        Dim localData As String = System.EnvironmentVariable("LOCALAPPDATA").Or("")
+        If localData <> "" Then folders.Append(Path.Join(localData, "Microsoft/WinGet/Links"))
+    #Else
+        Dim homeDirectory As String = System.EnvironmentVariable("HOME").Or("")
+        If homeDirectory <> "" Then
+            folders.Append(Path.Join(homeDirectory, ".local/bin"))
+            folders.Append(Path.Join(homeDirectory, ".npm-global/bin"))
+        End If
+        folders.Append("/usr/local/bin")
+        folders.Append("/usr/bin")
+    #End If
+    Return StudioFindCodexInFolders(folders)
+End Function

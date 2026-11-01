@@ -1,0 +1,117 @@
+Import diffkit
+Import StudioDiff
+Import StudioGitBaseline
+#If TargetIntel Or TargetMac Or TargetLinux Then
+    Import StudioGit
+    Import gitkit
+    Import StudioGitWindow
+#End If
+
+Public Interface StudioShellGitReceiver
+    Sub ShellGitMarkers(documentID As String, revision As Integer, hunks As Array Of LineHunk, errorText As String)
+End Interface
+
+#If TargetIntel Or TargetMac Or TargetLinux Then
+Public Class StudioShellGitBridge Implements StudioGitHost
+#Else
+Public Class StudioShellGitBridge
+#End If
+    Public Property Host As StudioShellGitReceiver
+    Public Property Enabled As Boolean = False
+    Public Property Comparison As StudioDiffSession
+    Public Property Status As String
+    Private Property Root As String
+    Private Property Request As StudioGitBaselineRequest
+    Private Property Snapshot As StudioDiffSnapshot
+    Private Property Started As Integer
+    Private Property LastRefresh As Integer
+    Private Property Relative As String
+    #If TargetIntel Or TargetMac Or TargetLinux Then
+        Private Property Controller As StudioGitController
+        Private Property View As StudioGitWindow
+    #End If
+    Public Sub Show(directory As String)
+        #If TargetIntel Or TargetMac Or TargetLinux Then
+            If Me.Controller = Nil Or Me.Root <> directory Then
+                Me.Close()
+                Me.Root = directory
+                Me.Controller = New StudioGitController(directory)
+            End If
+            If Me.View = Nil Then Me.View = New StudioGitWindow()
+            Me.View.Present(Me.Controller)
+            Me.Enabled = True
+            Me.Status = Me.Controller.ErrorText
+        #Else
+            Me.Status = "Local Git is unavailable: this package has no native slice for this ARM64 platform. Diff comparisons remain available."
+        #End If
+    End Sub
+    Public Sub UpdateGitMarkers(documentID As String, revision As Integer, hunks As Array Of LineHunk, errorText As String)
+        If Me.Host <> Nil Then Me.Host.ShellGitMarkers(documentID, revision, hunks, errorText)
+    End Sub
+    Public Sub Sync(relativePath As String, snapshot As StudioDiffSnapshot)
+        If Not Me.Enabled Or snapshot = Nil Then Return
+        If Me.Snapshot <> Nil Then
+            If snapshot.DocumentID = Me.Snapshot.DocumentID And snapshot.Revision = Me.Snapshot.Revision And String.Compare(snapshot.Text, Me.Snapshot.Text, True) = 0 And System.Microseconds() - Me.LastRefresh < 2000000 Then Return
+        End If
+        If Me.Request <> Nil Then Me.Request.Cancel()
+        Me.Snapshot = snapshot
+        Me.Relative = relativePath
+        Me.LastRefresh = System.Microseconds()
+        Dim executable As String = System.EnvironmentVariable("BUOY_STUDIO_GIT").Or("")
+        If executable = "" Then
+            #If TargetWindows Then
+                executable = "C:/Program Files/Git/cmd/git.exe"
+            #Else
+                executable = "/usr/bin/git"
+            #End If
+        End If
+        If Not New FileSystemItem(executable).IsFile() Then
+            Me.Status = "Index gutter needs an installed Git executable; set BUOY_STUDIO_GIT to its absolute path."
+            Dim empty As Array Of LineHunk = []
+            Me.UpdateGitMarkers(snapshot.DocumentID, snapshot.Revision, empty, Me.Status)
+            Return
+        End If
+        Me.Request = New StudioGitBaselineRequest(executable, Me.Root, relativePath)
+        Me.Started = System.Microseconds()
+    End Sub
+    Public Sub Poll()
+        If Me.Request = Nil Then Return
+        If System.Microseconds() - Me.Started > 5000000 Then Me.Request.Cancel()
+        Me.Request.Poll()
+        If Not Me.Request.IsComplete Then Return
+        Dim failure As String = Me.Request.ErrorText
+        #If TargetIntel Or TargetMac Or TargetLinux Then
+            If failure = "" Then
+                Me.Comparison = Me.Controller.PublishGutter(Me, Me.Snapshot.DocumentID, Me.Request.Text, Me.Snapshot)
+            Else
+                ' Only actual repository status can establish an empty untracked baseline.
+                Dim untracked As Boolean = False
+                Me.Controller.Refresh()
+                For Each entry As GitStatusEntry In Me.Controller.Entries
+                    If entry.RelativePath = Me.Relative And entry.IsUntracked Then untracked = True
+                Next
+                If untracked Then
+                    Me.Comparison = Me.Controller.PublishGutter(Me, Me.Snapshot.DocumentID, "", Me.Snapshot)
+                Else
+                    Me.Comparison = Nil
+                    Dim empty As Array Of LineHunk = []
+                    Me.UpdateGitMarkers(Me.Snapshot.DocumentID, Me.Snapshot.Revision, empty, failure)
+                End If
+            End If
+        #End If
+        Me.Request = Nil
+    End Sub
+    Public Sub Close()
+        If Me.Request <> Nil Then Me.Request.Cancel()
+        Me.Request = Nil
+        #If TargetIntel Or TargetMac Or TargetLinux Then
+            If Me.View <> Nil Then Me.View.Dispose()
+            Me.View = Nil
+            If Me.Controller <> Nil Then Me.Controller.Close()
+            Me.Controller = Nil
+        #End If
+        Me.Enabled = False
+        Me.Comparison = Nil
+        Me.Snapshot = Nil
+    End Sub
+End Class

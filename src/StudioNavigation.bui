@@ -1,0 +1,87 @@
+''' Source positions use stable workspace identity and one-based line/column.
+Public Class StudioLocation
+    Public Property DocumentID As String
+    Public Property Path As String
+    Public Property Revision As String
+    Public Property Line As Integer = 1
+    Public Property Column As Integer = 1
+    Public Property CaptureToken As String
+    Public Function Copy() As StudioLocation
+        Dim value As New StudioLocation()
+        value.DocumentID = Me.DocumentID
+        value.Path = Me.Path
+        value.Revision = Me.Revision
+        value.Line = Me.Line
+        value.Column = Me.Column
+        value.CaptureToken = Me.CaptureToken
+        Return value
+    End Function
+End Class
+
+Public Interface StudioNavigationHost
+    Function NavigationLocation() As StudioLocation
+    Function NavigationOpen(location As StudioLocation) As String
+    Function NavigationCanCommand(commandID As String) As Boolean
+    Function NavigationCommand(commandID As String) As String
+    Function NavigationPaste(text As String, expected As StudioLocation) As String
+End Interface
+
+Public Class StudioNavigationHistory
+    Private Property Items As Array Of StudioLocation = []
+    Private Property Position As Integer = -1
+    Private Property Edited As StudioLocation
+    Public Sub Visit(location As StudioLocation)
+        If location = Nil Or location.DocumentID = "" Then Return
+        If Me.Position >= 0 Then
+            Dim old As StudioLocation = Me.Items(Me.Position)
+            If old.DocumentID = location.DocumentID And old.Line = location.Line And old.Column = location.Column Then
+                Me.Items(Me.Position) = location.Copy()
+                Return
+            End If
+        End If
+        Dim retained As Array Of StudioLocation = []
+        For i As Integer = Math.Max(0, Me.Position - 126) To Me.Position
+            retained.Append(Me.Items(i))
+        Next
+        retained.Append(location.Copy())
+        Me.Items = retained
+        Me.Position = Array.Count(retained) - 1
+    End Sub
+    Public Function Candidate(forward As Boolean) As StudioLocation
+        Dim index As Integer = Me.Position - 1
+        If forward Then index = Me.Position + 1
+        If index < 0 Or index >= Array.Count(Me.Items) Then Return Nil
+        Return Me.Items(index).Copy()
+    End Function
+    ''' Commit only after the host successfully opened Candidate; failures preserve history.
+    Public Sub Commit(forward As Boolean)
+        If Me.Candidate(forward) = Nil Then Return
+        If forward Then
+            Me.Position += 1
+        Else
+            Me.Position -= 1
+        End If
+    End Sub
+    Public Sub RecordEdit(location As StudioLocation)
+        If location <> Nil Then Me.Edited = location.Copy()
+    End Sub
+    Public Function LastEdit() As StudioLocation
+        If Me.Edited = Nil Then Return Nil
+        Return Me.Edited.Copy()
+    End Function
+End Class
+
+''' Parses strict line[:column], optionally relative to a current source location.
+Public Function StudioParsePosition(text As String, current As StudioLocation) As StudioLocation
+    Dim parts As Array Of String = String.Split(String.Trim(text), ":")
+    If Array.Count(parts) < 1 Or Array.Count(parts) > 2 Then Return Nil
+    Dim line As Integer = Integer.Parse(parts(0)).Or(0)
+    Dim column As Integer = 1
+    If Array.Count(parts) = 2 Then column = Integer.Parse(parts(1)).Or(0)
+    If line < 1 Or column < 1 Then Return Nil
+    Dim location As New StudioLocation()
+    If current <> Nil Then location = current.Copy()
+    location.Line = line
+    location.Column = column
+    Return location
+End Function

@@ -1,0 +1,511 @@
+Import processkit
+Import agentkit
+Import StudioDiscovery
+
+
+''' Optional Studio navigation host; source paths remain adapter-provided data.
+''' The host decides which paths belong to its already registered project buffers.
+Public Interface StudioDebuggerListener
+    Sub DebuggerStopped(filePath As String, line As Integer)
+    Sub DebuggerResumed()
+End Interface
+
+''' Optional launch boundary for hosts that snapshot project source revisions.
+''' Called after validation/queueing and before any helper process is spawned.
+Public Interface StudioDebuggerSessionListener
+    Sub DebuggerSessionStarting()
+End Interface
+
+''' The host retains this holder; the debugger keeps only a weak reference.
+Public Class StudioDebuggerLink
+    Public Property Listener As StudioDebuggerListener
+End Class
+
+''' Native debugger view. A target is never launched until Launch or Attach is pressed.
+Public Class StudioDebuggerButton Inherits Button
+    Public Property Owner As Weak StudioDebuggerWindow
+    Public Property CommandName As String
+    Handle Action()
+        Dim target As StudioDebuggerWindow = Me.Owner
+        If target <> Nil Then target.Command(Me.CommandName)
+    End Handle
+End Class
+
+Public Class StudioDebuggerClock Inherits Timer
+    Public Property Owner As Weak StudioDebuggerWindow
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioDebuggerWindow = Me.Owner
+        If target <> Nil Then target.PollDebugger()
+    End Sub
+End Class
+
+Public Class StudioDebuggerWindow Inherits Window
+    Public Property ProjectRoot As String
+    Public Property Link As Weak StudioDebuggerLink
+    Private Property Frames As Array Of JSONItem = []
+    Public Property IsClosed As Boolean = False
+    Public Property State As String = "idle"
+    Public Property ProgramField As TextField = New TextField()
+    Public Property ArgumentsField As TextField = New TextField()
+    Public Property BreakpointsField As TextArea = New TextArea()
+    Public Property AttachField As TextField = New TextField()
+    Public Property StatusLabel As Label = New Label()
+    Public Property StackText As TextArea = New TextArea()
+    Public Property VariablesText As TextArea = New TextArea()
+    Public Property OutputText As TextArea = New TextArea()
+    Public Property FrameField As TextField = New TextField()
+    Private Property Buttons As Array Of StudioDebuggerButton = []
+    Private Property Labels As Array Of Label = []
+    Private Property Child As PipeProcess
+    Private Property Decoder As JSONLDecoder
+    Private Property Clock As StudioDebuggerClock = New StudioDebuggerClock()
+    Private Property Pending As Bytes = New Bytes()
+    Private Property PendingOffset As Integer = 0
+    Private Property Disposing As Boolean = False
+    Private Property Stopping As Boolean = False
+    Private Property OutputLimit As Integer = 131072
+
+    Public Sub Constructor(projectRoot As String)
+        Super.Constructor()
+        Me.ProjectRoot = projectRoot
+        If Me.ProjectRoot = "" Then Me.ProjectRoot = New FileSystemItem(".").FullPath()
+        Me.Title = "Buoy Debugger"
+        Me.Move(140, 100, 1060, 760)
+        Me.SetMinSize(900.0, 660.0)
+        Dim headings As Array Of String = ["Executable built with buoy -g", "Program arguments (JSON string array)", "Breakpoints applied on Launch/Attach: absolute file:line", "Attach process ID", "Stack (frame IDs)", "Locals and registers", "Program and adapter output", "Inspect frame ID"]
+        For Each heading As String In headings
+            Dim label As New Label()
+            label.Text = heading
+            label.FontSize = 12.0
+            Me.Labels.Append(label)
+            Me.AddSubview(label)
+        Next
+        Me.ProgramField.Text = System.EnvironmentVariable("BUOY_STUDIO_DEBUG_PROGRAM").Or("")
+        Me.ArgumentsField.Text = "[]"
+        Me.BreakpointsField.WordWrap = False
+        For Each area As TextArea In [Me.StackText, Me.VariablesText, Me.OutputText]
+            area.IsReadOnly = True
+            area.WordWrap = False
+            area.FontSize = 11.0
+            #If TargetMac Then
+                area.FontName = "Menlo"
+            #Else
+                area.FontName = "monospace"
+            #End If
+        Next
+        Me.AddSubview(Me.ProgramField)
+        Me.AddSubview(Me.ArgumentsField)
+        Me.AddSubview(Me.BreakpointsField)
+        Me.AddSubview(Me.AttachField)
+        Me.AddSubview(Me.StatusLabel)
+        Me.AddSubview(Me.StackText)
+        Me.AddSubview(Me.VariablesText)
+        Me.AddSubview(Me.OutputText)
+        Me.AddSubview(Me.FrameField)
+        Dim names As Array Of String = ["Launch", "Attach", "Continue", "Pause", "Step Over", "Step In", "Step Out", "Stop", "Inspect"]
+        Dim actions As Array Of String = ["launch", "attach", "continue", "pause", "next", "stepIn", "stepOut", "stop", "frame"]
+        For i As Integer = 0 To Array.Count(names) - 1
+            Dim button As New StudioDebuggerButton()
+            button.Owner = Me
+            button.CommandName = actions(i)
+            button.Caption = names(i)
+            Me.Buttons.Append(button)
+            Me.AddSubview(button)
+        Next
+        Me.StatusLabel.Text = "Choose an executable compiled with -g. Source breakpoints are optional."
+        Me.Clock.Owner = Me
+        Me.Clock.Period = 50
+        Me.Clock.Start()
+        Me.LayoutControls(1060, 760)
+        Me.UpdateButtons()
+    End Sub
+
+    Public Sub LayoutControls(width As Integer, height As Integer)
+        Me.Labels(0).Move(16, 12, width - 32, 18)
+        Me.ProgramField.Move(16, 34, width - 32, 28)
+        Me.Labels(1).Move(16, 68, width - 32, 18)
+        Me.ArgumentsField.Move(16, 90, width - 32, 28)
+        Me.Labels(2).Move(16, 126, width - 220, 18)
+        Me.BreakpointsField.Move(16, 148, width - 220, 58)
+        Me.Labels(3).Move(width - 192, 126, 176, 18)
+        Me.AttachField.Move(width - 192, 148, 176, 28)
+        For i As Integer = 0 To 7
+            Me.Buttons(i).Move(16 + i * 106, 216, 100, 28)
+        Next
+        Me.StatusLabel.Move(16, 252, width - 32, 30)
+        Dim half As Integer = (width - 48) \ 2
+        Me.Labels(4).Move(16, 288, half, 18)
+        Me.Labels(5).Move(32 + half, 288, half, 18)
+        Me.StackText.Move(16, 310, half, 140)
+        Me.VariablesText.Move(32 + half, 310, half, 140)
+        Me.Labels(7).Move(16, 458, 120, 18)
+        Me.FrameField.Move(140, 454, 120, 28)
+        Me.Buttons(8).Move(268, 454, 90, 28)
+        Me.Labels(6).Move(16, 494, width - 32, 18)
+        Me.OutputText.Move(16, 516, width - 32, Math.Max(100, height - 532))
+    End Sub
+
+    Private Sub UpdateButtons()
+        Dim active As Boolean = Me.Child <> Nil
+        Me.Buttons(0).Enabled = Not active
+        Me.Buttons(1).Enabled = Not active
+        Me.Buttons(2).Enabled = active And Me.State = "stopped"
+        Me.Buttons(3).Enabled = active And Me.State = "running"
+        For i As Integer = 4 To 6
+            Me.Buttons(i).Enabled = active And Me.State = "stopped"
+        Next
+        Me.Buttons(7).Enabled = active And Not Me.Stopping
+        Me.Buttons(8).Enabled = active And Me.State = "stopped"
+        Me.ProgramField.Enabled = Not active
+        Me.ArgumentsField.Enabled = Not active
+        Me.AttachField.Enabled = Not active
+        Me.BreakpointsField.Enabled = Not active
+    End Sub
+
+    Private Function HelperPath() As String
+        Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_DEBUG_HELPER").Or("")
+        If configured <> "" Then Return configured
+        Dim resource As FileSystemItem = FileSystemItem.AppResource("studio_debug_adapter.py")
+        If resource <> Nil Then Return resource.FullPath()
+        Return ""
+    End Function
+
+    Private Sub Queue(value As JSONItem, stopControl As Boolean = False)
+        Dim bytes As Bytes = Bytes.FromString(Json.Stringify(value) + "\n", Text.Encodings.UTF8)
+        Dim limit As Integer = 65536
+        If stopControl Then limit += 64
+        If Me.Pending.Count - Me.PendingOffset + bytes.Count > limit Then Throw New InvalidArgumentException("Debugger command queue is full")
+        Me.Pending.Append(bytes.DataPtr(), bytes.Count)
+    End Sub
+
+    Private Function LaunchRequest(action As String) As JSONItem
+        Dim message As JSONItem = JSONItem.NewObject()
+        message.Value("action") = action
+        message.Value("cwd") = Me.ProjectRoot
+        If action = "attach" Then
+            Dim processId As Integer = Integer.Parse(Me.AttachField.Text).Or(-1)
+            If processId < 1 Then Throw New InvalidArgumentException("Enter a positive process ID")
+            Dim number As Double = processId
+            message.Value("pid") = number
+        Else
+            message.Value("program") = Me.ProgramField.Text
+            Dim argumentDecoder As New JSONLDecoder(65536, 65537, 1)
+            Dim argumentMessages As Array Of JSONItem = argumentDecoder.Feed(Bytes.FromString("{\"args\":" + Me.ArgumentsField.Text + "}\n", Text.Encodings.UTF8))
+            argumentDecoder.Finish()
+            If Array.Count(argumentMessages) <> 1 Then Throw New InvalidArgumentException("Arguments must be one JSON string array")
+            Dim arguments As JSONItem = argumentMessages(0).Value("args")
+            If Not arguments.IsArray() Then Throw New InvalidArgumentException("Arguments must be a JSON string array")
+            For i As Integer = 0 To arguments.Count() - 1
+                If Not arguments.ValueAt(i).IsString() Then Throw New InvalidArgumentException("Every argument must be a string")
+            Next
+            message.Value("args") = arguments
+        End If
+        Dim points As JSONItem = JSONItem.NewArray()
+        For Each line As String In String.Split(Me.BreakpointsField.Text, "\n")
+            Dim entry As String = String.Trim(line)
+            If entry = "" Then Continue For
+            Dim colon As Integer = -1
+            For i As Integer = 1 To String.Len(entry)
+                If String.Mid(entry, i, 1) = ":" Then colon = i
+            Next
+            If colon <= 1 Then Throw New InvalidArgumentException("Breakpoint format is absolute source file:line")
+            Dim lineNumber As Integer = Integer.Parse(String.Mid(entry, colon + 1)).Or(-1)
+            If lineNumber < 1 Then Throw New InvalidArgumentException("Breakpoint line must be positive")
+            Dim point As JSONItem = JSONItem.NewObject()
+            point.Value("path") = String.Left(entry, colon - 1)
+            Dim number As Double = lineNumber
+            point.Value("line") = number
+            points.Add(point)
+        Next
+        message.Value("breakpoints") = points
+        Return message
+    End Function
+
+    ''' Returns an adapter frame ID from the current stopped stack, or -1.
+    Public Function FrameIdAt(index As Integer) As Integer
+        If index < 0 Or index >= Array.Count(Me.Frames) Then Return -1
+        Return Math.Round(Me.Frames(index).Value("id").AsNumber().Or(-1.0))
+    End Function
+
+    Private Sub NotifySessionStarting()
+        Dim target As StudioDebuggerLink = Me.Link
+        If target = Nil Then Return
+        Dim listener As StudioDebuggerSessionListener = TryCast(target.Listener, StudioDebuggerSessionListener)
+        If listener <> Nil Then listener.DebuggerSessionStarting()
+    End Sub
+
+    Private Sub QueueStop()
+        ' Keep only the remainder of an already partially written JSONL frame.
+        ' Unsent commands are cancelled; a partial frame must not be truncated.
+        Dim retained As New Bytes()
+        If Me.PendingOffset > 0 And Me.PendingOffset < Me.Pending.Count Then
+            If Me.Pending.Item(Me.PendingOffset - 1) <> 10 Then
+                For i As Integer = Me.PendingOffset To Me.Pending.Count - 1
+                    Dim code As Integer = Me.Pending.Item(i)
+                    retained.Append(code)
+                    If code = 10 Then Exit For
+                Next
+            End If
+        End If
+        Me.Pending = retained
+        Me.PendingOffset = 0
+        Dim request As JSONItem = JSONItem.NewObject()
+        request.Value("action") = "stop"
+        Me.Queue(request, True)
+    End Sub
+
+    Private Sub BeginStopping()
+        If Me.Stopping Then Return
+        Me.Stopping = True
+        Me.State = "stopping"
+        Me.Frames = []
+        Me.StackText.Text = ""
+        Me.VariablesText.Text = ""
+        Me.FrameField.Text = ""
+        Me.NotifyResumed()
+        Me.StatusLabel.Text = "Stopping native debugger…"
+        Me.QueueStop()
+    End Sub
+
+    Private Sub NotifyResumed()
+        Dim target As StudioDebuggerLink = Me.Link
+        If target <> Nil Then
+            If target.Listener <> Nil Then target.Listener.DebuggerResumed()
+        End If
+    End Sub
+
+    Private Sub NotifyFrame(frame As JSONItem)
+        Dim source As JSONItem = frame.Value("source")
+        Dim filePath As String = ""
+        If source.IsObject() Then filePath = source.Value("path").AsString().Or("")
+        Dim line As Integer = Math.Round(frame.Value("line").AsNumber().Or(0.0))
+        If filePath = "" Or line < 1 Then
+            Me.NotifyResumed()
+            Return
+        End If
+        Dim target As StudioDebuggerLink = Me.Link
+        If target <> Nil Then
+            If target.Listener <> Nil Then target.Listener.DebuggerStopped(filePath, line)
+        End If
+    End Sub
+
+    ''' Clears the host execution highlight and drops the weak navigation link.
+    Public Sub DetachHost()
+        Me.NotifyResumed()
+        Me.Link = Nil
+    End Sub
+
+    ''' A project switch cannot retain source locations from the previous target.
+    ''' The host may attach a fresh retained link after this call.
+    Public Sub ChangeProject(projectRoot As String)
+        Me.Shutdown()
+        Me.DetachHost()
+        Me.Frames = []
+        Me.StackText.Text = ""
+        Me.VariablesText.Text = ""
+        Me.ProjectRoot = projectRoot
+        Me.State = "idle"
+        Me.Stopping = False
+        Me.UpdateButtons()
+    End Sub
+
+    Public Sub Command(action As String)
+        Try
+            If action = "launch" Or action = "attach" Then
+                If Me.Child <> Nil Then Return
+                Dim request As JSONItem = Me.LaunchRequest(action)
+                Dim python As String = StudioPythonPath()
+                Dim helper As String = Me.HelperPath()
+                If python = "" Then Throw New InvalidArgumentException("Debugger requires Python 3; set BUOY_STUDIO_PYTHON")
+                If helper = "" Or Not New FileSystemItem(helper).IsFile() Then Throw New InvalidArgumentException("Bundled debugger helper is missing; set BUOY_STUDIO_DEBUG_HELPER")
+                Me.Decoder = New JSONLDecoder(4194304, 8388608, 256)
+                Me.Pending = New Bytes()
+                Me.PendingOffset = 0
+                ' Validate and queue before spawning: an oversized request must not orphan a helper.
+                Me.Queue(request)
+                Me.NotifySessionStarting()
+                Me.Stopping = False
+                Me.Child = New PipeProcess(python, [helper], Me.ProjectRoot, True)
+                Me.OutputText.Text = ""
+                Me.StackText.Text = ""
+                Me.VariablesText.Text = ""
+                Me.State = "initializing"
+                Me.Frames = []
+                Me.NotifyResumed()
+                Me.StatusLabel.Text = "Starting native debugger…"
+                Me.Clock.Start()
+            Else
+                If Me.Child = Nil Then Return
+                If action = "stop" Then
+                    Me.BeginStopping()
+                    Me.UpdateButtons()
+                    Return
+                End If
+                If Me.Stopping Then Return
+                Dim request As JSONItem = JSONItem.NewObject()
+                request.Value("action") = action
+                If action = "frame" Then
+                    Dim frameId As Integer = Integer.Parse(Me.FrameField.Text).Or(-1)
+                    If frameId < 0 Then Throw New InvalidArgumentException("Enter a frame ID from the stack")
+                    Dim selected As JSONItem
+                    For Each frame As JSONItem In Me.Frames
+                        If Math.Round(frame.Value("id").AsNumber().Or(-1.0)) = frameId Then selected = frame
+                    Next
+                    If selected = Nil Then Throw New InvalidArgumentException("Choose a frame ID from the current stopped stack")
+                    Dim number As Double = frameId
+                    request.Value("frameId") = number
+                    Me.NotifyFrame(selected)
+                End If
+                Me.Queue(request)
+            End If
+        Catch e As Exception
+            Me.StatusLabel.Text = e.Message
+        End Try
+        Me.UpdateButtons()
+    End Sub
+
+    Private Sub AppendOutput(text As String)
+        Dim combined As String = Me.OutputText.Text + text
+        If String.Len(combined) > Me.OutputLimit Then combined = String.Right(combined, Me.OutputLimit)
+        Me.OutputText.Text = combined
+    End Sub
+
+    Private Sub Receive(message As JSONItem)
+        Dim kind As String = message.Value("type").AsString().Or("")
+        If Me.Stopping Then
+            If kind <> "output" And kind <> "error" Then
+                If kind <> "state" Then Return
+                Dim state As String = message.Value("state").AsString().Or("")
+                If state <> "stopping" And state <> "terminated" And state <> "exited" And state <> "disconnected" Then Return
+            End If
+        End If
+        Select Case kind
+        Case "state"
+            Me.State = message.Value("state").AsString().Or("unknown")
+            Me.StatusLabel.Text = Me.State + " " + message.Value("reason").AsString().Or("")
+            Me.NotifyResumed()
+            Me.Frames = []
+        Case "error"
+            Me.StatusLabel.Text = message.Value("message").AsString().Or("Debugger error")
+            Me.AppendOutput(Me.StatusLabel.Text + "\n")
+        Case "output"
+            Me.AppendOutput(message.Value("text").AsString().Or(""))
+        Case "stack"
+            If Me.State <> "stopped" Then Return
+            Dim text As String = ""
+            Dim frames As JSONItem = message.Value("frames")
+            Me.Frames = []
+            For i As Integer = 0 To frames.Count() - 1
+                Dim frame As JSONItem = frames.ValueAt(i)
+                Me.Frames.Append(frame)
+                text += String.From(Math.Round(frame.Value("id").AsNumber().Or(0.0))) + "  " + frame.Value("name").AsString().Or("")
+                Dim framePath As String = ""
+                Dim frameSource As JSONItem = frame.Value("source")
+                If frameSource.IsObject() Then framePath = frameSource.Value("path").AsString().Or("")
+                text += "  " + framePath + ":" + String.From(Math.Round(frame.Value("line").AsNumber().Or(0.0))) + "\n"
+            Next
+            Me.StackText.Text = text
+            If Array.Count(Me.Frames) > 0 Then
+                Me.FrameField.Text = String.From(Me.FrameIdAt(0))
+                Me.NotifyFrame(Me.Frames(0))
+            Else
+                Me.NotifyResumed()
+            End If
+        Case "locals"
+            If Me.State <> "stopped" Then Return
+            Dim scope As String = message.Value("scope").AsString().Or("")
+            If scope = "" Then
+                Me.VariablesText.Text = ""
+            Else
+                Dim text As String = Me.VariablesText.Text + scope + "\n"
+                Dim variables As JSONItem = message.Value("variables")
+                For i As Integer = 0 To variables.Count() - 1
+                    Dim variable As JSONItem = variables.ValueAt(i)
+                    text += "  " + variable.Value("name").AsString().Or("") + " = " + variable.Value("value").AsString().Or("") + "  " + variable.Value("type").AsString().Or("") + "\n"
+                Next
+                Me.VariablesText.Text = String.Left(text, Me.OutputLimit)
+            End If
+        Case "breakpoints"
+            Dim points As JSONItem = message.Value("breakpoints")
+            For i As Integer = 0 To points.Count() - 1
+                Dim point As JSONItem = points.ValueAt(i)
+                If Not point.Value("verified").AsBoolean().Or(False) Then Me.AppendOutput("Unverified breakpoint: " + point.Value("message").AsString().Or("adapter could not resolve it") + "\n")
+            Next
+        End Select
+    End Sub
+
+    Public Sub PollDebugger()
+        If Me.Child = Nil Then Return
+        Try
+            Dim bytes As Bytes = Me.Child.ReadOutput()
+            For Each message As JSONItem In Me.Decoder.Feed(bytes)
+                Me.Receive(message)
+            Next
+            Dim errors As Bytes = Me.Child.ReadError()
+            If errors.Count > 0 Then Me.AppendOutput(errors.ToString(Text.Encodings.UTF8))
+            If Me.PendingOffset < Me.Pending.Count Then Me.PendingOffset += Me.Child.WriteInput(Me.Pending, Me.PendingOffset)
+            If Me.PendingOffset = Me.Pending.Count Then
+                Me.Pending = New Bytes()
+                Me.PendingOffset = 0
+            End If
+            If Not Me.Child.IsRunning Then
+                If bytes.Count = 0 And Me.Child.OutputClosed Then
+                    Me.Child.Close()
+                    Me.Child = Nil
+                    Me.Frames = []
+                    Me.NotifyResumed()
+                    If Me.State <> "failed" Then Me.StatusLabel.Text += " · session ended"
+                End If
+            End If
+        Catch e As Exception
+            Me.StatusLabel.Text = "Debugger failed: " + e.Message
+            Me.Shutdown()
+        End Try
+        Me.UpdateButtons()
+    End Sub
+
+    ''' Stop debugging at Studio shutdown. Closing this view alone only hides it.
+    Public Sub Shutdown()
+        Me.Frames = []
+        Me.NotifyResumed()
+        If Me.Child <> Nil Then
+            Try
+                Me.Child.CloseInput()
+                ' EOF lets the app-owned bridge disconnect the target correctly.
+                ' Drain while waiting so adapter output cannot block its shutdown.
+                For i As Integer = 0 To 249
+                    Me.Child.ReadOutput()
+                    Me.Child.ReadError()
+                    If Not Me.Child.IsRunning Then Exit For
+                    Thread.Sleep(20)
+                Next
+                Me.Child.Close()
+            Catch e As Exception
+                Me.AppendOutput("Debugger shutdown: " + e.Message + "\n")
+            End Try
+            Me.Child = Nil
+        End If
+        Me.Clock.Stop()
+    End Sub
+
+    Public Sub Dispose()
+        Me.Shutdown()
+        Me.DetachHost()
+        Me.Disposing = True
+        If Not Me.IsClosed Then Me.Close()
+    End Sub
+
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+    Handle Closed()
+        Me.IsClosed = True
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Dim w As Integer = width
+        Dim h As Integer = height
+        Me.LayoutControls(w, h)
+    End Handle
+End Class

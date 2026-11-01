@@ -1,0 +1,442 @@
+Import terminalkit
+Import StudioShellTerminalSession
+Import layoutcanvas.LayoutCanvasWheel
+
+Private Function TerminalColor(index As Integer) As Color
+    If index >= 16777216 Then
+        Dim rgb As Integer = index - 16777216
+        Return Color.FromBytes((rgb \ 65536) Mod 256, (rgb \ 256) Mod 256, rgb Mod 256)
+    End If
+    Dim palette As Array Of Integer = [&h141820, &hce5765, &h81bc83, &hd5b56e, &h72a7d8, &hb68acb, &h74bdc2, &hd8dee9, &h687385, &hf0808a, &ha4d797, &hf1d294, &h98c7f3, &hd0abed, &h9adee1, &hffffff]
+    Dim rgb As Integer
+    If index < 16 Then
+        rgb = palette(Math.Max(0, index))
+        Return Color.FromBytes((rgb \ 65536) Mod 256, (rgb \ 256) Mod 256, rgb Mod 256)
+    End If
+    If index >= 232 Then
+        Dim gray As Integer = 8 + (Math.Min(255, index) - 232) * 10
+        Return Color.FromBytes(gray, gray, gray)
+    End If
+    Dim levels As Array Of Integer = [0, 95, 135, 175, 215, 255]
+    Dim cube As Integer = index - 16
+    Return Color.FromBytes(levels((cube \ 36) Mod 6), levels((cube \ 6) Mod 6), levels(cube Mod 6))
+End Function
+
+Public Class StudioTerminalCanvas Inherits LayoutWheelCanvas
+    Public Property Owner As Weak StudioTerminalWindow
+    Public Property Screen As TerminalScreen = New TerminalScreen()
+    Public Property CellWidth As Double = 8.5
+    Public Property CellHeight As Double = 18.0
+    Public Property FontName As String = "monospace"
+    Public Property FontSize As Double = 13.0
+
+    Private Property WheelRemainder As Double = 0.0
+
+    Public Overrides Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Me.Screen.AlternateScreen Or dy = 0.0 Then Return False
+        Dim lines As Double = dy * 3.0
+        If pixels Then lines = dy / Me.CellHeight
+        Me.WheelRemainder += lines
+        Dim whole As Integer = Math.Floor(Math.Abs(Me.WheelRemainder))
+        If Me.WheelRemainder < 0.0 Then whole = -whole
+        Me.WheelRemainder -= whole
+        Me.Screen.ScrollBy(whole)
+        Me.Invalidate()
+        Return True
+    End Function
+
+    Handle Paint(g As Graphics)
+        g.FillRect(0, 0, Me.Width, Me.Height, TerminalColor(0))
+        Me.CellWidth = Math.Max(5.0, g.MeasureStringWidth("M", Me.FontName, Me.FontSize))
+        Me.CellHeight = Math.Max(15.0, g.MeasureStringHeight("M", Me.FontName, Me.FontSize) + 3.0)
+        For y As Integer = 0 To Me.Screen.Rows - 1
+            For x As Integer = 0 To Me.Screen.Columns - 1
+                Dim cell As TerminalCell = Me.Screen.VisibleCell(x, y)
+                Dim left As Double = 8.0 + x * Me.CellWidth
+                Dim top As Double = 6.0 + y * Me.CellHeight
+                If cell.Background <> 0 Then g.FillRect(left, top, Me.CellWidth + 0.5, Me.CellHeight, TerminalColor(cell.Background))
+                If cell.Text <> " " Then g.DrawString(cell.Text, left, top + Me.CellHeight - 4.0, Me.FontName, Me.FontSize, TerminalColor(cell.Foreground))
+            Next
+        Next
+        If Me.Screen.CursorVisible And Me.Screen.ScrollOffset = 0 Then g.FillRect(8.0 + Me.Screen.CursorX * Me.CellWidth, 6.0 + (Me.Screen.CursorY + 1) * Me.CellHeight - 2.0, Me.CellWidth, 2.0, TerminalColor(7))
+    End Handle
+    Handle MouseDown(e As MouseEvent)
+        Me.Focus()
+        e.Handled = True
+    End Handle
+    Handle KeyDown(e As KeyEvent)
+        Dim target As StudioTerminalWindow = Me.Owner
+        If target = Nil Then Return
+        If e.Modifiers.Shift And Not e.Modifiers.Primary And Not e.Modifiers.Option Then
+            If e.Key = KeyName.PageUp Or e.Key = KeyName.PageDown Then
+                Dim lines As Integer = Math.Max(1, Me.Screen.Rows - 1)
+                If e.Key = KeyName.PageUp Then lines = -lines
+                Me.Screen.ScrollBy(lines)
+                Me.Invalidate()
+                e.Handled = True
+                Return
+            End If
+        End If
+        Dim text As String = ""
+        Dim prefix As String = String.Chr(27) + "["
+        If Me.Screen.ApplicationCursor Then prefix = String.Chr(27) + "O"
+        Dim copyKey As Boolean = e.Modifiers.Primary And (e.Character = 99 Or e.Character = 67)
+        #If Not TargetMac Then
+            copyKey = copyKey And e.Modifiers.Shift
+        #End If
+        If copyKey Then
+            target.CopyScreen()
+        ElseIf e.Modifiers.Primary And (e.Character = 118 Or e.Character = 86) Then
+            #If Not TargetMac Then
+                If Not e.Modifiers.Shift Then
+                    text = String.Chr(22)
+                Else
+                    target.Paste()
+                End If
+            #Else
+                target.Paste()
+            #End If
+        Else
+            Select Case e.Key
+            Case KeyName.Return
+                text = String.Chr(13)
+            Case KeyName.Backspace
+                text = String.Chr(127)
+            Case KeyName.Delete
+                text = String.Chr(27) + "[3~"
+            Case KeyName.Tab
+                text = String.Chr(9)
+            Case KeyName.Escape
+                text = String.Chr(27)
+            Case KeyName.Up
+                text = prefix + "A"
+            Case KeyName.Down
+                text = prefix + "B"
+            Case KeyName.Right
+                text = prefix + "C"
+            Case KeyName.Left
+                text = prefix + "D"
+            Case KeyName.Home
+                text = String.Chr(27) + "[H"
+            Case KeyName.EndKey
+                text = String.Chr(27) + "[F"
+            Case KeyName.PageUp
+                text = String.Chr(27) + "[5~"
+            Case KeyName.PageDown
+                text = String.Chr(27) + "[6~"
+            Case Else
+                If e.Character > 0 Then
+                    Dim code As Integer = e.Character
+                    If e.Modifiers.Control Then
+                        If code >= 97 And code <= 122 Then code -= 96
+                        If code >= 65 And code <= 90 Then code -= 64
+                        If code = 32 Then code = 0
+                        If code = 91 Then code = 27
+                        If code = 92 Then code = 28
+                        If code = 93 Then code = 29
+                    End If
+                    text = String.Chr(code)
+                    If e.Modifiers.Option Then text = String.Chr(27) + text
+                End If
+            End Select
+        End If
+        If text <> "" Then
+            Me.Screen.FollowOutput()
+            Me.Invalidate()
+            target.SendText(text)
+        End If
+        e.Handled = True
+    End Handle
+End Class
+
+Public Class StudioTerminalTimer Inherits Timer
+    Public Property Owner As Weak StudioTerminalWindow
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioTerminalWindow = Me.Owner
+        If target <> Nil Then target.PollTerminal()
+    End Sub
+End Class
+
+Public Class StudioTerminalButton Inherits Button
+    Public Property Owner As Weak StudioTerminalWindow
+    Public Property ActionName As String
+    Handle Action()
+        Dim target As StudioTerminalWindow = Me.Owner
+        If target = Nil Then Return
+        If Me.ActionName = "restart" Then target.StartShell()
+        If Me.ActionName = "paste" Then target.Paste()
+        If Me.ActionName = "copy" Then target.CopyScreen()
+        If Me.ActionName = "stop" Then target.StopShell()
+    End Handle
+End Class
+
+''' An interactive shell connected to a real pseudo-terminal, never line-oriented pipes.
+''' Closing hides the window; Shutdown explicitly kills its owned process tree.
+Public Class StudioTerminalWindow Inherits Window
+    Public Property Surface As StudioTerminalCanvas = New StudioTerminalCanvas()
+    Public Property StatusLabel As Label = New Label()
+    Public Property ProgramSession As StudioShellTerminalSession
+    Public Property ProgramExitCode As Integer = -1
+    Public Property Session As TerminalSession
+    Public Property IsClosed As Boolean = False
+    Private Property Ticker As StudioTerminalTimer = New StudioTerminalTimer()
+    Private Property Directory As String
+    Private Property Pending As Bytes = New Bytes()
+    Private Property Disposing As Boolean = False
+    Private Property RestartButton As StudioTerminalButton = New StudioTerminalButton()
+    Private Property PasteButton As StudioTerminalButton = New StudioTerminalButton()
+    Private Property CopyButton As StudioTerminalButton = New StudioTerminalButton()
+    Private Property StopButton As StudioTerminalButton = New StudioTerminalButton()
+
+    Public Sub Constructor(projectRoot As String, autoStart As Boolean = True)
+        Super.Constructor()
+        Me.Directory = projectRoot
+        Me.Title = "Studio Terminal"
+        Me.Move(140, 100, 960, 640)
+        Me.SetMinSize(500.0, 320.0)
+        Me.Surface.Owner = Me
+        #If TargetMac Then
+            Me.Surface.FontName = "Menlo"
+        #ElseIf TargetWindows Then
+            Me.Surface.FontName = "Consolas"
+        #End If
+        Me.AddSubview(Me.Surface)
+        Me.StatusLabel.FontSize = 11.0
+        Me.AddSubview(Me.StatusLabel)
+        Me.Configure(Me.RestartButton, "New Shell", "restart")
+        Me.Configure(Me.PasteButton, "Paste", "paste")
+        Me.Configure(Me.CopyButton, "Copy Screen", "copy")
+        Me.Configure(Me.StopButton, "Stop", "stop")
+        Me.Ticker.Owner = Me
+        Me.Ticker.Period = 30
+        Me.LayoutTerminal(960, 640)
+        If autoStart Then Me.StartShell()
+    End Sub
+    Private Sub Configure(button As StudioTerminalButton, caption As String, actionName As String)
+        button.Owner = Me
+        button.ActionName = actionName
+        button.Caption = caption
+        Me.AddSubview(button)
+    End Sub
+    Public Sub StartShell()
+        If Me.ProgramSession <> Nil Then
+            Me.StatusLabel.Text = "Stop the active program before starting a shell."
+            Return
+        End If
+        Try
+            Me.StopShell()
+            Me.Surface.Screen = New TerminalScreen(Me.Surface.Screen.Columns, Me.Surface.Screen.Rows)
+            Dim shell As String
+            #If TargetWindows Then
+                shell = System.EnvironmentVariable("COMSPEC").Or("C:\\Windows\\System32\\cmd.exe")
+            #Else
+                shell = System.EnvironmentVariable("SHELL").Or("/bin/sh")
+            #End If
+            Me.Session = New TerminalSession(shell, Me.Directory, Me.Surface.Screen.Columns, Me.Surface.Screen.Rows)
+            Me.StatusLabel.Text = "Interactive shell · " + shell + " · " + Me.Directory
+            Me.Ticker.Start()
+            Me.Surface.Focus()
+        Catch e As Exception
+            Me.StatusLabel.Text = "Terminal could not start: " + e.Message
+        End Try
+    End Sub
+    Public Sub StopShell()
+        If Me.ProgramSession <> Nil Then
+            Me.ProgramSession.Stop()
+            Me.StatusLabel.Text = "Stopping program…"
+            Return
+        End If
+        Me.Ticker.Stop()
+        If Me.Session <> Nil Then Me.Session.Close()
+        Me.Session = Nil
+        Me.Pending = New Bytes()
+        Me.StatusLabel.Text = "Shell stopped. New Shell starts a fresh session."
+    End Sub
+    Public Sub SendText(content As String)
+        If Me.Session = Nil And Me.ProgramSession = Nil Then Return
+        Me.Surface.Screen.FollowOutput()
+        Me.Surface.Invalidate()
+        Dim data As Bytes = Bytes.FromString(content, Text.Encodings.UTF8)
+        If Me.Pending.Count + data.Count > 65536 Then
+            Me.StatusLabel.Text = "Input queue is full; wait before sending more text."
+            Return
+        End If
+        Me.Pending.Append(data)
+        Me.PollTerminal()
+    End Sub
+    Public Sub Paste()
+        Try
+            Dim clipboard As New Clipboard()
+            Dim text As String = clipboard.Text
+            clipboard.Close()
+            If Me.Surface.Screen.BracketedPaste Then text = String.Chr(27) + "[200~" + text + String.Chr(27) + "[201~"
+            Me.SendText(text)
+            Me.Surface.Focus()
+        Catch e As Exception
+            Me.StatusLabel.Text = "Paste failed: " + e.Message
+        End Try
+    End Sub
+    Public Sub CopyScreen()
+        Try
+            Dim text As String = ""
+            For row As Integer = 0 To Me.Surface.Screen.Rows - 1
+                text += Me.Surface.Screen.Line(row) + "\n"
+            Next
+            Dim clipboard As New Clipboard()
+            clipboard.Text = text
+            clipboard.Close()
+        Catch e As Exception
+            Me.StatusLabel.Text = "Copy failed: " + e.Message
+        End Try
+    End Sub
+    Public Sub PollTerminal()
+        If Me.ProgramSession <> Nil Then
+            Me.PollProgram()
+            Return
+        End If
+        If Me.Session = Nil Then Return
+        Try
+            Dim changed As Boolean = False
+            Dim drained As Boolean = False
+            For batch As Integer = 0 To 3
+                Dim data As Bytes = Me.Session.Read()
+                If data.Count = 0 Then
+                    drained = True
+                    Exit For
+                End If
+                Me.Surface.Screen.Feed(data)
+                changed = True
+            Next
+            Dim replies As String = Me.Surface.Screen.TakeReplies()
+            If replies <> "" Then
+                Dim data As Bytes = Bytes.FromString(replies, Text.Encodings.UTF8)
+                If Me.Pending.Count + data.Count <= 65536 Then Me.Pending.Append(data)
+            End If
+            If Me.Pending.Count > 0 Then
+                Dim accepted As Integer = Me.Session.Write(Me.Pending)
+                If accepted > 0 Then
+                    Dim rest As New Bytes()
+                    For i As Integer = accepted To Me.Pending.Count - 1
+                        rest.Append(Me.Pending.Item(i))
+                    Next
+                    Me.Pending = rest
+                End If
+            End If
+            ' An exited PTY may still have output beyond this tick's read budget.
+            If Not Me.Session.Poll() And drained Then
+                Me.StatusLabel.Text = "Shell exited with status " + String.From(Me.Session.ExitCode) + ". Choose New Shell to restart."
+                Me.Ticker.Stop()
+                Me.Session.Close()
+                Me.Session = Nil
+                Me.Pending = New Bytes()
+            End If
+            If changed Then Me.Surface.Invalidate()
+        Catch e As Exception
+            Me.StatusLabel.Text = "Terminal error: " + e.Message
+            Me.Ticker.Stop()
+        End Try
+    End Sub
+    Public Function StartProgram(executable As String, argv As Array Of String, workingDirectory As String) As Boolean
+        If Me.Session <> Nil Or Me.ProgramSession <> Nil Then Return False
+        Me.ProgramExitCode = -1
+        Me.Pending = New Bytes()
+        Me.Surface.Screen = New TerminalScreen(Me.Surface.Screen.Columns, Me.Surface.Screen.Rows)
+        Me.ProgramSession = New StudioShellTerminalSession(executable, argv, workingDirectory, Me.Surface.Screen.Columns, Me.Surface.Screen.Rows)
+        Me.StatusLabel.Text = "Running " + executable
+        Me.Ticker.Start()
+        Me.Show()
+        Me.Surface.Focus()
+        Return True
+    End Function
+
+    Public Function ProgramActive() As Boolean
+        Me.PollTerminal()
+        Return Me.ProgramSession <> Nil
+    End Function
+
+    Private Sub PollProgram()
+        Try
+            Dim drained As Boolean = False
+            For batch As Integer = 0 To 3
+                Dim data As Bytes = Me.ProgramSession.Read()
+                If data.Count = 0 Then
+                    drained = True
+                    Exit For
+                End If
+                Me.Surface.Screen.Feed(data)
+            Next
+            If Me.Pending.Count > 0 Then
+                Dim accepted As Integer = Me.ProgramSession.Write(Me.Pending)
+                Dim rest As New Bytes()
+                For i As Integer = accepted To Me.Pending.Count - 1
+                    rest.Append(Me.Pending.Item(i))
+                Next
+                Me.Pending = rest
+            End If
+            If drained Then
+                If Not Me.ProgramSession.Poll() Then
+                    Me.ProgramExitCode = Me.ProgramSession.ExitCode
+                    Me.StatusLabel.Text = "Program exited: " + String.From(Me.ProgramExitCode)
+                    If Me.ProgramSession.ErrorText <> "" Then Me.StatusLabel.Text += " · " + Me.ProgramSession.ErrorText
+                    Me.ProgramSession = Nil
+                    Me.Ticker.Stop()
+                End If
+            End If
+            Me.Surface.Invalidate()
+        Catch e As Exception
+            Me.StatusLabel.Text = "Program terminal error: " + e.Message
+            If Me.ProgramSession <> Nil Then Me.ProgramSession.Stop()
+        End Try
+    End Sub
+
+    Public Sub LayoutTerminal(width As Integer, height As Integer)
+        Me.RestartButton.Move(8, 7, 104, 28)
+        Me.PasteButton.Move(120, 7, 72, 28)
+        Me.CopyButton.Move(200, 7, 116, 28)
+        Me.StopButton.Move(324, 7, 72, 28)
+        Me.Surface.Move(0, 42, width, Math.Max(80, height - 70))
+        Me.StatusLabel.Move(8, height - 24, width - 16, 20)
+        Dim columns As Integer = Math.Min(500, Math.Max(2, (width - 16) / Me.Surface.CellWidth))
+        Dim rows As Integer = Math.Min(300, Math.Max(2, (height - 82) / Me.Surface.CellHeight))
+        If columns <> Me.Surface.Screen.Columns Or rows <> Me.Surface.Screen.Rows Then
+            Me.Surface.Screen.Resize(columns, rows)
+            If Me.Session <> Nil Then Me.Session.Resize(columns, rows)
+            If Me.ProgramSession <> Nil Then Me.ProgramSession.Resize(columns, rows)
+            Me.Surface.Invalidate()
+        End If
+    End Sub
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Try
+            Me.LayoutTerminal(width, height)
+        Catch e As Exception
+            Me.StatusLabel.Text = "Terminal resize failed: " + e.Message
+        End Try
+    End Handle
+    Public Sub Shutdown()
+        If Me.ProgramSession <> Nil Then
+            Me.ProgramSession.Stop()
+            Me.Visible = False
+            Return
+        End If
+        Me.Surface.CloseWheel()
+        Me.StopShell()
+        Me.Disposing = True
+        If Not Me.IsClosed Then Me.Close()
+    End Sub
+    Handle Opening()
+        Me.Surface.OpenWheel()
+        If Me.Surface.LastWheelError <> "" Then Me.StatusLabel.Text += " · Wheel scrolling unavailable: " + Me.Surface.LastWheelError
+    End Handle
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+    Handle Closed()
+        Me.Surface.CloseWheel()
+        Me.IsClosed = True
+        Me.StopShell()
+        Me.Ticker.Owner = Nil
+        Me.Surface.Owner = Nil
+    End Handle
+End Class

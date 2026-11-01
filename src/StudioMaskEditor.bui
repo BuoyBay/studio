@@ -1,0 +1,269 @@
+Import layoutkit.LayoutCatalog
+Import maskkit
+
+Private Function StudioMaskQuote(text As String) As String
+    Dim escaped As String = String.Replace(text, "\\", "\\\\")
+    escaped = String.Replace(escaped, "\"", "\\\"")
+    escaped = String.Replace(escaped, "\n", "\\n")
+    escaped = String.Replace(escaped, "\r", "\\r")
+    escaped = String.Replace(escaped, "\t", "\\t")
+    Return "\"" + escaped + "\""
+End Function
+
+Private Function StudioMaskLiteral(expression As String) As Optional Of String
+    Dim text As String = String.Trim(expression)
+    Dim chars As Array Of String = String.Chars(text)
+    Dim last As Integer = Array.Count(chars) - 1
+    If last < 1 Then Return None
+    If chars(0) <> "\"" Or chars(last) <> "\"" Then Return None
+    Dim decoded As String
+    Dim i As Integer = 1
+    While i < last
+        Dim ch As String = chars(i)
+        If ch = "\"" Or String.Asc(ch) < 32 Then Return None
+        If ch = "\\" Then
+            i += 1
+            If i >= last Then Return None
+            ch = chars(i)
+            If String.Compare(ch, "n", True) = 0 Then
+                decoded += "\n"
+            ElseIf String.Compare(ch, "r", True) = 0 Then
+                decoded += "\r"
+            ElseIf String.Compare(ch, "t", True) = 0 Then
+                decoded += "\t"
+            ElseIf ch = "\"" Or ch = "\\" Then
+                decoded += ch
+            Else
+                ' Buoy preserves unknown escapes; JSON would reinterpret some.
+                decoded += "\\" + ch
+            End If
+        Else
+            decoded += ch
+        End If
+        i += 1
+    End While
+    Return Some(decoded)
+End Function
+
+Private Class StudioMaskInput Inherits TextField
+    Public Property Owner As Weak StudioMaskPatternView
+    Handle TextChanged()
+        Dim owner As StudioMaskPatternView = Me.Owner
+        If owner <> Nil Then owner.RefreshSample()
+    End Handle
+End Class
+
+Private Class StudioMaskApply Inherits Button
+    Public Property Owner As Weak StudioMaskPatternView
+    Handle Action()
+        Dim owner As StudioMaskPatternView = Me.Owner
+        If owner <> Nil Then
+            Dim accepted As Boolean = owner.ApplyPattern()
+        End If
+    End Handle
+End Class
+
+''' Trusted Studio editor: validates data with MaskKit, never invokes project code.
+Public Class StudioMaskPatternView Inherits View Implements LayoutReusablePropertyViewV1
+    Public Property Pattern As TextField
+    Public Property Sample As TextField
+    Public Property Feedback As Label
+    Public Property ApplyButton As Button
+    Private Property mHost As LayoutPropertyEditorHost
+    Private Property mLiteral As Boolean
+    Private Property mOriginal As String
+    Private Property mValueMode As Boolean
+
+    Public Sub Constructor(expression As String, host As LayoutPropertyEditorHost, rawValueMode As Boolean = False)
+        Super.Constructor()
+        Me.mValueMode = rawValueMode
+        ' LayoutCanvas reserves 68px vertically and at least 196px horizontally.
+        Me.Move(0, 0, 196, 68)
+        Dim pattern As New StudioMaskInput()
+        pattern.Owner = Me
+        pattern.Placeholder = "(###) ###-####"
+        pattern.AccessibleLabel = "Input mask pattern"
+        pattern.AccessibleHint = "# digit; L/l letter case; A letter; * letter/digit; . character; backslash escapes a literal"
+        pattern.Move(0, 0, 128, 28)
+        Me.Pattern = pattern
+        Me.AddSubview(pattern)
+        Dim sample As New StudioMaskInput()
+        sample.Owner = Me
+        sample.Text = "2125550199"
+        sample.Placeholder = "Raw sample"
+        sample.AccessibleLabel = "Raw mask sample"
+        sample.Move(0, 34, 80, 28)
+        Me.Sample = sample
+        Me.AddSubview(sample)
+        Me.Feedback = New Label()
+        Me.Feedback.Multiline = True
+        Me.Feedback.FontSize = 11.0
+        Me.Feedback.Move(88, 34, 108, 32)
+        Me.AddSubview(Me.Feedback)
+        Dim apply As New StudioMaskApply()
+        apply.Owner = Me
+        apply.Caption = "Apply"
+        apply.Move(136, 0, 60, 28)
+        Me.ApplyButton = apply
+        Me.AddSubview(apply)
+        If Me.mValueMode Then
+            Me.Pattern.AccessibleLabel = "Canonical raw value"
+            Me.Pattern.AccessibleHint = "Enter raw mask characters without punctuation, independent of RawInput"
+            Me.Sample.Visible = False
+            Me.Feedback.Move(0, 34, 196, 32)
+        End If
+        Me.RebindProperty(expression, host)
+    End Sub
+
+    Public Sub RebindProperty(currentExpression As String, host As LayoutPropertyEditorHost)
+        Me.mHost = host
+        Me.mLiteral = False
+        Me.Sample.Text = "2125550199"
+        Dim parsed As Optional Of String = StudioMaskLiteral(currentExpression)
+        If parsed.HasValue Then
+            Me.Pattern.Text = parsed.Value
+            Me.mOriginal = parsed.Value
+            Me.mLiteral = True
+        End If
+        Me.Pattern.IsReadOnly = Not Me.mLiteral
+        Me.ApplyButton.Enabled = Me.mLiteral And host <> Nil
+        If Me.mLiteral Then
+            Me.Pattern.Placeholder = "(###) ###-####"
+            If Me.mValueMode Then Me.Pattern.Placeholder = "Raw characters"
+            Me.RefreshSample()
+        Else
+            Me.Pattern.Text = ""
+            Me.Pattern.Placeholder = "Computed expression (edit in Source)"
+            Me.Feedback.Text = "This expression is preserved. Edit a literal mask to use this editor."
+        End If
+    End Sub
+
+    Public Sub RefreshSample()
+        If Me.Feedback Is Nil Or Me.Pattern Is Nil Or Me.Sample Is Nil Then Return
+        If Not Me.mLiteral Then Return
+        If Me.mValueMode Then
+            Me.Feedback.Text = "Raw characters only; punctuation is added at runtime."
+            Return
+        End If
+        Try
+            If Me.Pattern.Text = "" Then
+                Me.Feedback.Text = "Mask disabled · " + Me.Sample.Text
+                Return
+            End If
+            Dim mask As New TextMask(Me.Pattern.Text)
+            Dim matched As MaskMatch = mask.Format(Me.Sample.Text)
+            If Not matched.IsValid Then
+                Me.Feedback.Text = "Sample rejected at character " + String.From(matched.ErrorPosition)
+            ElseIf matched.IsComplete Then
+                Me.Feedback.Text = "Complete · " + matched.Text
+            Else
+                Me.Feedback.Text = "Incomplete · " + matched.Text
+            End If
+        Catch error As InvalidArgumentException
+            Me.Feedback.Text = "Invalid mask: " + error.Message
+        End Try
+    End Sub
+
+    Public Function ApplyPattern() As Boolean
+        If Not Me.mLiteral Or Me.mHost Is Nil Then Return False
+        Try
+            Dim context As LayoutPropertyEditorContextV1 = TryCast(Me.mHost, LayoutPropertyEditorContextV1)
+            If context IsNot Nil Then
+                If Not context.IsCurrent() Then
+                    Me.Feedback.Text = "Selection changed. Select the property again."
+                    Return False
+                End If
+            End If
+            If Me.mValueMode Then
+                If context Is Nil Then
+                    Me.Feedback.Text = "Cannot verify MaskPattern for this host."
+                    Return False
+                End If
+                Dim patternExpression As Optional Of String = context.SiblingExpression("MaskPattern")
+                Dim pattern As Optional Of String = Some("")
+                If patternExpression.HasValue Then pattern = StudioMaskLiteral(patternExpression.Value)
+                If Not pattern.HasValue Then
+                    Me.Feedback.Text = "MaskPattern is computed; update Value in Source."
+                    Return False
+                End If
+                If pattern.Value <> "" And Me.Pattern.Text <> "" Then
+                    Dim mask As New TextMask(pattern.Value)
+                    Dim matched As MaskMatch = mask.Format(Me.Pattern.Text)
+                    If mask.SlotCount = 0 Or Not matched.IsValid Or Not matched.IsComplete Then
+                        Me.Feedback.Text = "Value must be complete raw characters without punctuation."
+                        Return False
+                    End If
+                End If
+            ' Empty disables the mask; nonempty patterns must compile before any edit.
+            ElseIf Me.Pattern.Text <> "" Then
+                Dim checked As New TextMask(Me.Pattern.Text)
+                If context Is Nil Then
+                    Me.Feedback.Text = "Cannot verify Value for this host. Edit in Source."
+                    Return False
+                End If
+                Dim rawValue As Optional Of String = context.SiblingExpression("Value")
+                If rawValue.HasValue Then
+                    Dim value As Optional Of String = StudioMaskLiteral(rawValue.Value)
+                    If Not value.HasValue Then
+                        Me.Feedback.Text = "Value is computed; update mask and Value in Source."
+                        Return False
+                    End If
+                    If value.Value <> "" Then
+                        Dim matched As MaskMatch = checked.Format(value.Value)
+                        If Not matched.IsValid Or Not matched.IsComplete Then
+                            Me.Feedback.Text = "Value does not fit.\nEdit Value first."
+                            Return False
+                        End If
+                    End If
+                End If
+            End If
+            If context IsNot Nil And String.Compare(Me.Pattern.Text, Me.mOriginal, True) = 0 Then
+                Me.Feedback.Text = "No change"
+                Return True
+            End If
+            If Not Me.mHost.CommitExpression(StudioMaskQuote(Me.Pattern.Text)) Then
+                Me.Feedback.Text = "Selection changed or edit rejected. Select the property again."
+                Return False
+            End If
+            Me.Feedback.Text = "Mask applied"
+            If Me.mValueMode Then Me.Feedback.Text = "Raw Value applied"
+            Return True
+        Catch error As InvalidArgumentException
+            Me.Feedback.Text = "Invalid mask: " + error.Message
+            Return False
+        End Try
+    End Function
+End Class
+
+Public Class StudioMaskValueFactory Implements LayoutPropertyViewFactory
+    Public Function EditorId() As String
+        Return "formatcontrols.mask-value.v1"
+    End Function
+    Public Function CreateView(currentExpression As String, host As LayoutPropertyEditorHost) As View
+        Return New StudioMaskPatternView(currentExpression, host, True)
+    End Function
+End Class
+
+Public Class StudioMaskPatternFactory Implements LayoutPropertyViewFactory
+    Public Function EditorId() As String
+        Return "formatcontrols.mask-pattern.v1"
+    End Function
+    Public Function CreateView(currentExpression As String, host As LayoutPropertyEditorHost) As View
+        Return New StudioMaskPatternView(currentExpression, host)
+    End Function
+End Class
+
+Public Sub RegisterStudioMaskEditors(catalog As LayoutCatalog)
+    If catalog Is Nil Then Throw New InvalidArgumentException("Mask editor catalog is Nil")
+    If catalog.EditorViewFor("formatcontrols.mask-pattern.v1") Is Nil Then catalog.RegisterEditorView(New StudioMaskPatternFactory())
+    If catalog.EditorViewFor("formatcontrols.mask-value.v1") Is Nil Then catalog.RegisterEditorView(New StudioMaskValueFactory())
+    Dim control As LayoutControlDescriptor = catalog.Find("formatcontrols.MaskedTextField")
+    If control Is Nil Then Return
+    For Each prop As LayoutPropertyDescriptor In control.Properties
+        If String.Compare(prop.Name, "MaskPattern", True) = 0 And String.Compare(prop.Kind, "string", True) = 0 Then
+            If String.Compare(prop.Metadata.Value("studioEditorId").AsString().Or(""), "formatcontrols.mask-pattern.v1", True) = 0 Then prop.EditorId = "formatcontrols.mask-pattern.v1"
+        ElseIf String.Compare(prop.Name, "Value", True) = 0 And String.Compare(prop.Kind, "string", True) = 0 Then
+            If String.Compare(prop.Metadata.Value("studioEditorId").AsString().Or(""), "formatcontrols.mask-value.v1", True) = 0 Then prop.EditorId = "formatcontrols.mask-value.v1"
+        End If
+    Next
+End Sub

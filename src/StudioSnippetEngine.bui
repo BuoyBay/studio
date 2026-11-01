@@ -1,0 +1,264 @@
+' Studio's snippet library over the shared template grammar
+' (apps/shared/snippets/SnippetTemplates.bui, also used by Xippets). Templates use the
+' cross-app envelope {"format":"buoy.snippets","version":1,"templates":[{id, name,
+' prefix, language, body, description}]}; bodies support ${1:default}, $1 (linked
+' references), $0 and the backslash escapes \$, \\ and \}. Parsing, validation,
+' serialization and expansion always go through the shared module: there is no Studio
+' grammar. Built-in Buoy/Markdown/JSON templates have ids starting "builtin." and are
+' not exported; user templates import/export as the envelope (bounded by the shared
+' limits) and save atomically.
+Import SnippetTemplates
+Import StudioSnippetTypes
+
+Public Class StudioSnippetLibrary Implements IStudioSnippetProvider
+    Private Property mTemplates As Array Of JSONItem = []
+    ''' Last import/load error ("" after a success).
+    Public Property LastError As String = ""
+
+    Public Sub Constructor(includeBuiltins As Boolean = True)
+        If includeBuiltins Then Me.LoadBuiltins()
+    End Sub
+
+    ''' Number of templates (built-in and user).
+    Public Property Count As Integer
+        Get
+            Return Array.Count(Me.mTemplates)
+        End Get
+    End Property
+
+    ''' Detached copies of the templates offered in a language mode ("" = all), in
+    ''' library order. A template's language matches its mode, or "*"/"any" for all.
+    Public Function Templates(mode As String) As Array Of JSONItem
+        Dim found As Array Of JSONItem = []
+        For Each template As JSONItem In Me.mTemplates
+            If mode = "" Or StudioSnippetLanguageMatches(template.Value("language").AsString().Value, mode) Then Array.Append(found, Json.Parse(Json.Stringify(template)))
+        Next
+        Return found
+    End Function
+
+    ''' The template with an id, or Nil.
+    Public Function TemplateWithId(id As String) As JSONItem
+        For Each template As JSONItem In Me.mTemplates
+            If template.Value("id").AsString().Value = id Then Return Json.Parse(Json.Stringify(template))
+        Next
+        Return Nil
+    End Function
+
+    ''' Adds or replaces (same id) one template after shared validation. False with
+    ''' LastError set when invalid or the 256-template limit would be exceeded.
+    Public Function Put(template As JSONItem) As Boolean
+        Try
+            SnippetTemplateValidate(template)
+            Dim clean As JSONItem = JSONItem.NewObject()
+            For Each key As String In ["id", "name", "prefix", "language", "body", "description"]
+                clean.Value(key) = template.Value(key).AsString().Value
+            Next
+            Dim id As String = clean.Value("id").AsString().Value
+            For i As Integer = 0 To Array.LastIndex(Me.mTemplates)
+                If Me.mTemplates(i).Value("id").AsString().Value = id Then
+                    Me.mTemplates(i) = clean
+                    Me.LastError = ""
+                    Return True
+                End If
+            Next
+            If Array.Count(Me.mTemplates) >= 256 Then Throw New InvalidArgumentException("Too many templates (maximum 256)")
+            Array.Append(Me.mTemplates, clean)
+            Me.LastError = ""
+            Return True
+        Catch e As InvalidArgumentException
+            Me.LastError = e.Message
+            Return False
+        End Try
+    End Function
+
+    Public Function Remove(id As String) As Boolean
+        For i As Integer = 0 To Array.LastIndex(Me.mTemplates)
+            If Me.mTemplates(i).Value("id").AsString().Value = id Then
+                Array.RemoveAt(Me.mTemplates, i)
+                Return True
+            End If
+        Next
+        Return False
+    End Function
+
+    ''' Imports an envelope (from Xippets or another Studio): the whole envelope is
+    ''' validated first, then its templates are merged by id. Nothing changes on error.
+    ''' Returns the number imported, -1 on error (LastError).
+    Public Function ImportText(content As String) As Integer
+        Dim envelope As JSONItem
+        Try
+            envelope = SnippetTemplatesParse(content)
+        Catch e As InvalidArgumentException
+            Me.LastError = e.Message
+            Return -1
+        End Try
+        Dim entries As JSONItem = envelope.Value("templates")
+        ' Capacity check before any change.
+        Dim added As Integer = 0
+        For i As Integer = 0 To entries.Count() - 1
+            If Me.TemplateWithId(entries.ValueAt(i).Value("id").AsString().Value) = Nil Then added += 1
+        Next
+        If Array.Count(Me.mTemplates) + added > 256 Then
+            Me.LastError = "Too many templates (maximum 256)"
+            Return -1
+        End If
+        For i As Integer = 0 To entries.Count() - 1
+            Me.Put(entries.ValueAt(i))
+        Next
+        Me.LastError = ""
+        Return entries.Count()
+    End Function
+
+    ''' The user templates (or every template) as a canonical envelope string.
+    Public Function ExportText(includeBuiltins As Boolean = False) As String
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("format") = "buoy.snippets"
+        envelope.Value("version") = 1
+        Dim entries As JSONItem = JSONItem.NewArray()
+        For Each template As JSONItem In Me.mTemplates
+            If includeBuiltins Or Not String.StartsWith(template.Value("id").AsString().Value, "builtin.") Then entries.Add(Json.Parse(Json.Stringify(template)))
+        Next
+        envelope.Value("templates") = entries
+        Return SnippetTemplatesSerialize(envelope)
+    End Function
+
+    ''' Imports an envelope file; a missing file imports nothing (0).
+    Public Function ImportFile(filePath As String) As Integer
+        Dim file As New FileSystemItem(filePath)
+        If Not file.Exists() Then
+            Me.LastError = ""
+            Return 0
+        End If
+        Dim read As Result Of String, String = file.ReadAllText()
+        If read.IsErr Then
+            Me.LastError = read.Error
+            Return -1
+        End If
+        Return Me.ImportText(read.Value)
+    End Function
+
+    ''' Writes the user templates atomically (temporary sibling, then rename).
+    Public Function ExportFile(filePath As String, includeBuiltins As Boolean = False) As Boolean
+        Dim text As String = Me.ExportText(includeBuiltins)
+        Dim target As New FileSystemItem(filePath)
+        Dim temporary As New FileSystemItem(filePath + ".tmp-" + String.From(System.Microseconds()))
+        Dim written As Result Of Integer, String = temporary.WriteAllText(text)
+        If written.IsErr Then
+            Me.LastError = written.Error
+            Return False
+        End If
+        If Not temporary.MoveTo(target) Then
+            temporary.Delete()
+            Me.LastError = "Could not replace " + filePath
+            Return False
+        End If
+        Me.LastError = ""
+        Return True
+    End Function
+
+    ''' Expansion of a template by id, or Nil.
+    Public Function ExpansionFor(id As String) As StudioSnippetExpansion
+        Dim template As JSONItem = Me.TemplateWithId(id)
+        If template = Nil Then Return Nil
+        Return Me.ExpandBody(template.Value("body").AsString().Value)
+    End Function
+
+    ' ---- IStudioSnippetProvider ------------------------------------------------------------
+
+    Public Function ExpandBody(body As String) As StudioSnippetExpansion
+        Try
+            Return StudioSnippetExpansionFrom(SnippetTemplateExpand(body))
+        Catch e As InvalidArgumentException
+            Me.LastError = e.Message
+            Return Nil
+        End Try
+    End Function
+
+    Public Function ExpandPrefix(prefix As String, mode As String) As StudioSnippetExpansion
+        For templateIndex As Integer = Array.LastIndex(Me.mTemplates) To 0 Step -1
+            Dim template As JSONItem = Me.mTemplates(templateIndex)
+            If String.Compare(template.Value("prefix").AsString().Value, prefix, False) <> 0 Then Continue For
+            If Not StudioSnippetLanguageMatches(template.Value("language").AsString().Value, mode) Then Continue For
+            Return Me.ExpandBody(template.Value("body").AsString().Value)
+        Next
+        Return Nil
+    End Function
+
+    Public Function Choices(mode As String) As Array Of String
+        Dim names As Array Of String = []
+        For Each template As JSONItem In Me.Templates(mode)
+            Array.Append(names, template.Value("name").AsString().Value + "  (" + template.Value("prefix").AsString().Value + ")")
+        Next
+        Return names
+    End Function
+
+    Public Function ExpandChoice(index As Integer, mode As String) As StudioSnippetExpansion
+        Dim offered As Array Of JSONItem = Me.Templates(mode)
+        If index < 0 Or index > Array.LastIndex(offered) Then Return Nil
+        Return Me.ExpandBody(offered(index).Value("body").AsString().Value)
+    End Function
+
+    ' ---- Built-ins ---------------------------------------------------------------------------
+
+    Private Sub Builtin(id As String, name As String, prefix As String, language As String, body As String, description As String)
+        Dim template As JSONItem = JSONItem.NewObject()
+        template.Value("id") = "builtin." + id
+        template.Value("name") = name
+        template.Value("prefix") = prefix
+        template.Value("language") = language
+        template.Value("body") = body
+        template.Value("description") = description
+        Me.Put(template)
+    End Sub
+
+    ''' Adds Studio's built-in templates (idempotent; user templates with other ids stay).
+    Public Sub LoadBuiltins()
+        Me.Builtin("buoy.if", "If block", "if", "buoy", "If ${1:condition} Then\n    $0\nEnd If", "If ... Then ... End If")
+        Me.Builtin("buoy.ifelse", "If/Else block", "ifelse", "buoy", "If ${1:condition} Then\n    $2\nElse\n    $0\nEnd If", "If ... Else ... End If")
+        Me.Builtin("buoy.for", "For loop", "for", "buoy", "For ${1:i} As Integer = ${2:0} To ${3:count}\n    $0\nNext", "Counted loop")
+        Me.Builtin("buoy.foreach", "For Each loop", "foreach", "buoy", "For Each ${1:item} As ${2:String} In ${3:items}\n    $0\nNext", "Loop over a collection")
+        Me.Builtin("buoy.while", "While loop", "while", "buoy", "While ${1:condition}\n    $0\nWend", "Conditional loop")
+        Me.Builtin("buoy.select", "Select Case", "select", "buoy", "Select Case ${1:value}\nCase ${2:first}\n    $0\nCase Else\nEnd Select", "Select Case block")
+        Me.Builtin("buoy.try", "Try/Catch", "try", "buoy", "Try\n    $1\nCatch ${2:e} As ${3:Exception}\n    $0\nEnd Try", "Exception handler")
+        Me.Builtin("buoy.sub", "Sub", "sub", "buoy", "${1:Public} Sub ${2:Name}($3)\n    $0\nEnd Sub", "Procedure")
+        Me.Builtin("buoy.function", "Function", "function", "buoy", "${1:Public} Function ${2:Name}($3) As ${4:String}\n    $0\nEnd Function", "Function returning a value")
+        Me.Builtin("buoy.class", "Class", "class", "buoy", "Public Class ${1:Name}\n    Public Sub Constructor()\n        $0\n    End Sub\nEnd Class", "Class with constructor")
+        Me.Builtin("buoy.property", "Computed property", "property", "buoy", "Private Property m${1:Name} As ${2:Integer}\n\nPublic Property $1 As $2\n    Get\n        Return Me.m$1\n    End Get\n    Set\n        Me.m$1 = value$0\n    End Set\nEnd Property", "Property with backing field (linked name and type)")
+        Me.Builtin("buoy.enum", "Enum", "enum", "buoy", "Public Enum ${1:Name} As Integer\n    ${2:First} = 0\n    $0\nEnd Enum", "Enumeration")
+        Me.Builtin("buoy.structure", "Structure", "structure", "buoy", "Public Structure ${1:Name}\n    ${2:Field} As ${3:Integer}\n    $0\nEnd Structure", "Value type")
+        Me.Builtin("buoy.main", "Sub Main", "main", "buoy", "Sub Main()\n    $0\nEnd Sub", "Program entry point")
+        Me.Builtin("markdown.fence", "Code block", "code", "markdown", "```${1:buoy}\n$0\n```", "Fenced code block")
+        Me.Builtin("markdown.link", "Link", "link", "markdown", "[${1:text}](${2:url})$0", "Inline link")
+        Me.Builtin("markdown.table", "Table", "table", "markdown", "| ${1:Column} | ${2:Column} |\n| --- | --- |\n| $3 | $4 |$0", "Two-column table")
+        Me.Builtin("json.object", "Object member", "member", "json", "\"${1:key}\": ${2:\"value\"}$0", "Object member")
+    End Sub
+End Class
+
+''' True when a template's language applies to an editor mode.
+Public Function StudioSnippetLanguageMatches(language As String, mode As String) As Boolean
+    Dim lower As String = String.LCase(String.Trim(language))
+    If lower = "*" Or lower = "any" Or lower = "all" Then Return True
+    If lower = "bui" Then lower = "buoy"
+    If lower = "md" Then lower = "markdown"
+    If lower = "text" Then lower = "plain"
+    Return lower = String.LCase(mode)
+End Function
+
+''' Converts a SnippetTemplateExpand result ({text, placeholders:[{index,start,length}],
+''' finalCaret}) into an editor expansion.
+Public Function StudioSnippetExpansionFrom(expanded As JSONItem) As StudioSnippetExpansion
+    Dim expansion As New StudioSnippetExpansion()
+    expansion.Text = expanded.Value("text").AsString().Value
+    expansion.FinalCaret = expanded.Value("finalCaret").AsNumber().Value
+    Dim placeholders As JSONItem = expanded.Value("placeholders")
+    For i As Integer = 0 To placeholders.Count() - 1
+        Dim item As JSONItem = placeholders.ValueAt(i)
+        Dim index As Integer = item.Value("index").AsNumber().Value
+        Dim start As Integer = item.Value("start").AsNumber().Value
+        Dim length As Integer = item.Value("length").AsNumber().Value
+        Array.Append(expansion.Indexes, index)
+        Array.Append(expansion.Starts, start)
+        Array.Append(expansion.Lengths, length)
+    Next
+    Return expansion
+End Function

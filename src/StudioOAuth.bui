@@ -1,0 +1,698 @@
+Import chatgptauth
+Import agentkit
+Import processkit
+Import keychain
+Import StudioCredentials
+
+#If TargetLinux Then
+    Private Delegate Function OAuthURIOpener(uri As CString, context As Ptr, errorData As Ptr) As Int32
+    Private Declare Function OAuthDlopen Lib "c" Alias "dlopen" (libraryName As String, mode As Int32) As Ptr
+    Private Declare Function OAuthDlsym Lib "c" Alias "dlsym" (library As Ptr, symbol As String) As Ptr
+    Private Declare Function OAuthDlclose Lib "c" Alias "dlclose" (library As Ptr) As Int32
+#End If
+
+#If TargetWindows Then
+    ' Optional: the bundled 0.72.0 shell32 import stub lacks ShellExecuteW (see BUI-013).
+    Private Optional Declare Function OAuthOpenURL Lib "shell32" Alias "ShellExecuteW" (window As Ptr, operation As Ptr, target As Ptr, parameters As Ptr, directory As Ptr, show As Int32) As Integer
+    Private Declare Function OAuthHandleInfo Lib "kernel32" Alias "SetHandleInformation" (handle As Ptr, mask As UInt32, value As UInt32) As Int32
+    Private Declare Function OAuthWSAStart Lib "ws2_32" Alias "WSAStartup" (version As UInt16, data As Ptr) As Int32
+    Private Declare Function OAuthWSACleanup Lib "ws2_32" Alias "WSACleanup" () As Int32
+    Private Declare Function OAuthSocket Lib "ws2_32" Alias "socket" (family As Int32, kind As Int32, protocol As Int32) As Integer
+    Private Declare Function OAuthBind Lib "ws2_32" Alias "bind" (socketID As Integer, address As Ptr, length As Int32) As Int32
+    Private Declare Function OAuthListen Lib "ws2_32" Alias "listen" (socketID As Integer, backlog As Int32) As Int32
+    Private Declare Function OAuthSocketName Lib "ws2_32" Alias "getsockname" (socketID As Integer, address As Ptr, ByRef length As Int32) As Int32
+    Private Declare Function OAuthAccept Lib "ws2_32" Alias "accept" (socketID As Integer, address As Ptr, length As Ptr) As Integer
+    Private Declare Function OAuthRecv Lib "ws2_32" Alias "recv" (socketID As Integer, buffer As Ptr, length As Int32, socketFlags As Int32) As Int32
+    Private Declare Function OAuthSend Lib "ws2_32" Alias "send" (socketID As Integer, buffer As Ptr, length As Int32, socketFlags As Int32) As Int32
+    Private Declare Function OAuthClose Lib "ws2_32" Alias "closesocket" (socketID As Integer) As Int32
+    Private Declare Function OAuthNonblock Lib "ws2_32" Alias "ioctlsocket" (socketID As Integer, command As UInt32, ByRef enabled As UInt32) As Int32
+#Else
+    Private Declare Function OAuthSocket Lib "c" Alias "socket" (family As Int32, kind As Int32, protocol As Int32) As Int32
+    Private Declare Function OAuthBind Lib "c" Alias "bind" (socketID As Int32, address As Ptr, length As Int32) As Int32
+    Private Declare Function OAuthListen Lib "c" Alias "listen" (socketID As Int32, backlog As Int32) As Int32
+    Private Declare Function OAuthSocketName Lib "c" Alias "getsockname" (socketID As Int32, address As Ptr, ByRef length As UInt32) As Int32
+    Private Declare Function OAuthAccept Lib "c" Alias "accept" (socketID As Int32, address As Ptr, length As Ptr) As Int32
+    Private Declare Function OAuthRecv Lib "c" Alias "recv" (socketID As Int32, buffer As Ptr, length As Integer, socketFlags As Int32) As Integer
+    Private Declare Function OAuthSend Lib "c" Alias "send" (socketID As Int32, buffer As Ptr, length As Integer, socketFlags As Int32) As Integer
+    Private Declare Function OAuthClose Lib "c" Alias "close" (socketID As Int32) As Int32
+    Private Declare Function OAuthFcntl Lib "c" Alias "fcntl" (socketID As Int32, command As Int32, socketFlags As Int32) As Int32
+    #If TargetMac Then
+        Private Declare Function OAuthSocketOption Lib "c" Alias "setsockopt" (socketID As Int32, level As Int32, optionName As Int32, ByRef optionValue As Int32, length As UInt32) As Int32
+    #End If
+#End If
+
+Private Function ZeroBytes(count As Integer) As Bytes
+    Dim buffer As New Bytes(count)
+    For i As Integer = 0 To count - 1
+        buffer.Append(0)
+    Next
+    Return buffer
+End Function
+
+Private Sub SetNonblocking(socketID As Integer)
+    #If TargetWindows Then
+        Dim enabled As UInt32 = 1
+        If OAuthNonblock(socketID, 2147772030, enabled) <> 0 Or OAuthHandleInfo(CType(socketID, Ptr), 1, 0) = 0 Then Throw New InvalidArgumentException("Could not configure loopback socket")
+    #Else
+        Dim descriptorFlags As Int32 = OAuthFcntl(socketID, 1, 0)
+        If descriptorFlags < 0 Or OAuthFcntl(socketID, 2, descriptorFlags Or 1) <> 0 Then Throw New InvalidArgumentException("Could not isolate loopback socket")
+        Dim socketFlags As Int32 = OAuthFcntl(socketID, 3, 0)
+        #If TargetMac Then
+            Dim nonblocking As Int32 = 4
+            Dim enabled As Int32 = 1
+            If OAuthSocketOption(socketID, 65535, 4130, enabled, 4) <> 0 Then Throw New InvalidArgumentException("Could not configure loopback socket")
+        #Else
+            Dim nonblocking As Int32 = 2048
+        #End If
+        If socketFlags < 0 Or OAuthFcntl(socketID, 4, socketFlags Or nonblocking) < 0 Then Throw New InvalidArgumentException("Could not configure loopback socket")
+    #End If
+End Sub
+
+''' Nonblocking IPv4 listener bound only to 127.0.0.1, never wildcard interfaces.
+Public Class StudioLoopbackListener
+    Private Property Listening As Integer = -1
+    Private Property Accepted As Integer = -1
+    Private Property Buffer As Bytes = New Bytes()
+    Private Property PortValue As Integer = 0
+    Private Property AcceptedAt As Integer
+    Private Property WindowsStarted As Boolean = False
+
+    Public Sub Constructor()
+        #If TargetWindows Then
+            Dim data As Bytes = ZeroBytes(512)
+            If OAuthWSAStart(514, data.DataPtr()) <> 0 Then Throw New InvalidArgumentException("Could not initialize loopback networking")
+            Me.WindowsStarted = True
+        #End If
+        Me.Listening = OAuthSocket(2, 1, 6)
+        Try
+            If Me.Listening < 0 Then Throw New InvalidArgumentException("Could not create loopback listener")
+            SetNonblocking(Me.Listening)
+            Dim address As Bytes = ZeroBytes(16)
+            #If TargetMac Then
+                address.SetItem(0, 16)
+                address.SetItem(1, 2)
+            #Else
+                address.SetItem(0, 2)
+            #End If
+            address.SetItem(4, 127)
+            address.SetItem(7, 1)
+            If OAuthBind(Me.Listening, address.DataPtr(), 16) <> 0 Or OAuthListen(Me.Listening, 4) <> 0 Then Throw New InvalidArgumentException("Could not bind exact IPv4 loopback")
+            #If TargetWindows Then
+                Dim length As Int32 = 16
+            #Else
+                Dim length As UInt32 = 16
+            #End If
+            If OAuthSocketName(Me.Listening, address.DataPtr(), length) <> 0 Then Throw New InvalidArgumentException("Could not discover callback port")
+            Me.PortValue = address.Item(2) * 256 + address.Item(3)
+            If Me.PortValue < 1 Then Throw New InvalidArgumentException("Could not allocate callback port")
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+
+    Public Property Port As Integer
+        Get
+            Return Me.PortValue
+        End Get
+    End Property
+
+    Private Sub CloseAccepted()
+        If Me.Accepted >= 0 Then OAuthClose(Me.Accepted)
+        Me.Accepted = -1
+        Me.Buffer = New Bytes()
+    End Sub
+
+    Public Sub Respond(success As Boolean)
+        If Me.Accepted < 0 Then Return
+        Dim body As String = "Invalid sign-in callback. Return to Buoy Studio and try again."
+        Dim status As String = "400 Bad Request"
+        If success Then
+            body = "Sign-in callback received. You can close this tab and return to Buoy Studio."
+            status = "200 OK"
+        End If
+        Dim replyText As String = "HTTP/1.1 " + status + "\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: " + String.From(String.LenBytes(body)) + "\r\n\r\n" + body
+        Dim encoded As Bytes = Bytes.FromString(replyText, Text.Encodings.UTF8)
+        #If TargetLinux Then
+            OAuthSend(Me.Accepted, encoded.DataPtr(), encoded.Count, 16384)
+        #Else
+            OAuthSend(Me.Accepted, encoded.DataPtr(), encoded.Count, 0)
+        #End If
+        Me.CloseAccepted()
+    End Sub
+
+    ''' Returns an origin-form target only after one complete small ASCII GET request.
+    Public Function PollTarget() As String
+        If Me.Listening < 0 Then Return ""
+        If Me.Accepted < 0 Then
+            Me.Accepted = OAuthAccept(Me.Listening, Nil, Nil)
+            If Me.Accepted < 0 Then Return ""
+            SetNonblocking(Me.Accepted)
+            Me.AcceptedAt = System.Microseconds()
+        End If
+        If System.Microseconds() - Me.AcceptedAt > 5000000 Then
+            Me.CloseAccepted()
+            Return ""
+        End If
+        Dim incoming As Bytes = ZeroBytes(4096)
+        Dim count As Integer = OAuthRecv(Me.Accepted, incoming.DataPtr(), incoming.Count, 0)
+        If count = 0 Then
+            Me.CloseAccepted()
+            Return ""
+        End If
+        If count < 0 Then Return ""
+        For i As Integer = 0 To count - 1
+            Dim value As Integer = incoming.Item(i)
+            If value = 0 Or value > 127 Then
+                Me.Respond(False)
+                Return ""
+            End If
+        Next
+        Me.Buffer.Append(incoming.DataPtr(), count)
+        If Me.Buffer.Count > 16384 Then
+            Me.Respond(False)
+            Return ""
+        End If
+        Dim request As String = Me.Buffer.ToString(Text.Encodings.UTF8)
+        If String.IndexOf(request, "\r\n\r\n", 0, True) < 0 Then Return ""
+        Dim lines As Array Of String = String.Split(request, "\r\n")
+        Dim words As Array Of String = String.Split(lines(0), " ")
+        If Array.Count(words) <> 3 Then
+            Me.Respond(False)
+            Return ""
+        End If
+        If String.Compare(words(0), "GET", True) <> 0 Or Not String.StartsWith(words(1), "/", True) Or String.StartsWith(words(1), "//", True) Or String.Compare(words(2), "HTTP/1.1", True) <> 0 Then
+            Me.Respond(False)
+            Return ""
+        End If
+        Dim expectedHost As String = "127.0.0.1:" + String.From(Me.PortValue)
+        Dim hostCount As Integer = 0
+        For i As Integer = 1 To Array.Count(lines) - 1
+            Dim colon As Integer = String.IndexOf(lines(i), ":", 0, True)
+            If colon > 0 Then
+                If String.Compare(String.Left(lines(i), colon), "Host", False) = 0 Then
+                    hostCount += 1
+                    If String.Compare(String.Trim(String.Substring(lines(i), colon + 1)), expectedHost, True) <> 0 Then
+                        Me.Respond(False)
+                        Return ""
+                    End If
+                End If
+            End If
+        Next
+        If hostCount <> 1 Then
+            Me.Respond(False)
+            Return ""
+        End If
+        Return words(1)
+    End Function
+
+    Public Sub Close()
+        Me.CloseAccepted()
+        If Me.Listening >= 0 Then OAuthClose(Me.Listening)
+        Me.Listening = -1
+        #If TargetWindows Then
+            If Me.WindowsStarted Then OAuthWSACleanup()
+            Me.WindowsStarted = False
+        #End If
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+Private Class StudioOAuthWork
+    Public Property Client As ChatGPTAuthClient
+    Public Property Attempt As ChatGPTSignIn
+    Public Property Profile As ChatGPTProfile
+    Public Property Kind As String
+    Public Property Store As StudioCredentialStorage
+    Public Property PendingExchange As StudioOAuthWork
+    Public Property WarningText As String
+    Public Property Cancelled As Atomic = New Atomic(0)
+    Public Property ExchangeCommitted As Boolean = False
+    Public Property ExchangeSucceeded As Boolean = False
+    Public Property ForgotRecord As Boolean = False
+    Public Property HasSavedRecord As Boolean = False
+    Public Property LocallySignedOut As Boolean = False
+    Public Property ErrorText As String
+    Public Property Work As Task
+    Public Property KeepAlive As StudioOAuthWork
+End Class
+
+Private Sub RunOAuthWorkOnce(pointer As Ptr)
+    Dim operation As StudioOAuthWork = CType(pointer, StudioOAuthWork)
+    Dim locked As Boolean = False
+    Dim phase As String = "secure storage"
+    Try
+        If operation.PendingExchange <> Nil Then
+            ' The cleanup owns the cancelled exchange even if the UI stops polling.
+            While Not operation.PendingExchange.Work.IsComplete()
+                Thread.Sleep(5)
+            End While
+            operation.Profile = operation.PendingExchange.Profile
+            operation.HasSavedRecord = operation.PendingExchange.ExchangeCommitted
+            operation.ForgotRecord = operation.PendingExchange.ForgotRecord
+            Dim exchanged As Boolean = operation.PendingExchange.ExchangeSucceeded
+            operation.PendingExchange = Nil
+            If Not operation.HasSavedRecord Or operation.Profile = Nil Then
+                If exchanged And operation.Profile <> Nil Then operation.Profile.ClearCredentials()
+                operation.Profile = Nil
+                Return
+            End If
+        End If
+        If operation.Store <> Nil Then
+            locked = operation.Store.Acquire()
+            If Not locked Then
+                operation.ErrorText = "Another Studio instance is updating ChatGPT sign-in. Try again shortly."
+                Return
+            End If
+            ' Reload the latest rotating refresh token while holding the process lock.
+            If operation.Kind = "restore" Or (operation.Kind <> "exchange" And operation.Kind <> "forget" And operation.HasSavedRecord) Then
+                Dim saved As String = operation.Store.Load()
+                If saved <> "" Then
+                    phase = "saved identity verification"
+                    operation.Profile = operation.Client.RestoreProfile(Json.Parse(saved))
+                    operation.HasSavedRecord = True
+                ElseIf operation.Kind = "restore" Then
+                    Return
+                Else
+                    operation.LocallySignedOut = True
+                    Throw New InvalidArgumentException("Saved session was removed")
+                End If
+            End If
+        End If
+        If operation.Kind = "forget" Then
+            phase = "forgetting cancelled sign-in"
+            Dim saved As String = operation.Store.Load()
+            If saved <> "" Then
+                Dim record As JSONItem = Json.Parse(saved)
+                Dim cancelled As JSONItem = operation.Profile.ExportCredentials()
+                ' Never remove a different registration saved by another process.
+                If String.Compare(record.Value("client_id").AsString().Or(""), operation.Profile.ClientID, True) = 0 And String.Compare(record.Value("nonce").AsString().Or(""), cancelled.Value("nonce").AsString().Or(""), True) = 0 Then
+                    operation.Store.Delete()
+                    operation.ForgotRecord = True
+                End If
+            End If
+            operation.Profile.ClearCredentials()
+            operation.Profile = Nil
+            operation.HasSavedRecord = False
+        ElseIf operation.Kind = "revoke" Then
+            ' Forget before revocation so a failed request cannot restore the session.
+            If operation.Store <> Nil Then operation.Store.Delete()
+            operation.HasSavedRecord = False
+            operation.LocallySignedOut = True
+            phase = "remote sign-out"
+            operation.Client.Revoke(operation.Profile)
+        Else
+            If operation.Kind = "exchange" Then
+                phase = "token exchange and identity verification"
+                operation.Profile = operation.Client.Exchange(operation.Attempt)
+                operation.ExchangeSucceeded = True
+            ElseIf operation.Profile <> Nil Then
+                phase = "session renewal"
+                operation.Client.Refresh(operation.Profile)
+            End If
+            If operation.Kind = "exchange" And operation.Cancelled.Load() <> 0 Then
+                operation.Profile.ClearCredentials()
+                operation.Profile = Nil
+                Return
+            End If
+            If operation.Store <> Nil And operation.Profile <> Nil Then
+                operation.HasSavedRecord = False
+                Try
+                    operation.Store.Save(operation.Profile.ExportCredentials().ToString())
+                    operation.HasSavedRecord = True
+                    If operation.Kind = "exchange" Then operation.ExchangeCommitted = True
+                Catch e As Exception
+                    ' A rotated token invalidates the previous stored record. Never reload it.
+                    Try
+                        operation.Store.Delete()
+                    Catch cleanupError As Exception
+                        ' The visible warning still requires sign-in after restarting.
+                    End Try
+                    operation.WarningText = "Session not saved; secure credential storage is unavailable. Sign in again after restarting."
+                End Try
+                If operation.Kind = "exchange" And operation.Cancelled.Load() <> 0 Then
+                    If operation.HasSavedRecord Then
+                        operation.Store.Delete()
+                        operation.ForgotRecord = True
+                    End If
+                    operation.ExchangeCommitted = False
+                    operation.HasSavedRecord = False
+                    operation.Profile.ClearCredentials()
+                    operation.Profile = Nil
+                End If
+            End If
+        End If
+    Catch e As KeychainException
+        operation.ErrorText = "ChatGPT secure storage: " + e.Kind.Name + ". Unlock or allow access to your credential store and retry."
+    Catch e As Exception
+        ' Never forward tokens, callback URLs, native errors or issuer response bodies.
+        operation.ErrorText = "ChatGPT " + phase + " failed. Retry sign-in."
+    Finally
+        If locked Then operation.Store.Release()
+        operation.KeepAlive = Nil
+    End Try
+End Sub
+
+Private Sub RunOAuthWork(pointer As Ptr)
+    Dim operation As StudioOAuthWork = CType(pointer, StudioOAuthWork)
+    RunOAuthWorkOnce(pointer)
+    ' A cancelled committed grant remains cleanup-owned until storage acknowledges it.
+    ' Retry off the UI thread, including lock contention and transient Delete failures.
+    While operation.Kind = "forget" And operation.ErrorText <> ""
+        Thread.Sleep(100)
+        operation.ErrorText = ""
+        RunOAuthWorkOnce(pointer)
+    End While
+End Sub
+
+''' Main-thread owner; secure-store and network work run off the UI thread.
+Public Class StudioOAuthService
+    Private Property Client As ChatGPTAuthClient
+    Private Property Store As StudioCredentialStorage
+    Private Property HasSavedRecord As Boolean = False
+    Private Property Attempt As ChatGPTSignIn
+    Private Property Listener As StudioLoopbackListener
+    Private Property Current As StudioOAuthWork
+    Private Property ActiveProfile As ChatGPTProfile
+    Private Property StatusValue As String = "Signed out"
+    Private Property RestartValue As Boolean = False
+    Private Property StartedAt As Integer
+    Private Property DiscardCurrent As Boolean = False
+    Private Property BrowserLaunch As PipeProcess
+    Private Property BrowserLibrary As Ptr
+
+    Public Sub Constructor()
+        Const Domain As String = "com.buoy.studio"
+        Dim hostID As String = Prefs.Get(Domain, "chatgpt-host-id", "")
+        If hostID = "" Then
+            hostID = NewChatGPTHostID()
+            Prefs.Set(Domain, "chatgpt-host-id", hostID)
+        End If
+        Me.Client = New ChatGPTAuthClient("Buoy Studio", hostID)
+        Me.Store = New StudioCredentialStore(hostID)
+        Me.StatusValue = "Restoring ChatGPT sign-in…"
+        Me.StartWork("restore")
+    End Sub
+
+    Public Sub Constructor(client As ChatGPTAuthClient)
+        If client = Nil Then Throw New InvalidArgumentException("Auth client is required")
+        Me.Client = client
+    End Sub
+
+    Public Shared Function ForTesting(client As ChatGPTAuthClient) As StudioOAuthService
+        Return New StudioOAuthService(client)
+    End Function
+
+    Public Shared Function ForTesting(client As ChatGPTAuthClient, store As StudioCredentialStorage) As StudioOAuthService
+        Dim service As New StudioOAuthService(client)
+        service.Store = store
+        service.StatusValue = "Restoring ChatGPT sign-in…"
+        service.StartWork("restore")
+        Return service
+    End Function
+
+    Public Function BeginSignIn() As String
+        If Me.Current <> Nil Then Throw New InvalidArgumentException("A ChatGPT operation is already running")
+        Me.Cancel()
+        Me.Listener = New StudioLoopbackListener()
+        Try
+            If Me.ActiveProfile = Nil Then
+                Me.Attempt = Me.Client.Begin(Me.Listener.Port)
+            Else
+                Me.Attempt = Me.Client.BeginForProfile(Me.ActiveProfile, Me.Listener.Port)
+            End If
+            Me.StartedAt = System.Microseconds()
+            Me.StatusValue = "Continue sign-in in your browser"
+            Return Me.Attempt.AuthorizationURL
+        Catch e As Exception
+            Me.Cancel()
+            Throw e
+        End Try
+    End Function
+
+    Public Sub OpenBrowser(authorizationURL As String)
+        If Me.Attempt = Nil Or Me.Listener = Nil Then Throw New InvalidArgumentException("Start sign-in before opening the browser")
+        If String.Compare(authorizationURL, Me.Attempt.AuthorizationURL, True) <> 0 Then Throw New InvalidArgumentException("Authorization URL does not match pending sign-in")
+        ' Token hints are optional; never hand identity tokens to browser launchers.
+        Dim hint As Integer = String.InStr(authorizationURL, "&id_token_hint=")
+        If hint > 0 Then
+            Dim suffix As String = String.Substring(authorizationURL, hint)
+            Dim nextParameter As Integer = String.InStr(suffix, "&")
+            authorizationURL = String.Left(authorizationURL, hint - 1)
+            If nextParameter > 0 Then authorizationURL += String.Substring(suffix, nextParameter - 1)
+        End If
+        #If TargetWindows Then
+            Dim wide As Bytes = Bytes.FromString(authorizationURL, Text.Encodings.UTF16LE)
+            wide.Append(0)
+            wide.Append(0)
+            If OAuthOpenURL(Nil, Nil, wide.DataPtr(), Nil, Nil, 1) <= 32 Then Throw New InvalidArgumentException("Could not open the default browser")
+        #ElseIf TargetMac Then
+            Me.BrowserLaunch = New PipeProcess("/usr/bin/open", [authorizationURL])
+        #Else
+            If Me.BrowserLibrary = Nil Then Me.BrowserLibrary = OAuthDlopen("libgio-2.0.so.0", 2)
+            If Me.BrowserLibrary = Nil Then Throw New InvalidArgumentException("GIO browser launcher is unavailable")
+            Dim symbol As Ptr = OAuthDlsym(Me.BrowserLibrary, "g_app_info_launch_default_for_uri")
+            If symbol = Nil Then Throw New InvalidArgumentException("GIO browser launcher is unavailable")
+            Dim opener As OAuthURIOpener = CType(symbol, OAuthURIOpener)
+            If opener(CType(authorizationURL, CString), Nil, Nil) = 0 Then Throw New InvalidArgumentException("Could not open the default browser")
+        #End If
+    End Sub
+
+    Private Sub StartWork(kind As String)
+        Dim operation As New StudioOAuthWork()
+        operation.Client = Me.Client
+        operation.Attempt = Me.Attempt
+        operation.Profile = Me.ActiveProfile
+        operation.Kind = kind
+        operation.Store = Me.Store
+        operation.HasSavedRecord = Me.HasSavedRecord
+        operation.KeepAlive = operation
+        operation.Work = Task.RunWithArg(AddressOf RunOAuthWork, CType(operation, Ptr))
+        Me.DiscardCurrent = False
+        Me.Current = operation
+    End Sub
+
+    Public Sub Poll()
+        If Me.BrowserLaunch <> Nil Then
+            If Not Me.BrowserLaunch.Poll() Then
+                Dim exited As Integer = Me.BrowserLaunch.ExitCode
+                Me.BrowserLaunch.Close()
+                Me.BrowserLaunch = Nil
+                If exited <> 0 Then Me.StatusValue = "Default browser could not be opened; retry sign-in"
+            End If
+        End If
+        If Me.Listener <> Nil Then
+            If System.Microseconds() - Me.StartedAt > 600000000 Then
+                Me.Cancel()
+                Me.StatusValue = "ChatGPT sign-in timed out"
+                Return
+            End If
+            Dim target As String = Me.Listener.PollTarget()
+            If target <> "" Then
+                Try
+                    Me.Attempt.AcceptCallback("http://127.0.0.1:" + String.From(Me.Listener.Port) + target)
+                    Me.Listener.Respond(True)
+                    Me.Listener.Close()
+                    Me.Listener = Nil
+                    Me.StatusValue = "Verifying ChatGPT sign-in…"
+                    Me.StartWork("exchange")
+                Catch e As Exception
+                    If Me.Listener <> Nil Then Me.Listener.Respond(False)
+                    If String.Compare(e.Message, "ChatGPT authorization was denied or failed", True) = 0 Then
+                        Me.Listener.Close()
+                        Me.Listener = Nil
+                        Me.Attempt = Nil
+                        Me.StatusValue = "ChatGPT sign-in was cancelled or denied"
+                    Else
+                        Me.StatusValue = "Waiting for a valid ChatGPT sign-in callback"
+                    End If
+                End Try
+            End If
+        End If
+        If Me.Current = Nil Then Return
+        If Not Me.Current.Work.IsComplete() Then Return
+        Dim operation As StudioOAuthWork = Me.Current
+        Me.Current = Nil
+        Me.Attempt = Nil
+        If Me.DiscardCurrent Then
+            Me.DiscardCurrent = False
+            If operation.Kind <> "refresh" Or operation.ErrorText <> "" Or operation.Profile = Nil Then
+                If Me.ActiveProfile <> Nil Then Me.ActiveProfile.ClearCredentials()
+                Me.ActiveProfile = Nil
+                Me.RestartValue = True
+                Me.StatusValue = "ChatGPT operation cancelled"
+                Return
+            End If
+            ' A completed refresh already rotated credentials; publish its valid result.
+        End If
+        If operation.ErrorText <> "" Then
+            Me.StatusValue = operation.ErrorText
+            If operation.LocallySignedOut Then
+                If operation.Profile <> Nil Then operation.Profile.ClearCredentials()
+                Me.ActiveProfile = Nil
+                Me.StatusValue = "Signed out locally; " + operation.ErrorText
+                Me.RestartValue = True
+            End If
+            Return
+        End If
+        If operation.Kind = "forget" Then
+            If operation.ForgotRecord Then Me.HasSavedRecord = False
+            Me.StatusValue = "ChatGPT sign-in cancelled"
+            Return
+        End If
+        Me.HasSavedRecord = operation.HasSavedRecord
+        If String.Compare(operation.Kind, "revoke", True) = 0 Then
+            Me.ActiveProfile = Nil
+            Me.StatusValue = "Signed out"
+        Else
+            Me.ActiveProfile = operation.Profile
+            Me.StatusValue = "Signed out"
+            If Me.ActiveProfile <> Nil Then
+                Me.StatusValue = "Signed in with ChatGPT"
+                If Not Me.ActiveProfile.PlanEnabled Then Me.StatusValue = "Signed in; ChatGPT plan permission is unavailable"
+                If operation.WarningText <> "" Then Me.StatusValue += " · " + operation.WarningText
+            End If
+        End If
+        Me.RestartValue = True
+    End Sub
+
+    Public Sub Refresh()
+        If Me.Current <> Nil Or Me.Listener <> Nil Then Throw New InvalidArgumentException("A ChatGPT operation is already running")
+        If Me.ActiveProfile = Nil Then Throw New InvalidArgumentException("Sign in first")
+        Me.StatusValue = "Refreshing ChatGPT session…"
+        Me.StartWork("refresh")
+    End Sub
+
+    Public Sub SignOut()
+        If Me.Current <> Nil Then Throw New InvalidArgumentException("A ChatGPT operation is already running")
+        Me.Cancel()
+        If Me.ActiveProfile = Nil Then Return
+        Me.StatusValue = "Signing out of ChatGPT…"
+        Me.StartWork("revoke")
+    End Sub
+
+    Public Sub Cancel()
+        If Me.Listener <> Nil Then
+            If Me.Attempt <> Nil Then Me.Attempt.Cancel()
+            Me.Listener.Close()
+        End If
+        Me.Listener = Nil
+        Me.Attempt = Nil
+        ' HTTP cannot be aborted; serialize it and discard its eventual completion.
+        If Me.Current <> Nil Then
+            If Me.Current.Kind = "forget" Then Return
+            If Me.Current.Kind = "exchange" Then
+                Me.Current.Cancelled.Store(1)
+                Dim cleanup As New StudioOAuthWork()
+                cleanup.Client = Me.Client
+                cleanup.Store = Me.Store
+                cleanup.PendingExchange = Me.Current
+                cleanup.Kind = "forget"
+                cleanup.KeepAlive = cleanup
+                cleanup.Work = Task.RunWithArg(AddressOf RunOAuthWork, CType(cleanup, Ptr))
+                Me.Current = cleanup
+                Me.DiscardCurrent = False
+                Me.StatusValue = "Forgetting cancelled ChatGPT sign-in…"
+                Return
+            End If
+            Me.DiscardCurrent = True
+            Me.StatusValue = "Cancelling ChatGPT operation…"
+            Return
+        End If
+        If Me.ActiveProfile = Nil Then
+            Me.StatusValue = "Signed out"
+        Else
+            Me.StatusValue = "Signed in with ChatGPT"
+        End If
+    End Sub
+
+    Public Property Status As String
+        Get
+            Return Me.StatusValue
+        End Get
+    End Property
+    Public Property Profile As ChatGPTProfile
+        Get
+            If Me.Current <> Nil Then Return Nil
+            Return Me.ActiveProfile
+        End Get
+    End Property
+    Public Property HasProfile As Boolean
+        Get
+            Return Me.ActiveProfile <> Nil
+        End Get
+    End Property
+    ''' Hosts must keep their close/poll loop alive until explicit cancellation completes.
+    Public Property CancellationPending As Boolean
+        Get
+            If Me.Current = Nil Then Return False
+            Return Me.Current.Kind = "forget"
+        End Get
+    End Property
+    Public Property IsBusy As Boolean
+        Get
+            Return Me.Current <> Nil Or Me.Listener <> Nil
+        End Get
+    End Property
+    Public Property NeedsAgentRestart As Boolean
+        Get
+            Return Me.RestartValue
+        End Get
+    End Property
+    Public Sub AcknowledgeAgentRestart()
+        Me.RestartValue = False
+    End Sub
+
+    ' Preserve published sessions, but abandon and drain any unpublished sign-in.
+    Public Sub Shutdown()
+        Dim abandoningExchange As Boolean = False
+        If Me.Current <> Nil Then abandoningExchange = Me.Current.Kind = "exchange"
+        If Me.Listener <> Nil Or Me.Current <> Nil Then Me.Cancel()
+        If abandoningExchange And Me.Current <> Nil Then
+            If Me.Current.Kind = "forget" Then
+                While Not Me.Current.Work.IsComplete()
+                    Thread.Sleep(5)
+                End While
+                Me.Poll()
+            End If
+        End If
+    End Sub
+
+    Public Sub Destructor()
+        Me.Shutdown()
+        #If TargetLinux Then
+            If Me.BrowserLibrary <> Nil Then OAuthDlclose(Me.BrowserLibrary)
+        #End If
+    End Sub
+End Class
+
+Public Function StudioChildEnvironment(profile As ChatGPTProfile) As Map Of String, String
+    If profile = Nil Then Throw New InvalidArgumentException("ChatGPT profile is required")
+    Return profile.ChildEnvironment()
+End Function
+
+''' Configure Codex Responses with an env_key; never include credentials in argv/config.
+Public Function SubscriptionEndpoint(codexPath As String, arguments As Array Of String) As AgentEndpoint
+    Dim configured As Array Of String = []
+    For Each argument As String In arguments
+        Array.Append(configured, argument)
+    Next
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_provider=\"openai_chatgpt_plan\"")
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_providers.openai_chatgpt_plan.name=\"ChatGPT plan\"")
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_providers.openai_chatgpt_plan.base_url=\"https://api.openai.com/v1\"")
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_providers.openai_chatgpt_plan.env_key=\"ACCESS_TOKEN\"")
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_providers.openai_chatgpt_plan.wire_api=\"responses\"")
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_providers.openai_chatgpt_plan.requires_openai_auth=false")
+    Array.Append(configured, "-c")
+    Array.Append(configured, "model_providers.openai_chatgpt_plan.supports_websockets=false")
+    Return New AgentEndpoint("ChatGPT plan", AgentProtocol.Codex, codexPath, configured)
+End Function

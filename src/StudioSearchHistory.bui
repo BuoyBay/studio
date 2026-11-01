@@ -1,0 +1,77 @@
+''' Bounded MRU pairs. JSON encoding preserves newlines and replacement escapes.
+Public Class StudioSearchHistoryEntry
+    Public Property Query As String
+    Public Property Replacement As String
+    Public Sub Constructor(query As String, replacement As String)
+        Me.Query = query
+        Me.Replacement = replacement
+    End Sub
+End Class
+
+Public Class StudioSearchHistory
+    Public Property Entries As Array Of StudioSearchHistoryEntry = []
+    Public Property Domain As String = "com.buoy.studio.search"
+    Public Property LastError As String = ""
+    ' Read the latest persisted MRU before recording from either modeless window.
+    Public Sub Record(query As String, replacement As String)
+        Me.Load()
+        If Me.LastError <> "" Then Return
+        Me.Remember(query, replacement)
+        Me.Save()
+    End Sub
+    Public Sub Remember(query As String, replacement As String)
+        If query = "" Or String.LenBytes(query) > 4096 Or String.LenBytes(replacement) > 4096 Then Return
+        Dim fresh As Array Of StudioSearchHistoryEntry = []
+        fresh.Append(New StudioSearchHistoryEntry(query, replacement))
+        For Each entry As StudioSearchHistoryEntry In Me.Entries
+            If String.Compare(entry.Query, query, True) = 0 And String.Compare(entry.Replacement, replacement, True) = 0 Then Continue For
+            If Array.Count(fresh) >= 30 Then Exit For
+            fresh.Append(entry)
+        Next
+        Me.Entries = fresh
+    End Sub
+    Public Function Encode() As String
+        Dim data As JSONItem = JSONItem.NewArray()
+        For Each entry As StudioSearchHistoryEntry In Me.Entries
+            Dim pair As JSONItem = JSONItem.NewObject()
+            pair.Value("query") = entry.Query
+            pair.Value("replacement") = entry.Replacement
+            data.Add(pair)
+        Next
+        Return Json.Stringify(data)
+    End Function
+    Public Sub Decode(source As String)
+        If String.LenBytes(source) > 300000 Then Throw New InvalidArgumentException("Search history exceeds size limit.")
+        Dim data As JSONItem = Json.Parse(source)
+        Dim fresh As New StudioSearchHistory()
+        If Not data.IsArray() Then Throw New InvalidArgumentException("Expected search history array.")
+        ' Remember in reverse order to retain MRU ordering, bound hostile input first.
+        Dim retained As Integer = data.Count
+        If retained > 30 Then retained = 30
+        For i As Integer = retained - 1 To 0 Step -1
+            Dim pair As JSONItem = data.ChildAt(i)
+            fresh.Remember(pair.Value("query").AsString().Or(""), pair.Value("replacement").AsString().Or(""))
+        Next
+        Me.Entries = fresh.Entries
+    End Sub
+    Public Sub Load()
+        Me.LastError = ""
+        Try
+            Me.Decode(Prefs.Get(Me.Domain, "history", "[]"))
+        Catch e As Exception
+            Me.LastError = "Could not load search history: " + e.Message
+        End Try
+    End Sub
+    Public Sub Save()
+        Me.LastError = ""
+        Try
+            Prefs.Set(Me.Domain, "history", Me.Encode())
+        Catch e As Exception
+            Me.LastError = "Could not save search history: " + e.Message
+        End Try
+    End Sub
+    Public Sub Clear()
+        Me.Entries = []
+        Me.Save()
+    End Sub
+End Class

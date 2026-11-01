@@ -1,0 +1,343 @@
+Import projectkit
+Import processkit
+Import StudioScriptSettings
+
+Private Class StudioScriptSlot
+    Public Shared Property Active As StudioAgentScript
+End Class
+
+Private Class StudioScriptTimer Inherits Timer
+    Public Property Owner As Weak StudioAgentScript
+    Public Overrides Sub NotifyTick()
+        Dim job As StudioAgentScript = Me.Owner
+        If job <> Nil Then job.Poll()
+    End Sub
+End Class
+
+''' Main-thread, bounded JSON-lines bridge to an optional, trusted native JIT helper.
+Public Class StudioAgentScript
+    Private Property Workspace As ProjectWorkspace
+    Private Property ProposalIDs As Array Of String = []
+    Private Property Host As ProjectMCPHost
+    Private Property Process As PipeProcess
+    Private Property Poller As StudioScriptTimer = New StudioScriptTimer()
+    Private Property Input As Bytes
+    Private Property InputOffset As Integer = 0
+    Private Property Line As Bytes = New Bytes()
+    Private Property ErrorText As Bytes = New Bytes()
+    Private Property OutputBytes As Integer = 0
+    Private Property Calls As Integer = 0
+    Private Property Started As Integer
+    Private Property CleanupDeadline As Integer = 0
+    Private Property Deadline As Integer
+    Private Property Finished As Boolean = False
+    Private Property GotResult As Boolean = False
+    Private Property Stopping As Boolean = False
+    Private Property Polling As Boolean = False
+    Private Property Outcome As JSONItem = JSONItem.NewObject()
+    Private Property KeepAlive As StudioAgentScript
+    Private Property ConsoleMode As Boolean = False
+    Private Property ConsoleTruncated As Boolean = False
+    Public Property ConsoleText As String
+    Public Property Id As String
+
+    Public Sub Constructor(workspace As ProjectWorkspace, executable As String, directory As String, source As String, timeoutMs As Integer = 30000, consoleMode As Boolean = False, access As Optional Of ProjectToolAccess = None)
+        If Not StudioScriptSettings.Enabled Then Throw New InvalidArgumentException("BuoyScript is disabled in Settings / Preferences")
+        Dim active As StudioAgentScript = StudioScriptSlot.Active
+        If active <> Nil Then
+            If active.IsActive() Then Throw New InvalidArgumentException("Another Studio script is running; cancel it or wait for its result")
+        End If
+        If String.LenBytes(source) < 1 Or String.LenBytes(source) > 65536 Then Throw New InvalidArgumentException("Script source must contain 1..65536 UTF-8 bytes")
+        If timeoutMs < 100 Or timeoutMs > 3600000 Then Throw New InvalidArgumentException("Script timeout must be 100..3600000 ms")
+        Me.Workspace = workspace
+        Me.ConsoleMode = consoleMode
+        Me.Host = New ProjectMCPHost(workspace)
+        If access.HasValue Then Me.Host.Access = access.Value
+        Me.Host.Handle(Json.Parse("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"studio-script\",\"version\":\"1\"}}}"))
+        Me.Host.Handle(Json.Parse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))
+        Me.Started = System.Microseconds()
+        Me.Deadline = Me.Started + timeoutMs * 1000
+        Me.Id = "script-" + String.From(Me.Started)
+        Dim request As JSONItem = JSONItem.NewObject()
+        request.Value("source") = source
+        request.Value("console") = consoleMode
+        Me.Input = Bytes.FromString(request.ToString() + "\n", Text.Encodings.UTF8)
+        Dim arguments As Array Of String = []
+        Dim environment As New Map Of String, String()
+        For Each name As String In ["MISTRAL_API_KEY", "BUOY_STUDIO_CODESTRAL_TOKEN", "BUOY_STUDIO_TABBY_TOKEN", "BUOY_STUDIO_TICKETS_TOKEN", "XAI_API_KEY", "META_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "BUOY_STUDIO_GROK_TOKEN", "BUOY_STUDIO_MUSE_TOKEN", "CHATGPT_ACCESS_TOKEN", "OPENAI_ACCESS_TOKEN"]
+            environment.Set(name, "")
+        Next
+        Me.Process = New PipeProcess(executable, arguments, directory, environment, True)
+        StudioScriptSlot.Active = Me
+        Me.KeepAlive = Me
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 20
+        Me.Poller.Start()
+    End Sub
+
+    Public Shared Sub StopActive()
+        Dim active As StudioAgentScript = StudioScriptSlot.Active
+        If active <> Nil Then active.Cancel()
+    End Sub
+
+    Public Function IsActive() As Boolean
+        Return Not Me.Finished
+    End Function
+
+    Private Sub CleanupWarning(message As String)
+        Dim previous As String = Me.Outcome.Value("cleanupWarning").AsString().Or("")
+        If previous <> "" Then previous += "; "
+        Me.Outcome.Value("cleanupWarning") = String.Left(previous + message, 4096)
+    End Sub
+
+    Private Sub TerminateOwnedTree()
+        Try
+            Me.Process.TerminateTree()
+        Catch e As Exception
+            ' Cleanup must never throw out of a UI timer or replace a final result.
+            Me.CleanupWarning("Owned process termination failed: " + String.Left(e.Message, 1024))
+        End Try
+    End Sub
+
+    Private Sub BeginCleanup()
+        Me.Stopping = True
+        If Me.CleanupDeadline = 0 Then Me.CleanupDeadline = System.Microseconds() + 2000000
+        Me.TerminateOwnedTree()
+    End Sub
+
+    Private Sub Fail(message As String)
+        If Not Me.GotResult Then
+            Me.Outcome.Value("ok") = False
+            Me.Outcome.Value("error") = message
+            Me.GotResult = True
+        Else
+            Me.CleanupWarning(message)
+        End If
+        Me.Line = New Bytes()
+        Me.BeginCleanup()
+    End Sub
+
+    Private Sub Finish()
+        Try
+            Me.Process.Close()
+        Catch e As Exception
+            Me.CleanupWarning("Process close failed: " + String.Left(e.Message, 1024))
+        Finally
+            Me.Process = Nil
+            Me.Finished = True
+            If StudioScriptSlot.Active = Me Then StudioScriptSlot.Active = Nil
+            Me.Poller.Stop()
+            Me.KeepAlive = Nil
+        End Try
+    End Sub
+
+    Private Sub CaptureConsole(data As Bytes)
+        If Me.ConsoleTruncated Then Return
+        For i As Integer = 0 To data.Count - 1
+            If Me.ErrorText.Count < 32768 Then Me.ErrorText.Append(data.Item(i))
+        Next
+        If Me.ErrorText.Count < 32768 Then
+            Try
+                Me.ConsoleText = Me.ErrorText.ToString(Text.Encodings.UTF8)
+            Catch e As EncodingException
+                ' A split UTF-8 character can finish on the next poll.
+            End Try
+            Return
+        End If
+        For trim As Integer = 0 To 3
+            Dim prefix As New Bytes()
+            For i As Integer = 0 To Me.ErrorText.Count - trim - 1
+                prefix.Append(Me.ErrorText.Item(i))
+            Next
+            Try
+                Me.ConsoleText = prefix.ToString(Text.Encodings.UTF8)
+                Exit For
+            Catch e As EncodingException
+                ' The retention boundary may split a character; retain complete text.
+            End Try
+        Next
+        Me.ConsoleText += "\n[console truncated at 32 KiB]\n"
+        Me.ConsoleTruncated = True
+    End Sub
+
+    Private Sub Dispatch(line As String)
+        If Me.ConsoleMode And Not String.StartsWith(String.Trim(line), "{", True) Then
+            Me.CaptureConsole(Bytes.FromString(line + "\n", Text.Encodings.UTF8))
+            Return
+        End If
+        If Me.GotResult Then
+            Me.CleanupWarning("Ignored protocol data after the final result")
+            Me.BeginCleanup()
+            Return
+        End If
+        Dim message As JSONItem
+        Try
+            message = Json.Parse(line)
+        Catch e As Exception
+            If Not Me.ConsoleMode Then Throw e
+            Me.CaptureConsole(Bytes.FromString(line + "\n", Text.Encodings.UTF8))
+            Throw New InvalidArgumentException("Invalid runner protocol: " + String.Left(line, 1024) + " · " + e.Message)
+        End Try
+        If Not message.IsObject() Then Throw New InvalidArgumentException("Expected a JSON object from runner")
+        Dim kind As String = message.Value("kind").AsString().Or("")
+        If kind = "done" Then
+            If Not message.Value("ok").IsBoolean() Then Throw New InvalidArgumentException("Runner result requires boolean ok")
+            If message.Value("ok").AsBoolean().Or(False) And Not message.Value("value").IsString() Then Throw New InvalidArgumentException("Runner result requires String value")
+            If Not message.Value("ok").AsBoolean().Or(False) And Not message.Value("error").IsString() Then Throw New InvalidArgumentException("Failed runner result requires an error message")
+            Me.Outcome = message
+            Me.GotResult = True
+            ' Finishing the helper is cleanup, independent of a long script budget.
+            Me.Deadline = Math.Min(Me.Deadline, System.Microseconds() + 2000000)
+            Me.Process.CloseInput()
+            Return
+        End If
+        If kind <> "call" Then Throw New InvalidArgumentException("Unknown runner message; use ProjectTool rather than Print/StdOut")
+        If Me.InputOffset < Me.Input.Count Then Throw New InvalidArgumentException("Runner sent a call before reading its previous response")
+        Me.Calls += 1
+        If Me.Calls > 128 Then Throw New InvalidArgumentException("Script exceeded 128 tool calls; split the work into smaller scripts")
+        Dim name As String = message.Value("name").AsString().Or("")
+        ' An explicit allowlist prevents recursive execution and hidden extension access.
+        If name <> "project_workspace" And name <> "project_list_items" And name <> "project_read_item" And name <> "project_search" And name <> "project_propose_edits" And name <> "project_proposal_status" Then Throw New InvalidArgumentException("Unsupported script tool '" + String.Left(name, 128) + "'; call project_script_help for supported commands")
+        Dim request As JSONItem = JSONItem.NewObject()
+        request.Value("jsonrpc") = "2.0"
+        request.Value("id") = Me.Calls
+        request.Value("method") = "tools/call"
+        Dim parameters As JSONItem = JSONItem.NewObject()
+        parameters.Value("name") = name
+        parameters.Value("arguments") = message.Value("arguments")
+        request.Value("params") = parameters
+        Dim response As String = Me.Host.Handle(request).ToString()
+        If name = "project_propose_edits" Then
+            Dim rpc As JSONItem = Json.Parse(response)
+            If rpc.HasKey("result") Then
+                Dim toolResult As JSONItem = rpc.Value("result")
+                If Not toolResult.Value("isError").AsBoolean().Or(False) Then
+                    Dim proposal As JSONItem = Json.Parse(toolResult.Value("content").ValueAt(0).Value("text").AsString().Or("{}"))
+                    Dim proposalId As String = proposal.Value("id").AsString().Or("")
+                    If proposalId <> "" Then Me.ProposalIDs.Append(proposalId)
+                End If
+            End If
+        End If
+        If String.LenBytes(response) > 1048576 Then Throw New InvalidArgumentException("Tool response exceeds 1 MiB; read smaller item ranges")
+        Me.Input = Bytes.FromString(response + "\n", Text.Encodings.UTF8)
+        Me.InputOffset = 0
+    End Sub
+
+    Public Sub Poll()
+        If Me.Finished Or Me.Polling Then Return
+        Me.Polling = True
+        Try
+            If Not Me.Stopping And System.Microseconds() >= Me.Deadline Then
+                If Me.GotResult Then
+                    Me.BeginCleanup()
+                Else
+                    Me.Fail("Script timed out; reduce work or fix an infinite loop. Earlier edits/proposals remain available; Undo restores applied edits.")
+                End If
+            End If
+            Dim output As Bytes = Me.Process.ReadOutput(16384)
+            Dim errors As Bytes = Me.Process.ReadError(16384)
+            If Me.ConsoleMode Then
+                Dim protocol As Bytes = errors
+                errors = output
+                output = protocol
+                Me.CaptureConsole(errors)
+            End If
+            Me.OutputBytes += output.Count + errors.Count
+            If Not Me.Stopping And Me.OutputBytes > 2097152 Then Throw New InvalidArgumentException("Script output exceeded 2 MiB; return a smaller summary")
+            If Not Me.ConsoleMode And Me.ErrorText.Count < 4096 And errors.Count > 0 Then
+                For i As Integer = 0 To Math.Min(errors.Count, 4096 - Me.ErrorText.Count) - 1
+                    Me.ErrorText.Append(errors.Item(i))
+                Next
+            End If
+            For i As Integer = 0 To output.Count - 1
+                If Me.Stopping Then Exit For
+                If output.Item(i) = 10 Then
+                    Me.Dispatch(Me.Line.ToString(Text.Encodings.UTF8))
+                    Me.Line = New Bytes()
+                Else
+                    Me.Line.Append(output.Item(i))
+                    If Me.Line.Count > 1048576 Then Throw New InvalidArgumentException("Runner JSON line exceeds 1 MiB")
+                End If
+            Next
+            Dim running As Boolean = Me.Process.Poll()
+            If Not running Then
+                If Me.CleanupDeadline = 0 Then Me.CleanupDeadline = System.Microseconds() + 2000000
+                Me.TerminateOwnedTree()
+            End If
+            If running And Not Me.GotResult And Me.InputOffset < Me.Input.Count Then Me.InputOffset += Me.Process.WriteInput(Me.Input, Me.InputOffset)
+            Dim pipesClosed As Boolean = Me.Process.OutputClosed And Me.Process.ErrorClosed
+            Dim cleanupExpired As Boolean = Me.CleanupDeadline > 0 And System.Microseconds() >= Me.CleanupDeadline
+            If (Not running And pipesClosed) Or cleanupExpired Then
+                If Not pipesClosed Then Me.CleanupWarning("Output pipes remained open after the cleanup deadline; closed owned handles")
+                If Me.Line.Count > 0 Then
+                    If Me.ConsoleMode And Not Me.GotResult Then Me.CaptureConsole(Me.Line)
+                    If Me.GotResult Then Me.CleanupWarning("Ignored trailing bytes after the final result")
+                    Me.Line = New Bytes()
+                End If
+                If Not Me.GotResult Then
+                    Dim reason As String = "BuoyScript runner exited without a valid result. Check runtime compatibility and inspect the console; read BuoyScript Help for output protocol details. " + Me.FailureOutput()
+                    Me.Fail(reason)
+                ElseIf Not running Then
+                    If Me.Process.ExitCode <> 0 Then Me.CleanupWarning("Runner exited with code " + String.From(Me.Process.ExitCode) + " after the final result")
+                End If
+                Me.TerminateOwnedTree()
+                Me.Finish()
+            End If
+        Catch e As Exception
+            Me.Fail("Script bridge failed: " + String.Left(e.Message, 4096) + ". Earlier edits/proposals remain; use Undo for applied edits.")
+            If Me.CleanupDeadline > 0 And System.Microseconds() >= Me.CleanupDeadline Then Me.Finish()
+        Finally
+            Me.Polling = False
+        End Try
+    End Sub
+
+    Private Function FailureOutput() As String
+        If Me.ConsoleMode Then Return Me.ConsoleText
+        Return Me.ErrorText.ToString(Text.Encodings.UTF8)
+    End Function
+
+    Public Function Result() As JSONItem
+        Me.Poll()
+        Dim output As JSONItem = Json.Parse(Me.Outcome.ToString())
+        output.Value("scriptId") = Me.Id
+        output.Value("complete") = Me.Finished
+        output.Value("calls") = Me.Calls
+        If Me.Finished Then
+            output.Value("state") = "finished"
+        Else
+            output.Value("state") = "running"
+        End If
+        Return output
+    End Function
+
+    Public Function HasPendingEdits() As Boolean
+        For Each proposalId As String In Me.ProposalIDs
+            If Me.Workspace.ReadProposal(proposalId).Status = ProjectProposalStatus.Pending Then Return True
+        Next
+        Return False
+    End Function
+
+    Public Sub Cancel()
+        If Me.Finished Then Return
+        If Me.GotResult Then
+            Me.BeginCleanup()
+        Else
+            Me.Fail("Script cancelled. Earlier proposals remain; applied edits can be undone.")
+        End If
+    End Sub
+
+    ' Detach cancellation cleanup from the closed session without blocking the UI.
+    ' KeepAlive and the timer reap this job; it can no longer dispatch tool calls.
+    Public Sub Shutdown()
+        Me.Cancel()
+        If StudioScriptSlot.Active = Me Then StudioScriptSlot.Active = Nil
+        Me.Poll()
+    End Sub
+
+End Class
+
+''' User-facing Stop Script applies to the shared UI/agent execution slot.
+Public Sub StudioStopActiveScript()
+    Dim active As StudioAgentScript = StudioScriptSlot.Active
+    If active <> Nil Then active.Cancel()
+End Sub

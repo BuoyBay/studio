@@ -1,0 +1,473 @@
+Import githubkit
+Import forgejokit
+
+Public Interface StudioTicketsListener
+    Sub TicketAttached(context As JSONItem)
+End Interface
+
+Public Class StudioTicketsLink
+    Public Property Listener As StudioTicketsListener
+End Class
+
+''' Worker input/output. No GUI objects or project buffers cross the worker boundary.
+Public Class StudioTicketRequest
+    Public Property Forge As String
+    Public Property API As String
+    Public Property Token As String
+    Public Property OwnerName As String
+    Public Property Repository As String
+    Public Property Operation As String
+    Public Property Number As Integer
+    Public Property Page As Integer = 1
+    Public Property Title As String
+    Public Property Body As String
+    Public Property IssueState As String = "open"
+    Public Property AllowLoopback As Boolean = False
+    Public Property Rows As JSONItem = JSONItem.NewArray()
+    Public Property ResultItem As JSONItem
+    Public Property Comments As String
+    Public Property HasNext As Boolean = False
+    Public Property ErrorText As String
+    Public Property Work As Task
+    Public Property KeepAlive As StudioTicketRequest
+End Class
+
+Private Sub TicketRun(pointer As Ptr)
+    Dim job As StudioTicketRequest = CType(pointer, StudioTicketRequest)
+    Try
+        Dim changes As JSONItem = JSONItem.NewObject()
+        changes.Value("title") = job.Title
+        changes.Value("body") = job.Body
+        changes.Value("state") = job.IssueState
+        If String.Compare(job.Forge, "github", True) = 0 Then
+            Dim client As New GitHubClient(job.Token, job.API, job.AllowLoopback)
+            Select Case job.Operation
+                Case "list"
+                    Dim page As GitHubIssuePage = client.ListIssues(job.OwnerName, job.Repository, job.Page, 30, "all")
+                    For Each item As GitHubIssue In page.Items
+                        If Not item.RawJSON.HasKey("pull_request") Then job.Rows.Add(item.RawJSON)
+                    Next
+                    job.HasNext = page.Info.HasNext
+                Case "get"
+                    job.ResultItem = client.GetIssue(job.OwnerName, job.Repository, job.Number).RawJSON
+                    Dim comments As GitHubCommentPage = client.ListComments(job.OwnerName, job.Repository, job.Number, 1, 100)
+                    For Each comment As GitHubComment In comments.Items
+                        job.Comments += comment.Author + ":\n" + comment.Body + "\n\n"
+                    Next
+                    If comments.Info.HasNext Then job.Comments += "More comments are available on the forge.\n"
+                Case "create"
+                    job.ResultItem = client.CreateIssue(job.OwnerName, job.Repository, job.Title, job.Body).RawJSON
+                Case "update"
+                    job.ResultItem = client.UpdateIssue(job.OwnerName, job.Repository, job.Number, changes).RawJSON
+                Case "comment"
+                    job.ResultItem = client.CreateComment(job.OwnerName, job.Repository, job.Number, job.Body).RawJSON
+                Case Else
+                    Throw New InvalidArgumentException("Unknown ticket operation")
+            End Select
+        ElseIf String.Compare(job.Forge, "forgejo", True) = 0 Then
+            Dim client As New ForgejoClient(job.API, job.Token, job.AllowLoopback, 30)
+            Select Case job.Operation
+                Case "list"
+                    Dim page As ForgejoIssuePage = client.ListIssues(job.OwnerName, job.Repository, job.Page, 30, "all", "issues")
+                    For Each item As ForgejoIssue In page.Items
+                        If Not item.IsPullRequest Then job.Rows.Add(item.RawJSON)
+                    Next
+                    job.HasNext = String.Contains(page.LinkHeader, "rel=\"next\"", True) Or Array.Count(page.Items) = 30
+                Case "get"
+                    job.ResultItem = client.GetIssue(job.OwnerName, job.Repository, job.Number).RawJSON
+                    For Each comment As ForgejoComment In client.ListComments(job.OwnerName, job.Repository, job.Number)
+                        job.Comments += comment.Body + "\n\n"
+                    Next
+                Case "create"
+                    job.ResultItem = client.CreateIssue(job.OwnerName, job.Repository, job.Title, job.Body).RawJSON
+                Case "update"
+                    job.ResultItem = client.UpdateIssue(job.OwnerName, job.Repository, job.Number, changes).RawJSON
+                Case "comment"
+                    job.ResultItem = client.CreateComment(job.OwnerName, job.Repository, job.Number, job.Body).RawJSON
+                Case Else
+                    Throw New InvalidArgumentException("Unknown ticket operation")
+            End Select
+        Else
+            Throw New InvalidArgumentException("Forge must be github or forgejo")
+        End If
+    Catch e As GitHubAPIException
+        job.ErrorText = "GitHub request failed: HTTP " + String.From(e.ResponseInfo.Status) + ". Check repository access, credentials and rate limits."
+    Catch e As ForgejoAPIException
+        job.ErrorText = "Forgejo request failed: HTTP " + String.From(e.HTTPStatus) + ". Check repository access, credentials and rate limits."
+    Catch e As Exception
+        ' Do not echo arbitrary server/parser/config exception text or credentials.
+        job.ErrorText = "Ticket request failed. Check forge, API URL, repository and credentials."
+    End Try
+    job.Token = ""
+    job.KeepAlive = Nil
+End Sub
+
+''' Starts HTTP only on an explicit action. Poll from the UI timer; Stop ignores
+''' a late response but cannot undo a write already accepted by the forge.
+Public Sub StartStudioTicketRequest(job As StudioTicketRequest)
+    If job = Nil Then Throw New InvalidArgumentException("Ticket request is required")
+    If job.Work <> Nil Then Throw New InvalidArgumentException("Request already started")
+    If String.Compare(job.Forge, "github", True) <> 0 And String.Compare(job.Forge, "forgejo", True) <> 0 Then Throw New InvalidArgumentException("Forge must be github or forgejo")
+    If String.Trim(job.OwnerName) = "" Or String.Trim(job.Repository) = "" Then Throw New InvalidArgumentException("Repository owner and name are required")
+    If job.Page < 1 Then Throw New InvalidArgumentException("Page must be positive")
+    If job.Operation <> "list" And job.Operation <> "get" And job.Operation <> "create" And job.Operation <> "update" And job.Operation <> "comment" Then Throw New InvalidArgumentException("Unknown ticket operation")
+    If job.Operation = "get" Or job.Operation = "update" Or job.Operation = "comment" Then
+        If job.Number < 1 Then Throw New InvalidArgumentException("Select a ticket first")
+    End If
+    If job.Operation = "create" And job.IssueState <> "open" Then Throw New InvalidArgumentException("New issues start open; update an existing issue to close it")
+    If job.Operation = "create" Or job.Operation = "update" Then
+        If String.Trim(job.Title) = "" Then Throw New InvalidArgumentException("Ticket title is required")
+        If job.IssueState <> "open" And job.IssueState <> "closed" Then Throw New InvalidArgumentException("State must be open or closed")
+    End If
+    If job.Operation = "comment" And String.Trim(job.Body) = "" Then Throw New InvalidArgumentException("Comment text is required")
+    job.KeepAlive = job
+    job.Work = Task.RunWithArg(AddressOf TicketRun, CType(job, Ptr))
+End Sub
+
+Private Class TicketRows Inherits ListBoxDataSource
+    Public Property Items As JSONItem = JSONItem.NewArray()
+    Public Overrides Function RowCount() As Integer
+        Return Me.Items.Count()
+    End Function
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        Dim label As New Label()
+        Dim width As Integer = 810
+        If column = 0 Then width = 70
+        If column = 1 Then width = 80
+        label.Move(4, 3, width - 8, 18)
+        cell.AddSubview(label)
+    End Sub
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        If row < 0 Or row >= Me.Items.Count() Or cell.SubviewCount() = 0 Then Return
+        Dim label As Label = TryCast(cell.Subview(0), Label)
+        If label = Nil Then Return
+        Dim item As JSONItem = Me.Items.ValueAt(row)
+        Select Case column
+            Case 0
+                label.Text = "#" + Json.Stringify(item.Value("number"))
+            Case 1
+                label.Text = item.Value("state").AsString().Or("")
+            Case Else
+                label.Text = item.Value("title").AsString().Or("")
+        End Select
+    End Sub
+End Class
+
+Private Class TicketList Inherits ListBox
+    Public Property Owner As Weak StudioTicketsWindow
+    Handle SelectionChanged()
+        Dim target As StudioTicketsWindow = Me.Owner
+        If target <> Nil Then target.SelectTicket(Me.SelectedRow)
+    End Handle
+End Class
+
+Private Class TicketButton Inherits Button
+    Public Property Owner As Weak StudioTicketsWindow
+    Public Property Command As String
+    Handle Action()
+        Dim target As StudioTicketsWindow = Me.Owner
+        If target <> Nil Then target.PerformAction(Me.Command)
+    End Handle
+End Class
+
+Private Class TicketTimer Inherits Timer
+    Public Property Owner As Weak StudioTicketsWindow
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioTicketsWindow = Me.Owner
+        If target <> Nil Then target.PollTickets()
+    End Sub
+End Class
+
+Public Class StudioTicketsWindow Inherits Window
+    Public Property HostLink As Weak StudioTicketsLink
+    Public Property IsClosed As Boolean = False
+    Public Property ForgeField As TextField = New TextField()
+    Public Property APIField As TextField = New TextField()
+    Public Property OwnerField As TextField = New TextField()
+    Public Property RepositoryField As TextField = New TextField()
+    Public Property TitleField As TextField = New TextField()
+    Public Property StateField As TextField = New TextField()
+    Public Property BodyField As TextArea = New TextArea()
+    Public Property CommentField As TextArea = New TextArea()
+    Public Property Details As TextArea = New TextArea()
+    Public Property Status As Label = New Label()
+    Public Property SelectedTicket As JSONItem
+    Public Property CurrentRequest As StudioTicketRequest
+    Public Property Page As Integer = 1
+    Public Property AllowLoopback As Boolean = False
+    Public Property HasNext As Boolean = False
+    Private Property Token As String
+    Private Property BodyLabel As Label = New Label()
+    Private Property CommentsLabel As Label = New Label()
+    Private Property CommentLabel As Label = New Label()
+    Private Property Source As TicketRows = New TicketRows()
+    Private Property Results As TicketList = New TicketList()
+    Private Property Poller As TicketTimer = New TicketTimer()
+    Private Property Buttons As Array Of TicketButton = []
+    Private Property LoadedForge As String
+    Private Property LoadedAPI As String
+    Private Property LoadedOwner As String
+    Private Property LoadedRepository As String
+
+    Public Sub Constructor(projectRoot As String)
+        Super.Constructor()
+        Me.Title = "Project Tickets"
+        Me.Move(120, 90, 1050, 810)
+        Me.SetMinSize(1000.0, 760.0)
+        Me.ForgeField.Text = System.EnvironmentVariable("BUOY_STUDIO_TICKETS_FORGE").Or("github")
+        Me.APIField.Text = System.EnvironmentVariable("BUOY_STUDIO_TICKETS_API").Or("")
+        If Me.APIField.Text = "" And Me.ForgeField.Text = "github" Then Me.APIField.Text = "https://api.github.com"
+        Me.OwnerField.Text = System.EnvironmentVariable("BUOY_STUDIO_TICKETS_OWNER").Or("")
+        Me.RepositoryField.Text = System.EnvironmentVariable("BUOY_STUDIO_TICKETS_REPO").Or("")
+        Me.Token = System.EnvironmentVariable("BUOY_STUDIO_TICKETS_TOKEN").Or("")
+        Me.ForgeField.Placeholder = "github or forgejo"
+        Me.APIField.Placeholder = "HTTPS API base; Forgejo ends /api/v1"
+        Me.OwnerField.Placeholder = "Repository owner"
+        Me.RepositoryField.Placeholder = "Repository name"
+        Me.TitleField.Placeholder = "Issue title"
+        Me.StateField.Text = "open"
+        Me.StateField.Placeholder = "open or closed"
+        Me.Details.IsReadOnly = True
+        Me.Results.Owner = Me
+        Me.Results.DataSource = Me.Source
+        Me.Results.AddColumn("Ticket", 70.0)
+        Me.Results.AddColumn("State", 80.0)
+        Me.Results.AddColumn("Title", 810.0)
+        Me.Results.DefaultRowHeight = 24.0
+        Me.AddSubview(Me.ForgeField)
+        Me.AddSubview(Me.APIField)
+        Me.AddSubview(Me.OwnerField)
+        Me.AddSubview(Me.RepositoryField)
+        Me.AddSubview(Me.Results)
+        Me.AddSubview(Me.TitleField)
+        Me.AddSubview(Me.StateField)
+        Me.AddSubview(Me.BodyField)
+        Me.AddSubview(Me.CommentField)
+        Me.AddSubview(Me.Details)
+        Me.AddSubview(Me.Status)
+        Me.BodyLabel.Text = "Issue body"
+        Me.CommentsLabel.Text = "URL and comments (first page)"
+        Me.CommentLabel.Text = "New comment"
+        Me.AddSubview(Me.BodyLabel)
+        Me.AddSubview(Me.CommentsLabel)
+        Me.AddSubview(Me.CommentLabel)
+        Me.AddButton("Refresh", "list")
+        Me.AddButton("Previous", "previous")
+        Me.AddButton("Next", "next")
+        Me.AddButton("New Draft", "draft")
+        Me.AddButton("Create Issue", "create")
+        Me.AddButton("Update Issue", "update")
+        Me.AddButton("Post Comment", "comment")
+        Me.AddButton("Attach to Agent", "attach")
+        Me.Status.Text = "Configure repository, then Refresh. No network request runs until you choose an action. Token: BUOY_STUDIO_TICKETS_TOKEN."
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 60
+        Me.Poller.Start()
+        Me.LayoutTickets(1050, 810)
+    End Sub
+
+    Private Sub AddButton(caption As String, command As String)
+        Dim button As New TicketButton()
+        button.Owner = Me
+        button.Caption = caption
+        button.Command = command
+        Me.Buttons.Append(button)
+        Me.AddSubview(button)
+    End Sub
+
+    Public Function IsBusy() As Boolean
+        Return Me.CurrentRequest <> Nil
+    End Function
+
+    Private Function SameRepository() As Boolean
+        Return String.Compare(Me.ForgeField.Text, Me.LoadedForge, True) = 0 And String.Compare(Me.APIField.Text, Me.LoadedAPI, True) = 0 And String.Compare(Me.OwnerField.Text, Me.LoadedOwner, True) = 0 And String.Compare(Me.RepositoryField.Text, Me.LoadedRepository, True) = 0
+    End Function
+
+    Public Sub PerformAction(command As String)
+        Try
+            If Me.IsBusy() Then Throw New InvalidArgumentException("Wait for the current request to finish.")
+            If command = "draft" Then
+                Me.SelectedTicket = Nil
+                Me.TitleField.Text = ""
+                Me.BodyField.Text = ""
+                Me.CommentField.Text = ""
+                Me.StateField.Text = "open"
+                Me.Status.Text = "New issue draft. Create Issue publishes this draft to the configured repository."
+                Return
+            End If
+            If command = "attach" Then
+                If Me.SelectedTicket = Nil Or Not Me.SameRepository() Then Throw New InvalidArgumentException("Refresh and select a ticket from this repository first.")
+                Dim link As StudioTicketsLink = Me.HostLink
+                If link = Nil Or link.Listener = Nil Then Throw New InvalidArgumentException("Agent attachment is unavailable in this host.")
+                link.Listener.TicketAttached(Me.TicketContext())
+                Me.Status.Text = "Selected ticket attached to agent context."
+                Return
+            End If
+            Dim operation As String = command
+            Dim page As Integer = Me.Page
+            If command = "previous" Then
+                page = Math.Max(1, page - 1)
+                operation = "list"
+            ElseIf command = "next" Then
+                If Not Me.HasNext Then Return
+                page += 1
+                operation = "list"
+            ElseIf command = "list" Then
+                page = 1
+            End If
+            If operation <> "list" And operation <> "create" Then
+                If Me.SelectedTicket = Nil Or Not Me.SameRepository() Then Throw New InvalidArgumentException("Refresh and select a ticket from this repository first.")
+            End If
+            If operation = "create" And Me.StateField.Text <> "open" Then Throw New InvalidArgumentException("New issues start open. Create it, then Update Issue to close it.")
+            Dim request As New StudioTicketRequest()
+            request.Operation = operation
+            request.Forge = Me.ForgeField.Text
+            request.API = Me.APIField.Text
+            request.OwnerName = Me.OwnerField.Text
+            request.Repository = Me.RepositoryField.Text
+            request.Token = Me.Token
+            request.AllowLoopback = Me.AllowLoopback
+            request.Page = page
+            request.Title = Me.TitleField.Text
+            request.Body = Me.BodyField.Text
+            request.IssueState = Me.StateField.Text
+            If Me.SelectedTicket <> Nil Then request.Number = Math.Round(Me.SelectedTicket.Value("number").AsNumber().Or(0.0))
+            If operation = "comment" Then request.Body = Me.CommentField.Text
+            StartStudioTicketRequest(request)
+            Me.CurrentRequest = request
+            Me.SetControlsBusy(True)
+            Me.Status.Text = "Request in progress… Closing hides this window; it does not cancel an accepted remote write."
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+
+    Public Sub SelectTicket(index As Integer)
+        If Me.IsBusy() Or index < 0 Or index >= Me.Source.Items.Count() Then Return
+        If Not Me.SameRepository() Then
+            Me.Status.Text = "Repository settings changed. Refresh before selecting a ticket."
+            Return
+        End If
+        Me.SelectedTicket = Me.Source.Items.ValueAt(index)
+        Me.ShowTicket(Me.SelectedTicket)
+        Me.PerformAction("get")
+    End Sub
+
+    Private Sub ShowTicket(item As JSONItem)
+        Me.TitleField.Text = item.Value("title").AsString().Or("")
+        Me.BodyField.Text = item.Value("body").AsString().Or("")
+        Me.StateField.Text = item.Value("state").AsString().Or("open")
+        Me.Details.Text = item.Value("html_url").AsString().Or("")
+    End Sub
+
+    Public Function TicketContext() As JSONItem
+        If Me.SelectedTicket = Nil Then Throw New InvalidArgumentException("Select a ticket first")
+        Dim value As JSONItem = JSONItem.NewObject()
+        value.Value("kind") = "repository-issue"
+        value.Value("forge") = Me.LoadedForge
+        value.Value("api") = Me.LoadedAPI
+        value.Value("owner") = Me.LoadedOwner
+        value.Value("repository") = Me.LoadedRepository
+        value.Value("number") = Me.SelectedTicket.Value("number")
+        value.Value("title") = Me.SelectedTicket.Value("title")
+        value.Value("body") = Me.SelectedTicket.Value("body")
+        value.Value("url") = Me.SelectedTicket.Value("html_url")
+        Return value
+    End Function
+
+    Public Sub PollTickets()
+        If Me.CurrentRequest = Nil Then Return
+        If Not Me.CurrentRequest.Work.IsComplete() Then Return
+        Dim request As StudioTicketRequest = Me.CurrentRequest
+        Me.CurrentRequest = Nil
+        Me.SetControlsBusy(False)
+        If request.ErrorText <> "" Then
+            Me.Status.Text = request.ErrorText
+            Return
+        End If
+        If request.Operation = "list" Then
+            Me.LoadedForge = request.Forge
+            Me.LoadedAPI = request.API
+            Me.LoadedOwner = request.OwnerName
+            Me.LoadedRepository = request.Repository
+            Me.Page = request.Page
+            Me.HasNext = request.HasNext
+            Me.Source.Items = request.Rows
+            Me.SelectedTicket = Nil
+            Me.Results.ReloadData()
+            Me.Status.Text = "Page " + String.From(Me.Page) + " · " + String.From(request.Rows.Count()) + " tickets."
+        ElseIf request.Operation = "comment" Then
+            Me.CommentField.Text = ""
+            Me.Status.Text = "Comment posted. Select the ticket to refresh its comments."
+        Else
+            Me.SelectedTicket = request.ResultItem
+            Me.LoadedForge = request.Forge
+            Me.LoadedAPI = request.API
+            Me.LoadedOwner = request.OwnerName
+            Me.LoadedRepository = request.Repository
+            Me.ShowTicket(Me.SelectedTicket)
+            Me.Details.Text += "\n\n" + request.Comments
+            Me.Status.Text = "Ticket #" + String.From(Math.Round(Me.SelectedTicket.Value("number").AsNumber().Or(0.0))) + " loaded. Create, Update and Post Comment publish only when clicked."
+        End If
+    End Sub
+
+    Private Sub SetControlsBusy(busy As Boolean)
+        Me.ForgeField.Enabled = Not busy
+        Me.APIField.Enabled = Not busy
+        Me.OwnerField.Enabled = Not busy
+        Me.RepositoryField.Enabled = Not busy
+        Me.TitleField.Enabled = Not busy
+        Me.StateField.Enabled = Not busy
+        Me.BodyField.Enabled = Not busy
+        Me.CommentField.Enabled = Not busy
+        Me.Results.Enabled = Not busy
+        For Each button As TicketButton In Me.Buttons
+            button.Enabled = Not busy
+        Next
+    End Sub
+
+    Public Sub LayoutTickets(width As Integer, height As Integer)
+        Me.ForgeField.Move(16, 16, 140, 28)
+        Me.APIField.Move(166, 16, width - 182, 28)
+        Me.OwnerField.Move(16, 54, 230, 28)
+        Me.RepositoryField.Move(256, 54, 230, 28)
+        For i As Integer = 0 To 2
+            Me.Buttons(i).Move(500 + i * 120, 54, 110, 28)
+        Next
+        Me.Results.Move(16, 94, width - 32, 220)
+        Me.TitleField.Move(16, 326, width - 200, 28)
+        Me.StateField.Move(width - 174, 326, 158, 28)
+        Me.BodyLabel.Move(16, 360, (width - 42) \ 2, 20)
+        Me.CommentsLabel.Move((width + 10) \ 2, 360, (width - 42) \ 2, 20)
+        Me.BodyField.Move(16, 384, (width - 42) \ 2, height - 594)
+        Me.Details.Move((width + 10) \ 2, 384, (width - 42) \ 2, height - 594)
+        Me.CommentLabel.Move(16, height - 202, width - 32, 20)
+        Me.CommentField.Move(16, height - 178, width - 32, 84)
+        For i As Integer = 3 To 7
+            Me.Buttons(i).Move(16 + (i - 3) * 180, height - 82, 170, 30)
+        Next
+        Me.Status.Move(16, height - 42, width - 32, 28)
+    End Sub
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutTickets(Math.Round(width), Math.Round(height))
+    End Handle
+
+    Handle Closing() As Boolean
+        Me.Visible = False
+        Return True
+    End Handle
+
+    Public Sub Shutdown()
+        Me.Poller.Stop()
+        Me.HostLink = Nil
+        Me.CurrentRequest = Nil
+        Me.Token = ""
+        Me.Visible = False
+        Me.IsClosed = True
+    End Sub
+
+    Public Sub Dispose()
+        Me.Shutdown()
+    End Sub
+End Class

@@ -1,0 +1,235 @@
+' Shared data-only snippet grammar. No regex, evaluation, filesystem, or app dependencies.
+Const SnippetTemplatesMaxBytes As Integer = 1048576
+
+Private Function TemplateString(value As JSONItem, key As String, limit As Integer, required As Boolean = True) As String
+    If Not value.HasKey(key) Then Throw New InvalidArgumentException("Missing template field: " + key)
+    If Not value.Value(key).IsString() Then Throw New InvalidArgumentException("Template field must be text: " + key)
+    Dim found As String = value.Value(key).AsString().Value
+    If String.LenBytes(found) > limit Then Throw New InvalidArgumentException("Template field is too large: " + key)
+    If required And String.Trim(found) = "" Then Throw New InvalidArgumentException("Template field is required: " + key)
+    ' Current runtimes cannot reliably roundtrip embedded NUL through JSON/storage.
+    For Each ch As String In String.Chars(found)
+        If String.Asc(ch) = 0 Then Throw New InvalidArgumentException("NUL is unsupported in template field: " + key)
+    Next
+    Return found
+End Function
+
+Private Function TemplateCharacter(chars As Array Of String, position As Integer) As String
+    If position < 1 Or position > chars.Count Then Return ""
+    Return chars(position - 1)
+End Function
+
+Private Function TemplateTokens(body As String) As JSONItem
+    If String.LenBytes(body) > 65536 Then Throw New InvalidArgumentException("Template body exceeds 64 KiB")
+    Dim chars As Array Of String = String.Chars(body)
+    Dim tokens As JSONItem = JSONItem.NewArray()
+    Dim literal As String = ""
+    Dim i As Integer = 1
+    Dim occurrences As Integer = 0
+    Dim finalSeen As Boolean = False
+    Dim defaults As Array Of Boolean = []
+    For n As Integer = 0 To 99
+        defaults.Append(False)
+    Next
+    While i <= chars.Count
+        Dim ch As String = TemplateCharacter(chars, i)
+        If String.Asc(ch) = 0 Then Throw New InvalidArgumentException("NUL is unsupported in template body")
+        If ch = "\\" Then
+            i += 1
+            Dim escaped As String = TemplateCharacter(chars, i)
+            If escaped <> "$" And escaped <> "\\" And escaped <> "}" Then Throw New InvalidArgumentException("Invalid template escape at character " + String.From(i - 1))
+            literal += escaped
+            i += 1
+        ElseIf ch = "$" Then
+            Dim plain As JSONItem = JSONItem.NewObject()
+            plain.Value("text") = literal
+            plain.Value("index") = -1
+            tokens.Add(plain)
+            literal = ""
+            i += 1
+            Dim braced As Boolean = TemplateCharacter(chars, i) = "{"
+            If braced Then i += 1
+            Dim digits As String = ""
+            While i <= chars.Count
+                ch = TemplateCharacter(chars, i)
+                If ch < "0" Or ch > "9" Then Exit While
+                digits += ch
+                If String.Len(digits) > 2 Then Throw New InvalidArgumentException("Placeholder index must be 0..99")
+                i += 1
+            End While
+            If digits = "" Then Throw New InvalidArgumentException("Expected a placeholder index")
+            If String.Len(digits) > 1 And String.Left(digits, 1) = "0" Then Throw New InvalidArgumentException("Leading zero in placeholder index")
+            Dim index As Integer = Integer.Parse(digits).Value
+            Dim value As String = ""
+            If braced Then
+                If index = 0 Or TemplateCharacter(chars, i) <> ":" Then Throw New InvalidArgumentException("Expected ${1:default}")
+                If defaults(index) Then Throw New InvalidArgumentException("Duplicate placeholder default")
+                defaults(index) = True
+                i += 1
+                Dim closed As Boolean = False
+                While i <= chars.Count
+                    ch = TemplateCharacter(chars, i)
+                    If ch = "}" Then
+                        closed = True
+                        i += 1
+                        Exit While
+                    End If
+                    If ch = "$" Then Throw New InvalidArgumentException("Nested placeholders are unsupported; escape literal dollars")
+                    If ch = "\\" Then
+                        i += 1
+                        ch = TemplateCharacter(chars, i)
+                        If ch <> "$" And ch <> "\\" And ch <> "}" Then Throw New InvalidArgumentException("Invalid default escape")
+                    End If
+                    If String.Asc(ch) = 0 Then Throw New InvalidArgumentException("NUL is unsupported in default")
+                    value += ch
+                    i += 1
+                End While
+                If Not closed Then Throw New InvalidArgumentException("Unclosed placeholder default")
+            End If
+            If index = 0 Then
+                If finalSeen Then Throw New InvalidArgumentException("Duplicate final caret")
+                finalSeen = True
+            End If
+            occurrences += 1
+            If occurrences > 1024 Then Throw New InvalidArgumentException("Too many placeholder occurrences")
+            Dim token As JSONItem = JSONItem.NewObject()
+            token.Value("index") = index
+            token.Value("text") = value
+            token.Value("default") = braced
+            tokens.Add(token)
+        Else
+            literal += ch
+            i += 1
+        End If
+    End While
+    Dim tail As JSONItem = JSONItem.NewObject()
+    tail.Value("text") = literal
+    tail.Value("index") = -1
+    tokens.Add(tail)
+    Return tokens
+End Function
+
+Public Function SnippetTemplateExpand(body As String) As JSONItem
+    Dim tokens As JSONItem = TemplateTokens(body)
+    Dim defaults As Array Of String = []
+    For i As Integer = 0 To 99
+        defaults.Append("")
+    Next
+    For i As Integer = 0 To tokens.Count() - 1
+        Dim token As JSONItem = tokens.ValueAt(i)
+        Dim index As Integer = token.Value("index").AsNumber().Value
+        If index > 0 Then
+            If token.Value("default").AsBoolean().Value Then defaults(index) = token.Value("text").AsString().Value
+        End If
+    Next
+    Dim text As String = ""
+    Dim caret As Integer = -1
+    Dim placeholders As JSONItem = JSONItem.NewArray()
+    For i As Integer = 0 To tokens.Count() - 1
+        Dim token As JSONItem = tokens.ValueAt(i)
+        Dim index As Integer = token.Value("index").AsNumber().Value
+        If index = 0 Then
+            caret = String.Len(text)
+        ElseIf index > 0 Then
+            Dim occurrence As JSONItem = JSONItem.NewObject()
+            occurrence.Value("index") = index
+            occurrence.Value("start") = String.Len(text)
+            occurrence.Value("length") = String.Len(defaults(index))
+            placeholders.Add(occurrence)
+            text += defaults(index)
+        Else
+            text += token.Value("text").AsString().Value
+        End If
+        If String.LenBytes(text) > 1048576 Then Throw New InvalidArgumentException("Expanded template exceeds 1 MiB")
+    Next
+    If caret < 0 Then caret = String.Len(text)
+    Dim expanded As JSONItem = JSONItem.NewObject()
+    expanded.Value("text") = text
+    expanded.Value("placeholders") = placeholders
+    expanded.Value("finalCaret") = caret
+    Return expanded
+End Function
+
+Public Sub SnippetTemplateValidate(template As JSONItem)
+    If template = Nil Then Throw New InvalidArgumentException("Expected a template object")
+    If Not template.IsObject() Then Throw New InvalidArgumentException("Expected a template object")
+    TemplateString(template, "id", 4096)
+    TemplateString(template, "name", 4096)
+    TemplateString(template, "prefix", 256)
+    TemplateString(template, "language", 256)
+    TemplateString(template, "description", 4096, False)
+    SnippetTemplateExpand(TemplateString(template, "body", 65536, False))
+End Sub
+
+Private Sub TemplateJSONBounds(content As String)
+    Dim data As Bytes = Bytes.FromString(content, Text.Encodings.UTF8)
+    Dim depth As Integer = 0
+    Dim quoted As Boolean = False
+    Dim i As Integer = 0
+    While i < data.Count
+        Dim ch As Integer = data.Item(i)
+        If ch = 0 Then Throw New InvalidArgumentException("NUL is unsupported in template JSON")
+        If quoted Then
+            If ch = 92 Then
+                If i + 5 < data.Count Then
+                    If data.Item(i + 1) = 117 And data.Item(i + 2) = 48 And data.Item(i + 3) = 48 And data.Item(i + 4) = 48 And data.Item(i + 5) = 48 Then Throw New InvalidArgumentException("NUL is unsupported in template JSON")
+                End If
+                i += 1
+            ElseIf ch = 34 Then
+                quoted = False
+            End If
+        ElseIf ch = 34 Then
+            quoted = True
+        ElseIf ch = 123 Or ch = 91 Then
+            depth += 1
+            If depth > 16 Then Throw New InvalidArgumentException("Template JSON nesting exceeds 16")
+        ElseIf ch = 125 Or ch = 93 Then
+            depth -= 1
+        End If
+        i += 1
+    End While
+End Sub
+
+Public Function SnippetTemplatesParse(content As String) As JSONItem
+    If String.LenBytes(content) > SnippetTemplatesMaxBytes Then Throw New InvalidArgumentException("Template collection exceeds 1 MiB")
+    TemplateJSONBounds(content)
+    Dim envelope As JSONItem
+    Try
+        envelope = Json.Parse(content)
+    Catch e As JSONException
+        Throw New InvalidArgumentException("Malformed template JSON: " + e.Message)
+    End Try
+    If Not envelope.IsObject() Then Throw New InvalidArgumentException("Expected a template envelope")
+    If Not envelope.Value("format").IsString() Then Throw New InvalidArgumentException("Missing template format")
+    If envelope.Value("format").AsString().Value <> "buoy.snippets" Then Throw New InvalidArgumentException("Unsupported template format")
+    If Not envelope.Value("version").IsNumber() Then Throw New InvalidArgumentException("Missing template version")
+    If envelope.Value("version").AsNumber().Value <> 1 Then Throw New InvalidArgumentException("Unsupported template version")
+    Dim entries As JSONItem = envelope.Value("templates")
+    If Not entries.IsArray() Then Throw New InvalidArgumentException("Expected templates array")
+    If entries.Count() > 256 Then Throw New InvalidArgumentException("Too many templates (maximum 256)")
+    Dim canonical As JSONItem = JSONItem.NewObject()
+    canonical.Value("format") = "buoy.snippets"
+    canonical.Value("version") = 1
+    Dim output As JSONItem = JSONItem.NewArray()
+    Dim ids As Array Of String = []
+    For i As Integer = 0 To entries.Count() - 1
+        Dim item As JSONItem = entries.ValueAt(i)
+        SnippetTemplateValidate(item)
+        Dim id As String = item.Value("id").AsString().Value
+        For Each previous As String In ids
+            If previous = id Then Throw New InvalidArgumentException("Duplicate template id: " + id)
+        Next
+        ids.Append(id)
+        Dim clean As JSONItem = JSONItem.NewObject()
+        For Each key As String In ["id", "name", "prefix", "language", "body", "description"]
+            clean.Value(key) = item.Value(key).AsString().Value
+        Next
+        output.Add(clean)
+    Next
+    canonical.Value("templates") = output
+    Return canonical
+End Function
+
+Public Function SnippetTemplatesSerialize(envelope As JSONItem) As String
+    Return Json.Stringify(SnippetTemplatesParse(Json.Stringify(envelope)))
+End Function

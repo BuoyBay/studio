@@ -1,0 +1,103 @@
+Import projectkit
+Import editorkit
+Import StudioLanguageServer
+
+''' Strict codepoint position conversion. Never clamp server edits into valid text.
+Public Function StudioShellOffset(text As String, line As Integer, column As Integer) As Integer
+    If line < 0 Or column < 0 Then Throw New InvalidArgumentException("Negative language position")
+    Dim currentLine As Integer = 0
+    Dim currentColumn As Integer = 0
+    Dim offset As Integer = 0
+    Dim previousCR As Boolean = False
+    For Each character As String In String.Chars(text)
+        If previousCR And character = "\n" Then
+            previousCR = False
+            offset += 1
+            Continue For
+        End If
+        previousCR = character = "\r"
+        If currentLine = line And currentColumn = column Then Return offset
+        If character = "\n" Or character = "\r" Then
+            If currentLine = line Then Throw New InvalidArgumentException("Language column is past line end")
+            currentLine += 1
+            currentColumn = 0
+        Else
+            currentColumn += 1
+        End If
+        offset += 1
+    Next
+    If currentLine = line And currentColumn = column Then Return offset
+    Throw New InvalidArgumentException("Language position is outside document")
+End Function
+
+Public Function StudioShellPosition(text As String, offset As Integer) As EditorPosition
+    If offset < 0 Or offset > String.Len(text) Then Throw New InvalidArgumentException("Selection outside document")
+    Dim line As Integer = 0
+    Dim column As Integer = 0
+    If offset > 0 And offset < String.Len(text) Then
+        If String.Substring(text, offset - 1, 2) = "\r\n" Then Throw New InvalidArgumentException("Selection splits CRLF")
+    End If
+    Dim previousCR As Boolean = False
+    For Each character As String In String.Chars(String.Left(text, offset))
+        If previousCR And character = "\n" Then
+            previousCR = False
+            Continue For
+        End If
+        previousCR = character = "\r"
+        If character = "\n" Or character = "\r" Then
+            line += 1
+            column = 0
+        Else
+            column += 1
+        End If
+    Next
+    Return New EditorPosition(line, column)
+End Function
+
+Public Function StudioShellReadDisk(filePath As String) As String
+    Dim file As New FileSystemItem(filePath)
+    If Not file.IsFile() Or file.Length() > 8388608 Then Throw New InvalidArgumentException("Language disk snapshot unavailable: " + filePath)
+    Dim content As Result Of String, String = file.ReadAllText()
+    If content.IsErr Then Throw New InvalidArgumentException(content.Error)
+    If Bytes.FromString(content.Value, Text.Encodings.UTF8).Count <> file.Length() Then Throw New InvalidArgumentException("Language disk snapshot is not lossless UTF-8")
+    Return content.Value
+End Function
+
+''' ProjectKit validates UTF-8 boundaries and rejects overlapping/ambiguous ranges
+''' while constructing all changes, before its single atomic approval state swap.
+Public Function StudioShellLanguageRequests(workspace As ProjectWorkspace, paths As Map Of String, String, edits As Array Of StudioLanguageLocation) As Array Of ProjectChangeRequest
+    If Array.Count(edits) = 0 Or Array.Count(edits) > 4096 Then Throw New InvalidArgumentException("Language edit count outside 1..4096")
+    Dim grouped As New Map Of String, Array Of EditorEdit()
+    Dim identities As Array Of String = []
+    For Each location As StudioLanguageLocation In edits
+        If location = Nil Or location.Path = "" Then Throw New InvalidArgumentException("Language edit has no path")
+        Dim found As String = ""
+        For Each item As ProjectItem In workspace.Items()
+            If Not paths.ContainsKey(item.Id) Then Continue For
+            If String.Compare(String.Replace(paths.Get(item.Id).Value, "\\", "/", True), String.Replace(location.Path, "\\", "/", True), True) = 0 Then
+                If found <> "" Then Throw New InvalidArgumentException("Ambiguous language document identity")
+                found = item.Id
+            End If
+        Next
+        If found = "" Then Throw New InvalidArgumentException("Language edit targets an unopened path: " + location.Path)
+        Dim item As ProjectItem = workspace.ReadItem(found)
+        If item.Kind <> "source" Then Throw New InvalidArgumentException("Language edit targets an auxiliary document")
+        Dim first As Integer = StudioShellOffset(item.Text, location.Line, location.Column)
+        Dim last As Integer = StudioShellOffset(item.Text, location.EndLine, location.EndColumn)
+        If last < first Then Throw New InvalidArgumentException("Reversed language range")
+        Dim startByte As Integer = Bytes.FromString(String.Left(item.Text, first), Text.Encodings.UTF8).Count
+        Dim endByte As Integer = Bytes.FromString(String.Left(item.Text, last), Text.Encodings.UTF8).Count
+        If Not grouped.ContainsKey(found) Then
+            Dim empty As Array Of EditorEdit = []
+            grouped.Set(found, empty)
+            identities.Append(found)
+        End If
+        Dim changes As Array Of EditorEdit = grouped.Get(found).Value
+        changes.Append(New EditorEdit(startByte, endByte, location.NewText))
+    Next
+    Dim requests As Array Of ProjectChangeRequest = []
+    For Each id As String In identities
+        requests.Append(New ProjectChangeRequest(id, workspace.ReadItem(id).Version, grouped.Get(id).Value))
+    Next
+    Return requests
+End Function

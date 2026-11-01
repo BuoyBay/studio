@@ -1,0 +1,183 @@
+Import StudioScriptSettings
+Import StudioAgentScript
+Import StudioCompletionSettings
+Import StudioCompletionHTTP
+
+Private Class PreferencesSave Inherits Button
+    Public Property Owner As Weak StudioPreferencesWindow
+    Handle Action()
+        Dim owner As StudioPreferencesWindow = Me.Owner
+        If owner <> Nil Then owner.Save()
+    End Handle
+End Class
+
+Private Class CompletionLogin Inherits Button
+    Public Property Owner As Weak StudioPreferencesWindow
+    Handle Action()
+        Dim owner As StudioPreferencesWindow = Me.Owner
+        If owner <> Nil Then
+            owner.Save()
+            If owner.Saved Then StudioCompletionSettings.LoginRequested = True
+        End If
+    End Handle
+End Class
+
+Public Class StudioPreferencesWindow Inherits Window
+    Public Property Scripting As Checkbox = New Checkbox()
+    Public Property Runner As TextField = New TextField()
+    Private Property Explanation As Label = New Label()
+    Private Property RunnerLabel As Label = New Label()
+    Private Property Status As Label = New Label()
+    Private Property ApplyButton As PreferencesSave = New PreferencesSave()
+    Public Property Saved As Boolean = False
+    Private Property Domain As String
+    Private Property CompletionProvider As ComboBox = New ComboBox()
+    Private Property CompletionAutomatic As Checkbox = New Checkbox()
+    Private Property CodestralModel As TextField = New TextField()
+    Private Property OllamaModel As TextField = New TextField()
+    Private Property CodestralBase As TextField = New TextField()
+    Private Property OllamaBase As TextField = New TextField()
+    Private Property TabbyBase As TextField = New TextField()
+    Private Property CopilotPath As TextField = New TextField()
+    Private Property CopilotLogin As CompletionLogin = New CompletionLogin()
+    Private Property CompletionStatus As Label = New Label()
+
+    Private Sub CompletionField(caption As String, field As TextField, y As Integer)
+        Dim label As New Label()
+        label.Text = caption
+        label.Move(20, y, 210, 26)
+        field.Move(235, y, 425, 28)
+        field.AccessibleLabel = caption
+        Me.AddSubview(label)
+        Me.AddSubview(field)
+    End Sub
+
+    Public Sub UpdateCompletionStatus()
+        Me.CompletionStatus.Text = StudioCompletionSettings.Status
+    End Sub
+
+    Public Sub Constructor(domain As String)
+        Me.Domain = domain
+        Me.Title = "Settings / Preferences"
+        Me.Move(180, 140, 680, 720)
+        Me.Scripting.Caption = "Enable BuoyScript for agents and the Scripts playground"
+        Me.Scripting.Move(20, 24, 640, 28)
+        Me.Explanation.Text = "Script edits use project proposals and shared Undo. Scripts run with your OS privileges."
+        Me.Explanation.Move(20, 68, 640, 48)
+        Me.RunnerLabel.Text = "Runner executable (leave empty to use the bundled helper)"
+        Me.RunnerLabel.Move(20, 124, 640, 24)
+        Me.Runner.Move(20, 154, 640, 28)
+        Me.Status.Move(20, 196, 640, 48)
+        Me.ApplyButton.Caption = "Save"
+        Me.ApplyButton.Owner = Me
+        Me.ApplyButton.Move(560, 670, 100, 28)
+        Me.AddSubview(Me.Scripting)
+        Me.AddSubview(Me.Explanation)
+        Me.AddSubview(Me.RunnerLabel)
+        Me.AddSubview(Me.Runner)
+        Me.AddSubview(Me.Status)
+        Me.AddSubview(Me.ApplyButton)
+        Me.CompletionProvider.Move(20, 252, 300, 28)
+        For Each title As String In ["Autocomplete off", "GitHub Copilot", "Codestral", "Ollama (local)", "Tabby", "Selected chat agent (compatibility)"]
+            Me.CompletionProvider.AddItem(title)
+        Next
+        Me.CompletionProvider.AccessibleLabel = "Autocomplete provider (independent of chat agent)"
+        Me.CompletionAutomatic.Caption = "Suggest automatically while typing"
+        Me.CompletionAutomatic.Move(330, 252, 330, 28)
+        Me.AddSubview(Me.CompletionProvider)
+        Me.AddSubview(Me.CompletionAutomatic)
+        Me.CompletionField("Copilot server executable", Me.CopilotPath, 298)
+        Me.CompletionField("Codestral model", Me.CodestralModel, 338)
+        Me.CompletionField("Codestral server URL", Me.CodestralBase, 378)
+        Me.CompletionField("Ollama FIM model", Me.OllamaModel, 418)
+        Me.CompletionField("Ollama server URL", Me.OllamaBase, 458)
+        Me.CompletionField("Tabby server URL", Me.TabbyBase, 498)
+        Me.CopilotLogin.Caption = "Sign in to Copilot"
+        Me.CopilotLogin.Owner = Me
+        Me.CopilotLogin.Move(20, 542, 190, 28)
+        Me.CompletionStatus.Move(20, 578, 640, 60)
+        Me.AddSubview(Me.CopilotLogin)
+        Me.AddSubview(Me.CompletionStatus)
+        Me.Reload()
+    End Sub
+
+    Public Sub Reload()
+        Me.Scripting.Value = Checkbox.CheckState.False
+        If StudioScriptSettings.Enabled Then Me.Scripting.Value = Checkbox.CheckState.True
+        Me.Runner.Text = StudioScriptSettings.RunnerPath
+        Dim ids As Array Of String = ["off", "copilot", "codestral", "ollama", "tabby", "agent"]
+        Me.CompletionProvider.SelectedIndex = 0
+        For i As Integer = 0 To Array.Count(ids) - 1
+            If ids(i) = StudioCompletionSettings.Provider Then Me.CompletionProvider.SelectedIndex = i
+        Next
+        Me.CompletionAutomatic.Value = If(StudioCompletionSettings.Automatic, Checkbox.CheckState.True, Checkbox.CheckState.False)
+        Me.CodestralModel.Text = StudioCompletionSettings.CodestralModel
+        Me.OllamaModel.Text = StudioCompletionSettings.OllamaModel
+        Me.CodestralBase.Text = StudioCompletionSettings.CodestralBase
+        Me.OllamaBase.Text = StudioCompletionSettings.OllamaBase
+        Me.TabbyBase.Text = StudioCompletionSettings.TabbyBase
+        Me.CopilotPath.Text = StudioCompletionSettings.CopilotExecutable
+        Me.UpdateCompletionStatus()
+        Me.Status.Text = "BuoyScript enabled by default"
+        If Not StudioScriptSettings.Enabled Then
+            Me.Status.Text = "BuoyScript disabled"
+        ElseIf Not StudioScriptRunnerAvailable(StudioScriptRunnerPath()) Then
+            Me.Status.Text = "Runner unavailable for this installation. Select a matching native helper."
+        End If
+    End Sub
+
+    Public Sub Save()
+        Me.Saved = False
+        Dim ids As Array Of String = ["off", "copilot", "codestral", "ollama", "tabby", "agent"]
+        Dim selected As Integer = Me.CompletionProvider.SelectedIndex
+        If selected < 0 Or selected >= Array.Count(ids) Then
+            Me.Status.Text = "Select an autocomplete provider from the list"
+            Return
+        End If
+        Try
+            If ids(selected) = "codestral" Or String.Trim(Me.CodestralBase.Text) <> "" Then
+                Dim checkedCodestral As String = StudioCompletionBase(String.Trim(Me.CodestralBase.Text))
+            End If
+            If ids(selected) = "ollama" Or String.Trim(Me.OllamaBase.Text) <> "" Then
+                Dim checkedOllama As String = StudioCompletionBase(String.Trim(Me.OllamaBase.Text))
+            End If
+            If ids(selected) = "tabby" Or String.Trim(Me.TabbyBase.Text) <> "" Then
+                Dim checkedTabby As String = StudioCompletionBase(String.Trim(Me.TabbyBase.Text))
+            End If
+        Catch e As Exception
+            Me.Status.Text = e.Message
+            Return
+        End Try
+        If ids(selected) = "ollama" And String.Trim(Me.OllamaModel.Text) = "" Then
+            Me.Status.Text = "Choose an installed fill-in-the-middle model for Ollama"
+            Return
+        End If
+        Dim enabled As Boolean = Me.Scripting.Value = Checkbox.CheckState.True
+        Dim runner As String = String.Trim(Me.Runner.Text)
+        If enabled And runner <> "" And Not StudioScriptRunnerAvailable(runner) Then
+            Me.Status.Text = "Choose an existing absolute runner executable path, or leave it empty."
+            Return
+        End If
+        If Not enabled Or runner <> StudioScriptSettings.RunnerPath Then StudioAgentScript.StopActive()
+        StudioScriptSettings.Enabled = enabled
+        StudioScriptSettings.RunnerPath = runner
+        StudioScriptSettings.Save(Me.Domain)
+        StudioCompletionSettings.Provider = ids(selected)
+        StudioCompletionSettings.Automatic = Me.CompletionAutomatic.Value = Checkbox.CheckState.True
+        StudioCompletionSettings.CodestralModel = String.Trim(Me.CodestralModel.Text)
+        StudioCompletionSettings.OllamaModel = String.Trim(Me.OllamaModel.Text)
+        StudioCompletionSettings.CodestralBase = String.Trim(Me.CodestralBase.Text)
+        StudioCompletionSettings.OllamaBase = String.Trim(Me.OllamaBase.Text)
+        StudioCompletionSettings.TabbyBase = String.Trim(Me.TabbyBase.Text)
+        StudioCompletionSettings.CopilotExecutable = String.Trim(Me.CopilotPath.Text)
+        StudioCompletionSettings.Save(Me.Domain)
+        Me.Reload()
+        Me.Saved = True
+        Me.Status.Text = "Preferences saved"
+    End Sub
+
+    Handle Closing() As Boolean
+        Me.Visible = False
+        Return True
+    End Handle
+End Class

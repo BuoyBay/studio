@@ -1,0 +1,38 @@
+''' Completion preferences are independent of the agent selected in Chat.
+Public Class StudioCompletionSettings
+    Public Shared Property Provider As String = "off"
+    Public Shared Property Automatic As Boolean = False
+    Public Shared Property CodestralModel As String = "codestral-latest"
+    Public Shared Property OllamaModel As String = ""
+    Public Shared Property CodestralBase As String = "https://api.mistral.ai"
+    Public Shared Property OllamaBase As String = "http://localhost:11434"
+    Public Shared Property TabbyBase As String = "http://localhost:8080"
+    Public Shared Property CopilotExecutable As String = ""
+    Public Shared Property Generation As Integer = 0
+    Public Shared Property LoginRequested As Boolean = False
+    Public Shared Property Status As String = ""
+
+    Public Shared Sub Load(domain As String)
+        StudioCompletionSettings.Provider = Prefs.Get(domain, "completion.provider", "off")
+        StudioCompletionSettings.Automatic = Prefs.Get(domain, "completion.automatic", False)
+        StudioCompletionSettings.CodestralModel = Prefs.Get(domain, "completion.codestralModel", "codestral-latest")
+        StudioCompletionSettings.OllamaModel = Prefs.Get(domain, "completion.ollamaModel", "")
+        StudioCompletionSettings.CodestralBase = Prefs.Get(domain, "completion.codestralBase", "https://api.mistral.ai")
+        StudioCompletionSettings.OllamaBase = Prefs.Get(domain, "completion.ollamaBase", "http://localhost:11434")
+        StudioCompletionSettings.TabbyBase = Prefs.Get(domain, "completion.tabbyBase", "http://localhost:8080")
+        StudioCompletionSettings.CopilotExecutable = Prefs.Get(domain, "completion.copilotExecutable", "")
+    End Sub
+
+    Public Shared Sub Save(domain As String)
+        Prefs.Set(domain, "completion.provider", StudioCompletionSettings.Provider)
+        Prefs.Set(domain, "completion.automatic", StudioCompletionSettings.Automatic)
+        Prefs.Set(domain, "completion.codestralModel", StudioCompletionSettings.CodestralModel)
+        Prefs.Set(domain, "completion.ollamaModel", StudioCompletionSettings.OllamaModel)
+        Prefs.Set(domain, "completion.codestralBase", StudioCompletionSettings.CodestralBase)
+        Prefs.Set(domain, "completion.ollamaBase", StudioCompletionSettings.OllamaBase)
+        Prefs.Set(domain, "completion.tabbyBase", StudioCompletionSettings.TabbyBase)
+        Prefs.Set(domain, "completion.copilotExecutable", StudioCompletionSettings.CopilotExecutable)
+        StudioCompletionSettings.Generation += 1
+    End Sub
+End Class
+

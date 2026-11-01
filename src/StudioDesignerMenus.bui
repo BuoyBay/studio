@@ -1,0 +1,289 @@
+Import layoutcanvas
+
+' Menubar and toolbar wiring for the layout designer.
+'
+' Every designer menu item carries a tag "design:<command>" or "edit:<command>"
+' where <command> is a LayoutEditor command name (align-left, bring-to-front,
+' zoom-in, show-grid, ...). StudioWindow routes design:* to the designer and edit:*
+' to the designer in Design mode. StudioDesignerMenus remembers each item so the
+' window can refresh Enabled/Checked from LayoutEditor.CanPerformCommand and
+' CommandChecked whenever the designer reports a state change.
+'
+' Shortcut policy (verified on GTK under Xvfb with synthetic key events):
+' - A menubar shortcut wins over the focused native text field, and an item's
+'   Enabled = False does not stop its shortcut firing. Text-editing chords
+'   (Primary+X/C/V/A, Delete, arrows) are therefore NOT bound in GTK's menubar: they
+'   keep working in the Inspector, filter, composer and source editor, and the
+'   focused design canvas handles them itself.
+' - Primary+Shift+<key> menubar shortcuts do not fire on Linux in Buoy 0.72, so the
+'   z-order chords use Primary+Alt there instead of Primary+Shift.
+
+''' Platform primary modifier: Cmd on macOS, Ctrl elsewhere.
+Public Function StudioPrimary(key As String) As String
+    #If TargetMac Then
+        Return "Cmd+" + key
+    #Else
+        Return "Ctrl+" + key
+    #End If
+End Function
+
+''' Primary+Shift+key on macOS/Windows; Primary+Alt+key on Linux (see policy above).
+Public Function StudioPrimaryShifted(key As String) As String
+    #If TargetLinux Then
+        Return "Ctrl+Alt+" + key
+    #ElseIf TargetMac Then
+        Return "Cmd+Shift+" + key
+    #Else
+        Return "Ctrl+Shift+" + key
+    #End If
+End Function
+
+''' The LayoutEditor command behind a menu/toolbar tag, or "" for Studio actions.
+Public Function StudioDesignerCommand(tag As String) As String
+    If String.StartsWith(tag, "design:") Then Return String.Substring(tag, 7)
+    If String.StartsWith(tag, "edit:") Then Return String.Substring(tag, 5)
+    Return ""
+End Function
+
+''' Toolbar glyphs for designer commands, drawn on the same 24 px stroke grid as the
+''' generated Studio icon set (StudioGlyphs) and tinted the same way.
+Public Function StudioDesignerGlyphSource(key As String) As String
+    Dim body As String = ""
+    Select Case key
+        Case "align-left"
+            body = "<path d=\"M4 3v18\"/><rect x=\"7\" y=\"6\" width=\"12\" height=\"4\" rx=\"1\"/><rect x=\"7\" y=\"14\" width=\"8\" height=\"4\" rx=\"1\"/>"
+        Case "align-hcenter"
+            body = "<path d=\"M12 3v3M12 10v4M12 18v3\"/><rect x=\"5\" y=\"6\" width=\"14\" height=\"4\" rx=\"1\"/><rect x=\"8\" y=\"14\" width=\"8\" height=\"4\" rx=\"1\"/>"
+        Case "align-right"
+            body = "<path d=\"M20 3v18\"/><rect x=\"5\" y=\"6\" width=\"12\" height=\"4\" rx=\"1\"/><rect x=\"9\" y=\"14\" width=\"8\" height=\"4\" rx=\"1\"/>"
+        Case "align-top"
+            body = "<path d=\"M3 4h18\"/><rect x=\"6\" y=\"7\" width=\"4\" height=\"12\" rx=\"1\"/><rect x=\"14\" y=\"7\" width=\"4\" height=\"8\" rx=\"1\"/>"
+        Case "align-vcenter"
+            body = "<path d=\"M3 12h3M10 12h4M18 12h3\"/><rect x=\"6\" y=\"5\" width=\"4\" height=\"14\" rx=\"1\"/><rect x=\"14\" y=\"8\" width=\"4\" height=\"8\" rx=\"1\"/>"
+        Case "align-bottom"
+            body = "<path d=\"M3 20h18\"/><rect x=\"6\" y=\"5\" width=\"4\" height=\"12\" rx=\"1\"/><rect x=\"14\" y=\"9\" width=\"4\" height=\"8\" rx=\"1\"/>"
+        Case "distribute-hcenter"
+            body = "<path d=\"M3 4v16M21 4v16\"/><rect x=\"6.5\" y=\"7\" width=\"4\" height=\"10\" rx=\"1\"/><rect x=\"13.5\" y=\"7\" width=\"4\" height=\"10\" rx=\"1\"/>"
+        Case "distribute-vcenter"
+            body = "<path d=\"M4 3h16M4 21h16\"/><rect x=\"7\" y=\"6.5\" width=\"10\" height=\"4\" rx=\"1\"/><rect x=\"7\" y=\"13.5\" width=\"10\" height=\"4\" rx=\"1\"/>"
+        Case "preview"
+            body = "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M3 8h18\"/><path d=\"M10.5 11.25v5.5l4.5-2.75z\"/>"
+        Case "canvas-appearance"
+            body = "<circle cx=\"12\" cy=\"12\" r=\"8\"/><path d=\"M12 4a8 8 0 0 1 0 16z\" fill=\"currentColor\"/>"
+    End Select
+    If body = "" Then Return ""
+    Return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"24\" height=\"24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\">" + body + "</svg>"
+End Function
+
+Public Function StudioDesignerGlyph(key As String, sizePx As Integer, dark As Boolean) As Picture
+    Dim source As String = StudioDesignerGlyphSource(key)
+    If source = "" Then Return Nil
+    Dim tint As String = "#3c3c43"
+    If dark Then tint = "#e8e8e8"
+    Try
+        Return Picture.FromSVG(Bytes.FromString(String.Replace(source, "currentColor", tint), Text.Encodings.UTF8), sizePx, sizePx)
+    Catch e As Exception
+        Return Nil
+    End Try
+End Function
+
+''' One tracked menu item.
+Public Class StudioCommandEntry
+    Public Property Item As MenuItem
+    Public Property Command As String
+    Public Property Toggle As Boolean
+End Class
+
+''' Builds the designer's menus and keeps their state in sync.
+Public Class StudioDesignerMenus
+    Public Property Entries As Array Of StudioCommandEntry = []
+    ''' Every designer command that appears in a menu, in menu order.
+    Public Property Commands As Array Of String = []
+    Public Property ToolbarButtons As Array Of ToolbarButton = []
+    Public Property ToolbarCommands As Array Of String = []
+
+    Private Function Make(caption As String, tag As String, shortcut As String, toggle As Boolean) As MenuItem
+        Dim item As New MenuItem()
+        item.Caption = caption
+        item.Tag = tag
+        If shortcut <> "" Then item.Shortcut = shortcut
+        Dim command As String = StudioDesignerCommand(tag)
+        If command <> "" Then
+            Dim entry As New StudioCommandEntry()
+            entry.Item = item
+            entry.Command = command
+            entry.Toggle = toggle
+            Me.Entries.Append(entry)
+            Me.Commands.Append(command)
+        End If
+        Return item
+    End Function
+
+    ''' Appends a top-level item to a menu.
+    Public Function Add(menu As Menu, caption As String, tag As String, shortcut As String, toggle As Boolean = False) As MenuItem
+        Dim item As MenuItem = Me.Make(caption, tag, shortcut, toggle)
+        menu.AddItem(item)
+        Return item
+    End Function
+
+    ''' Appends an item to a submenu parent.
+    Public Function AddChild(parent As MenuItem, caption As String, tag As String, shortcut As String, toggle As Boolean = False) As MenuItem
+        Dim item As MenuItem = Me.Make(caption, tag, shortcut, toggle)
+        parent.AddMenuItem(item)
+        Return item
+    End Function
+
+    Private Function Submenu(caption As String) As MenuItem
+        Dim parent As New MenuItem()
+        parent.Caption = caption
+        parent.Tag = ""
+        Return parent
+    End Function
+
+    ''' Designer part of the Edit menu (after Undo/Redo).
+    Public Sub BuildEdit(menu As Menu)
+        menu.AddSeparator()
+        Me.Add(menu, "Cut", "edit:cut", "")
+        Me.Add(menu, "Copy", "edit:copy", "")
+        Me.Add(menu, "Paste", "edit:paste", "")
+        Me.Add(menu, "Duplicate", "edit:duplicate", StudioPrimary("D"))
+        Me.Add(menu, "Delete", "edit:delete", "")
+        menu.AddSeparator()
+        Me.Add(menu, "Select All Controls", "edit:select-all", "")
+        #If TargetMac Then
+            ' AppKit needs menu key equivalents for NSTextView's standard editing
+            ' chords. Studio routes these to the focused native text responder first.
+            Me.Find("cut").Shortcut = "Cmd+X"
+            Me.Find("copy").Shortcut = "Cmd+C"
+            Me.Find("paste").Shortcut = "Cmd+V"
+            Me.Find("select-all").Shortcut = "Cmd+A"
+        #End If
+        Me.Add(menu, "Deselect All", "edit:deselect", "")
+        Me.Add(menu, "Select Parent", "design:select-parent", "")
+    End Sub
+
+    ''' The Arrange menu: alignment, distribution, spacing, size, order, embedding.
+    Public Sub BuildArrange(menu As Menu)
+        Dim align As MenuItem = Me.Submenu("Align")
+        Me.AddChild(align, "Left Edges", "design:align-left", "")
+        Me.AddChild(align, "Horizontal Centers", "design:align-hcenter", "")
+        Me.AddChild(align, "Right Edges", "design:align-right", "")
+        align.AddSeparator()
+        Me.AddChild(align, "Top Edges", "design:align-top", "")
+        Me.AddChild(align, "Vertical Centers", "design:align-vcenter", "")
+        Me.AddChild(align, "Bottom Edges", "design:align-bottom", "")
+        align.AddSeparator()
+        Me.AddChild(align, "Align to Selection", "design:align-to-selection", "", True)
+        Me.AddChild(align, "Align to Key Object", "design:align-to-key", "", True)
+        Me.AddChild(align, "Align to Container", "design:align-to-parent", "", True)
+        menu.AddItem(align)
+        Dim center As MenuItem = Me.Submenu("Center in Container")
+        Me.AddChild(center, "Horizontally", "design:center-horizontally", "")
+        Me.AddChild(center, "Vertically", "design:center-vertically", "")
+        menu.AddItem(center)
+        Dim distribute As MenuItem = Me.Submenu("Distribute")
+        Me.AddChild(distribute, "Left Edges", "design:distribute-left", "")
+        Me.AddChild(distribute, "Horizontal Centers", "design:distribute-hcenter", "")
+        Me.AddChild(distribute, "Right Edges", "design:distribute-right", "")
+        distribute.AddSeparator()
+        Me.AddChild(distribute, "Top Edges", "design:distribute-top", "")
+        Me.AddChild(distribute, "Vertical Centers", "design:distribute-vcenter", "")
+        Me.AddChild(distribute, "Bottom Edges", "design:distribute-bottom", "")
+        menu.AddItem(distribute)
+        Dim spacing As MenuItem = Me.Submenu("Spacing")
+        Me.AddChild(spacing, "Make Horizontal Spacing Equal", "design:space-horizontal-equal", "")
+        Me.AddChild(spacing, "Increase Horizontal Spacing", "design:space-horizontal-increase", "")
+        Me.AddChild(spacing, "Decrease Horizontal Spacing", "design:space-horizontal-decrease", "")
+        Me.AddChild(spacing, "Remove Horizontal Spacing", "design:space-horizontal-remove", "")
+        spacing.AddSeparator()
+        Me.AddChild(spacing, "Make Vertical Spacing Equal", "design:space-vertical-equal", "")
+        Me.AddChild(spacing, "Increase Vertical Spacing", "design:space-vertical-increase", "")
+        Me.AddChild(spacing, "Decrease Vertical Spacing", "design:space-vertical-decrease", "")
+        Me.AddChild(spacing, "Remove Vertical Spacing", "design:space-vertical-remove", "")
+        menu.AddItem(spacing)
+        Dim size As MenuItem = Me.Submenu("Size")
+        Me.AddChild(size, "Same Width", "design:size-same-width", "")
+        Me.AddChild(size, "Same Height", "design:size-same-height", "")
+        Me.AddChild(size, "Same Size", "design:size-same-size", "")
+        size.AddSeparator()
+        Me.AddChild(size, "Size to Default", "design:size-to-default", "")
+        menu.AddItem(size)
+        menu.AddSeparator()
+        Dim order As MenuItem = Me.Submenu("Order")
+        Me.AddChild(order, "Bring to Front", "design:bring-to-front", StudioPrimaryShifted("]"))
+        Me.AddChild(order, "Bring Forward", "design:bring-forward", StudioPrimary("]"))
+        Me.AddChild(order, "Send Backward", "design:send-backward", StudioPrimary("["))
+        Me.AddChild(order, "Send to Back", "design:send-to-back", StudioPrimaryShifted("["))
+        menu.AddItem(order)
+        menu.AddSeparator()
+        Me.Add(menu, "Embed in View", "design:embed-in-view", StudioPrimary("Alt+E"))
+        Me.Add(menu, "Unembed", "design:unembed", "")
+        menu.AddSeparator()
+        Dim nudge As MenuItem = Me.Submenu("Nudge")
+        Me.AddChild(nudge, "Left", "design:nudge-left", "")
+        Me.AddChild(nudge, "Right", "design:nudge-right", "")
+        Me.AddChild(nudge, "Up", "design:nudge-up", "")
+        Me.AddChild(nudge, "Down", "design:nudge-down", "")
+        nudge.AddSeparator()
+        Me.AddChild(nudge, "Left by 10", "design:nudge-left-large", "")
+        Me.AddChild(nudge, "Right by 10", "design:nudge-right-large", "")
+        Me.AddChild(nudge, "Up by 10", "design:nudge-up-large", "")
+        Me.AddChild(nudge, "Down by 10", "design:nudge-down-large", "")
+        menu.AddItem(nudge)
+    End Sub
+
+    ''' Designer part of the View menu: zoom and canvas overlays.
+    Public Sub BuildViewCanvas(menu As Menu)
+        Me.Add(menu, "Zoom In", "design:zoom-in", StudioPrimary("="))
+        Me.Add(menu, "Zoom Out", "design:zoom-out", StudioPrimary("-"))
+        Me.Add(menu, "Actual Size", "design:zoom-actual", StudioPrimary("0"))
+        Me.Add(menu, "Zoom to Fit", "design:zoom-fit", StudioPrimary("9"))
+        menu.AddSeparator()
+        Me.Add(menu, "Show Grid", "design:show-grid", StudioPrimary("Alt+G"), True)
+        Me.Add(menu, "Snap to Grid", "design:snap-to-grid", "", True)
+        Me.Add(menu, "Smart Guides", "design:smart-guides", "", True)
+        Me.Add(menu, "Show Bounds", "design:show-bounds", StudioPrimary("Alt+B"), True)
+        Me.Add(menu, "Show Spacing", "design:show-spacing", "", True)
+    End Sub
+
+    ''' Designer panel toggles, appended to the View menu's panel group.
+    Public Sub BuildViewPanels(menu As Menu)
+        Me.Add(menu, "Show or Hide Inspector", "design:toggle-inspector", StudioPrimary("Alt+4"))
+        Me.Add(menu, "Show or Hide Tool Palette", "design:toggle-palette", StudioPrimary("Alt+5"))
+    End Sub
+
+    ''' Appends a designer command button to the window toolbar.
+    Public Function AddToolbar(bar As Toolbar, command As String, caption As String, tooltip As String, icon As Picture) As ToolbarButton
+        Dim button As ToolbarButton = bar.AddButton("design:" + command, caption, icon)
+        button.Tooltip = tooltip
+        Me.ToolbarButtons.Append(button)
+        Me.ToolbarCommands.Append(command)
+        Return button
+    End Function
+
+    ''' Refreshes every tracked item. Outside Design mode all designer items disable.
+    Public Sub Sync(designer As LayoutEditor, designMode As Boolean)
+        For Each entry As StudioCommandEntry In Me.Entries
+            Dim enabled As Boolean = False
+            Dim checked As Boolean = False
+            If designMode And designer <> Nil Then
+                enabled = designer.CanPerformCommand(entry.Command)
+                If entry.Toggle Then checked = designer.CommandChecked(entry.Command)
+            End If
+            If entry.Item.Enabled <> enabled Then entry.Item.Enabled = enabled
+            If entry.Toggle And entry.Item.Checked <> checked Then entry.Item.Checked = checked
+        Next
+        For i As Integer = 0 To Array.Count(Me.ToolbarButtons) - 1
+            Dim available As Boolean = False
+            If designMode And designer <> Nil Then available = designer.CanPerformCommand(Me.ToolbarCommands(i))
+            If Me.ToolbarButtons(i).Enabled <> available Then Me.ToolbarButtons(i).Enabled = available
+        Next
+    End Sub
+
+    Public Function Find(command As String) As MenuItem
+        For Each entry As StudioCommandEntry In Me.Entries
+            If String.Compare(entry.Command, command, True) = 0 Then Return entry.Item
+        Next
+        Return Nil
+    End Function
+End Class

@@ -1,0 +1,153 @@
+{
+  "host": "m4-casa, macOS arm64",
+  "compiler": "Buoy 0.72.0",
+  "adapter": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap",
+  "adapterVersion": "lldb-2103.0.34.407 / Apple Swift version 6.4.2",
+  "classification": "Resolved host authorization prerequisite plus fixed local debugger source-path mapping bug; no demonstrated Buoy compiler defect",
+  "standaloneControl": {
+    "compilerCommand": [
+      "/usr/bin/xcrun",
+      "clang",
+      "-g",
+      "-O0",
+      "control.c",
+      "-o",
+      "control"
+    ],
+    "source": "int main(void){volatile int answer=42;return answer==42?0:1;}\n",
+    "sourceSha256": "89eac9c8c4014ef0c58418ed9e2de8e76b1c100630070aace8e8dfd8c4ba02d5",
+    "result": [
+      {
+        "type": "state",
+        "state": "initializing"
+      },
+      {
+        "type": "error",
+        "message": "launch: process exited with status -1 (this is a non-interactive debug session, cannot get permission to debug processes.)"
+      },
+      {
+        "type": "state",
+        "state": "failed"
+      },
+      {
+        "type": "state",
+        "state": "stopped",
+        "reason": "",
+        "threadId": 0
+      },
+      {
+        "type": "error",
+        "message": "threads: failed to retrieve threads from process"
+      },
+      {
+        "type": "state",
+        "state": "disconnected"
+      }
+    ]
+  },
+  "guiControl": {
+    "launch": "open -n --stdout LOG --stderr LOG --env BUOY_STUDIO_DEBUG_HELPER=... --env BUOY_STUDIO_DEBUG_ADAPTER=... DebuggerHarness.app",
+    "result": "STUDIO DEBUGGER WINDOW FAILED: debugger window timed out: disconnected  \u00b7 session ended Debugger initialization timed out",
+    "stderr": "",
+    "interpretation": "The LaunchServices harness did not establish successful debugging; a pending authorization request is possible but not confirmed."
+  },
+  "readOnlyPolicyCheck": {
+    "command": [
+      "/usr/sbin/DevToolsSecurity",
+      "-status"
+    ],
+    "output": "Developer mode is currently disabled.",
+    "userInDeveloperGroup": true
+  },
+  "localFixes": [
+    "Retain structured DAP body.error.format and variables in visible errors.",
+    "Do not let a spurious stopped event replace failed launch state.",
+    "Fail native GUI test immediately on explicit failed state."
+  ],
+  "nativeMacVerdict": "PASS: all eight debugger tests, all six-target module/harness checks, and actual native debugger-window callbacks",
+  "nextStep": "Root integrates frozen helper/tests/docs into its isolated Studio build and delivery; no further debugger OS authorization changes required for this tested host.",
+  "nativeCLIControl": {
+    "command": [
+      "/usr/bin/xcrun",
+      "lldb",
+      "-b",
+      "-o",
+      "run",
+      "-o",
+      "quit",
+      "/tmp/buoy-debugger-mac-control/control"
+    ],
+    "result": "Timeout after 18 seconds; LLDB created the clang-built arm64 target and hung at run without our DAP bridge or Buoy.",
+    "stdout": "(lldb) target create control\nCurrent executable set to control (arm64).\n(lldb) run\n"
+  },
+  "failedLaunchCleanup": {
+    "observation": "Apple debugserver starts a new session and survived adapter termination during OS-blocked launch. Four known test-owned orphan debugserver processes were terminated explicitly.",
+    "localFix": "Before adapter teardown, retain this adapter subtree debugserver PID/start-time/executable identities; after teardown recheck identity and terminate only those internal debugservers. External attach targets are not selected.",
+    "nativeVerification": "Short-startup-timeout native clang control completed with initialization timeout and disconnected; subsequent ps query found no debugserver processes. No system authorization settings changed."
+  },
+  "postReviewCleanupVerification": {
+    "ownershipGuard": "Query descendants only while the Popen child is live and unreaped, so its PID remains pinned.",
+    "host": "m4-casa macOS arm64",
+    "command": "Bridge(selected Xcode lldb-dap,startup_timeout=2) launching standalone clang control",
+    "result": "ready, capabilities, initialization timeout, disconnected; before/after debugserver sets showed no new orphan processes",
+    "osSettingsChanged": false,
+    "nativeDebuggerSuccessClaimed": false
+  },
+  "initialNativeMacVerdict": "blocked by host debugger authorization; cannot claim native debugger pass",
+  "nativeRunnerBeforeAuthorization": {
+    "command": "BUOY_STUDIO_DEBUG_ADAPTER=/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap python3 tests/run_studio_debugger_tests.py",
+    "result": "Failed at native launch: initialize capabilities received, then no launch completion/stopped event within 25 seconds; other pure helper tests passed. No native Mac debugger success claimed.",
+    "note": "Earlier direct clang control captured explicit OS authorization refusal. GUI launch and subsequent full runs time out; an authorization request remaining pending is a hypothesis, not a confirmed observation."
+  },
+  "permissionChangesMadeByDebuggerAgent": false,
+  "authorizationResolution": {
+    "source": "Root coordination message and subsequent independent native debugger execution",
+    "actor": "/root",
+    "authorization": "User explicitly authorized enabling DevToolsSecurity",
+    "reportedAction": "sudo -n /usr/sbin/DevToolsSecurity -enable",
+    "reportedResult": "Succeeded",
+    "performedByDebuggerAgent": false
+  },
+  "sourceBreakpointFix": {
+    "observation": "CLI resolves /tmp/.../target.bui:3 but not its canonical /private/tmp/... alias, because compiler DWARF retains lexical source spelling. tempfile /var paths have the same alias issue.",
+    "localCause": "studio_debug_adapter.py canonicalized breakpoint source with Path.resolve().",
+    "fix": "Preserve absolute lexical source spelling; do not resolve source-directory symlinks.",
+    "regression": "Standard real native Buoy target is now compiled through a directory-symlink source path; verified breakpoints retain that exact spelling on Linux/macOS."
+  },
+  "nativeRunnerFinal": {
+    "command": "BUOY_STUDIO_DEBUG_ADAPTER=/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap python3 tests/run_studio_debugger_tests.py",
+    "exitCode": 0,
+    "tests": "8 passed, none skipped on macOS",
+    "covered": [
+      "real -g Buoy executable source breakpoints/stack/locals/Step In/Over/Out/Continue/Pause/output/Stop",
+      "native directory-symlink source breakpoint regression",
+      "real macOS .app bundle and adjacent dSYM discovery",
+      "Attach/Detach of unique owned clang target, target confirmed alive afterward",
+      "actual native debugger window source callback, Inspect-frame navigation, resume clearing and project-switch detachment",
+      "module and harness compile clean on all six targets",
+      "Stop latch ignores late initialize/configuration/stopped/continued/frame responses and cannot launch after cancellation",
+      "owned nonreading adapter with individually valid ~60 KiB requests cannot block deadline or Stop; bounded asynchronous writer",
+      "native GUI optional session-start callback validation/rejection/restart before helper spawn",
+      "native GUI immediate Stop frame/locals/location clearing and late-message suppression"
+    ],
+    "nonfatalDiagnostic": "sandbox_extension_issue_file_to_process failed ... Operation not permitted emitted by native runtime launch; harness still completed successfully."
+  },
+  "linuxRegression": {
+    "exitCode": 0,
+    "tests": "8 total, 7 passed, macOS-only .app fixture skipped",
+    "sixTargetChecks": "passed",
+    "nativeWindowHarness": "passed",
+    "nonfatalDiagnostics": "Existing GTK focus-out diagnostic, tracked separately."
+  },
+  "finalDebugAudit": {
+    "nativeMacExitCode": 0,
+    "nativeMacSeconds": 13.741,
+    "nativeLinuxExitCode": 0,
+    "nativeLinuxSeconds": 6.169,
+    "sixTargetChecks": "All staged debugger/harness/dependency sources clean",
+    "transport": "One-MiB async write queue including in-flight packet, reserved four-KiB Disconnect control budget; teardown never synchronously writes/flushes adapter stdin.",
+    "newOptionalHostAPI": "StudioDebuggerSessionListener.DebuggerSessionStarting(), TryCast from existing link listener, after validated Queue and before helper spawn.",
+    "sourceNavigationContract": "Root snapshots clean saved source revisions at session start. Dirty-at-start, changed/saved mid-session or externally changed files refuse navigation until a new session; this does not prove selected executable freshness.",
+    "liveAppPreserved": "m4-casa PID10097 observed still running; no deployment or playground mutation by this agent."
+  }
+}

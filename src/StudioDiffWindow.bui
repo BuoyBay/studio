@@ -1,0 +1,142 @@
+Import diffkit
+Import StudioDiff
+
+Private Class StudioDiffButton Inherits Button
+    Public Property Owner As Weak StudioDiffWindow
+    Public Property ActionName As String
+    Handle Action()
+        Dim owner As StudioDiffWindow = Me.Owner
+        If owner <> Nil Then owner.Command(Me.ActionName)
+    End Handle
+End Class
+
+''' Modeless native viewer. All edits require an explicit button and a revision-checking host.
+Public Class StudioDiffWindow Inherits Window
+    Private Property Session As StudioDiffSession
+    Private Property Review As StudioExternalReview
+    Private Property Host As StudioDiffHost
+    Public Property Output As TextArea = New TextArea()
+    Public Property Status As Label = New Label()
+    Private Property Buttons As Array Of StudioDiffButton
+    Private Property HunkIndex As Integer = 0
+    Private Property Disposing As Boolean = False
+    Public Property IsClosed As Boolean = False
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.Title = "Compare snapshots"
+        Me.Move(160, 120, 1040, 720)
+        Me.SetMinSize(1040.0, 480.0)
+        Me.Output.IsReadOnly = True
+        Me.Output.AccessibleLabel = "Exact unified comparison including final newline markers"
+        Me.AddSubview(Me.Output)
+        Me.AddSubview(Me.Status)
+        Dim captions As Array Of String = ["Previous hunk", "Next hunk", "Revert hunk", "Saved / Local", "Saved / Disk", "Disk / Local", "Reload disk", "Keep local", "Cancel"]
+        Dim commands As Array Of String = ["previous", "next", "revert", "saved-local", "saved-disk", "disk-local", "reload", "keep", "cancel"]
+        For i As Integer = 0 To Array.Count(captions) - 1
+            Dim button As New StudioDiffButton()
+            button.Owner = Me
+            button.Caption = captions(i)
+            button.ActionName = commands(i)
+            Me.Buttons.Append(button)
+            Me.AddSubview(button)
+        Next
+        Me.LayoutControls(1040, 720)
+    End Sub
+    Public Sub Present(session As StudioDiffSession, host As StudioDiffHost)
+        Me.Session = session
+        Me.Review = Nil
+        Me.Host = host
+        Me.HunkIndex = 0
+        Me.Render()
+        Me.Show()
+    End Sub
+    Public Sub PresentExternal(review As StudioExternalReview, host As StudioDiffHost)
+        Me.Review = review
+        Me.Host = host
+        Me.Session = review.Comparison("disk-local")
+        Me.HunkIndex = 0
+        Me.Render()
+        Me.Show()
+    End Sub
+    Private Sub Render()
+        If Me.Session = Nil Then Return
+        Me.Title = Me.Session.Left.Label + " → " + Me.Session.Right.Label
+        Dim display As String = Me.Session.Patch()
+        If Array.Count(Me.Session.Hunks) > 0 Then
+            Dim selected As LineHunk = Me.Session.Hunks(Me.HunkIndex)
+            display = "Selected hunk " + String.From(Me.HunkIndex + 1) + " · left line " + String.From(selected.OldStart + 1) + ", right line " + String.From(selected.NewStart + 1) + "\nRemoved:\n" + String.Join(selected.OldLines, "") + "\nAdded:\n" + String.Join(selected.NewLines, "") + "\n\nFull comparison:\n" + display
+        End If
+        Me.Output.Text = StudioDiffDisplay(display)
+        Me.Status.Text = String.From(Array.Count(Me.Session.Hunks)) + " hunks · selected " + String.From(Me.HunkIndex + 1)
+        If Array.Count(Me.Session.Hunks) = 0 Then Me.Status.Text = "No selectable hunks"
+        If Me.Review <> Nil Then Me.Status.Text += " · Three snapshots; choose reload, keep, or cancel. No automatic merge."
+        For i As Integer = 0 To Array.Count(Me.Buttons) - 1
+            Me.Buttons(i).Enabled = True
+            If i = 2 Then Me.Buttons(i).Enabled = Me.Host <> Nil And Me.Review = Nil And Array.Count(Me.Session.Hunks) > 0
+            If i >= 3 Then Me.Buttons(i).Enabled = Me.Review <> Nil And Not Me.Review.IsResolved
+        Next
+    End Sub
+    Public Sub Command(action As String)
+        Try
+            If action = "next" And Me.HunkIndex + 1 < Array.Count(Me.Session.Hunks) Then Me.HunkIndex += 1
+            If action = "previous" And Me.HunkIndex > 0 Then Me.HunkIndex -= 1
+            If action = "revert" Then
+                If Me.Review <> Nil Then Return
+                If Me.Session.RevertHunk(Me.HunkIndex, Me.Host) Then
+                    Me.Status.Text = "Hunk reverted as one undoable buffer edit. Refresh comparison before another edit."
+                    Me.Buttons(2).Enabled = False
+                Else
+                    Me.Status.Text = "Edit refused: document changed or host rejected the edit. Refresh comparison."
+                End If
+                Return
+            End If
+            If Me.Review <> Nil Then
+                If action = "reload" Or action = "keep" Or action = "cancel" Then
+                    If Me.Review.Resolve(action, Me.Host) Then
+                        Me.Render()
+                        Me.Status.Text = "External-change choice accepted: " + action
+                    Else
+                        Me.Status.Text = "Choice refused: local or disk snapshot changed. Reopen review."
+                    End If
+                    Return
+                End If
+                If action = "saved-local" Or action = "saved-disk" Or action = "disk-local" Then
+                    Me.Session = Me.Review.Comparison(action)
+                    Me.HunkIndex = 0
+                End If
+            End If
+            Me.Render()
+            If Array.Count(Me.Session.Hunks) > 0 Then
+                Dim hunk As LineHunk = Me.Session.Hunks(Me.HunkIndex)
+                Me.Status.Text += " · left line " + String.From(hunk.OldStart + 1) + ", right line " + String.From(hunk.NewStart + 1)
+            End If
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+    Private Sub LayoutControls(width As Integer, height As Integer)
+        For i As Integer = 0 To Array.Count(Me.Buttons) - 1
+            Me.Buttons(i).Move(12 + (i Mod 5) * 202, 12 + (i \ 5) * 36, 194, 30)
+        Next
+        Me.Status.Move(12, 88, width - 24, 36)
+        Me.Output.Move(12, 130, width - 24, height - 142)
+    End Sub
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutControls(Math.Round(width), Math.Round(height))
+    End Handle
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+    Handle Closed()
+        Me.IsClosed = True
+    End Handle
+    Public Sub Dispose()
+        Me.Host = Nil
+        Me.Review = Nil
+        Me.Session = Nil
+        Me.Disposing = True
+        If Not Me.IsClosed Then Me.Close()
+    End Sub
+End Class

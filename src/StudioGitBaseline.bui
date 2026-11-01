@@ -1,0 +1,68 @@
+Import processkit
+
+''' Optional Git CLI bridge for the blob API absent from GitKit. Exact argv, never a shell.
+''' gitExecutable is the absolute path of a host-selected/trusted Git executable.
+''' Poll from the UI timer; completed text is an immutable index/HEAD snapshot for PublishGutter.
+Public Class StudioGitBaselineRequest
+    Private Property Process As PipeProcess
+    Private Property OutputBytes As Bytes = New Bytes()
+    Private Property ErrorBytes As Bytes = New Bytes()
+    Private Property PollCount As Integer = 0
+    Public Property IsComplete As Boolean = False
+    Public Property ErrorText As String
+    Public Property Text As String
+    Public Sub Constructor(gitExecutable As String, workingDirectory As String, relativePath As String, fromHead As Boolean = False)
+        If relativePath = "" Or String.StartsWith(relativePath, "/", True) Then Throw New InvalidArgumentException("Repository-relative file path is required")
+        For Each part As String In String.Split(String.Replace(relativePath, "\\", "/"), "/")
+            If part = ".." Then Throw New InvalidArgumentException("Parent traversal is not a repository-relative file path")
+        Next
+        Dim revision As String = ":0:./" + relativePath
+        If fromHead Then revision = "HEAD:./" + relativePath
+        Try
+            ' Disable pager, external diff and text conversion; the revision is one literal argument.
+            Me.Process = New PipeProcess(gitExecutable, ["--no-pager", "show", "--no-ext-diff", "--no-textconv", revision], workingDirectory, True)
+            Me.Process.CloseInput()
+        Catch e As Exception
+            Me.ErrorText = "Git baseline unavailable: " + e.Message
+            Me.IsComplete = True
+        End Try
+    End Sub
+    ''' Bounded work per tick. Host should cancel at its own elapsed-time deadline as well.
+    Public Sub Poll()
+        If Me.IsComplete Then Return
+        Try
+            Me.PollCount += 1
+            If Me.PollCount > 1200 Then Throw New Exception("Git baseline exceeded 1200 polls")
+            Dim data As Bytes = Me.Process.ReadOutput(65536)
+            Me.OutputBytes.Append(data)
+            Dim errors As Bytes = Me.Process.ReadError(4096)
+            Me.ErrorBytes.Append(errors)
+            If Me.OutputBytes.Count > 1048576 Or Me.ErrorBytes.Count > 65536 Then Throw New Exception("Git baseline exceeded text/output limit")
+            Dim running As Boolean = Me.Process.Poll()
+            If Not running And Me.Process.OutputClosed And Me.Process.ErrorClosed Then
+                If Me.Process.ExitCode <> 0 Then Throw New Exception("git show failed: " + Me.ErrorBytes.ToString(Text.Encodings.UTF8))
+                Me.Text = Me.OutputBytes.ToString(Text.Encodings.UTF8)
+                For i As Integer = 0 To Me.OutputBytes.Count - 1
+                    If Me.OutputBytes.Item(i) = 0 Then Throw New Exception("Binary Git baseline is not supported")
+                Next
+                Me.IsComplete = True
+                Me.Process.Close()
+                Me.Process = Nil
+            End If
+        Catch e As Exception
+            Me.Text = ""
+            Me.ErrorText = "Git baseline unavailable: " + e.Message
+            Me.Cancel()
+        End Try
+    End Sub
+    Public Sub Cancel()
+        If Me.IsComplete Then Return
+        If Me.Process <> Nil Then Me.Process.Close()
+        Me.Process = Nil
+        Me.IsComplete = True
+        If Me.ErrorText = "" Then Me.ErrorText = "Git baseline request cancelled"
+    End Sub
+    Public Sub Destructor()
+        If Me.Process <> Nil Then Me.Process.Close()
+    End Sub
+End Class

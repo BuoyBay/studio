@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- PROPOSAL: Buoy Permissions identity. Ivory shield with a check over a slate-violet tile,
+       in the established app-icon language. Not wired into any build. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#6d5bd8"/>
+      <stop offset="1" stop-color="#3a2e86"/>
+    </linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffdf7"/>
+      <stop offset="1" stop-color="#e9e2d2"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".30"/>
+      <stop offset=".55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#tile)"/>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#sheen)"/>
+  <rect x="64" y="64" width="896" height="896" rx="206" fill="none" stroke="#ffffff" stroke-opacity=".22" stroke-width="4"/>
+  <path d="M512 214 772 306v188c0 172-110 290-260 352-150-62-260-180-260-352V306z" fill="#160f40" opacity=".3"/>
+  <g>
+    <path d="M512 196 772 288v188c0 172-110 290-260 352-150-62-260-180-260-352V288z" fill="url(#ivory)"/>
+    <path d="m396 512 82 82 160-176" fill="none" stroke="#5141c4" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

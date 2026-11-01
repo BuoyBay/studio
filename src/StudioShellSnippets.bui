@@ -1,0 +1,126 @@
+Import StudioSnippetEngine
+Import StudioSnippetTypes
+Import StudioShellFiles
+Import StudioProject
+Import atomicfilekit
+
+Public Interface StudioShellSnippetHost
+    Function ShellInsertSnippet(id As String, expectedToken As String) As String
+    Sub ShellSnippetsChanged()
+End Interface
+
+Private Class ShellSnippetButton Inherits Button
+    Public Property Owner As Weak StudioShellSnippetWindow
+    Handle Action()
+        Dim owner As StudioShellSnippetWindow = Me.Owner
+        If owner <> Nil Then owner.Command(Me.Tag)
+    End Handle
+End Class
+
+''' Bounded native picker; importing merges only validated shared-format templates.
+Public Class StudioShellSnippetWindow Inherits Window
+    Private Property Library As StudioSnippetLibrary
+    Private Property Host As StudioShellSnippetHost
+    Private Property ExpectedToken As String
+    Private Property Mode As String
+    Private Property Choices As ComboBox = New ComboBox()
+    Private Property Preview As TextArea = New TextArea()
+    Private Property Status As Label = New Label()
+    Private Property Templates As Array Of JSONItem = []
+    Public Sub Constructor()
+        Me.Title = "Studio Snippets / Xippets Templates"
+        Me.Move(180, 140, 720, 460)
+        Me.Choices.Move(16, 16, 688, 32)
+        Me.Choices.AccessibleLabel = "Snippet template"
+        Me.AddSubview(Me.Choices)
+        Me.Preview.Move(16, 62, 688, 286)
+        Me.Preview.IsReadOnly = True
+        Me.Preview.AccessibleLabel = "Expanded snippet preview"
+        Me.AddSubview(Me.Preview)
+        Dim position As Integer = 16
+        For Each action As String In ["Preview", "Insert", "Import", "Export"]
+            Dim button As New ShellSnippetButton()
+            button.Owner = Me
+            button.Tag = action
+            button.Caption = action
+            button.Move(position, 362, 130, 30)
+            position += 142
+            Me.AddSubview(button)
+        Next
+        Me.Status.Move(16, 406, 688, 40)
+        Me.AddSubview(Me.Status)
+    End Sub
+    Public Sub Present(library As StudioSnippetLibrary, host As StudioShellSnippetHost, mode As String, expectedToken As String)
+        Me.Library = library
+        Me.Host = host
+        Me.Mode = mode
+        Me.ExpectedToken = expectedToken
+        Me.RefreshChoices()
+        Me.Show()
+    End Sub
+    Private Sub RefreshChoices()
+        Me.Templates = Me.Library.Templates(Me.Mode)
+        Me.Choices.RemoveAllItems()
+        For Each template As JSONItem In Me.Templates
+            Me.Choices.AddItem(template.Value("name").AsString().Value + " · " + template.Value("prefix").AsString().Value)
+        Next
+        If Me.Choices.Count > 0 Then Me.Choices.SelectedIndex = 0
+        Me.Preview.Text = ""
+        Me.Status.Text = String.From(Array.Count(Me.Templates)) + " templates for " + Me.Mode + ". Imports/exports use the shared buoy.snippets format."
+    End Sub
+    Public Sub Command(action As String)
+        If Me.Library = Nil Or Me.Host = Nil Then Return
+        Try
+            If action = "Import" Then
+                Dim dialog As New OpenFileDialog()
+                dialog.Title = "Import Xippets / Studio snippet templates"
+                dialog.AddFilter("Snippet templates", "*.json")
+                If Not dialog.Show(Me) Then Return
+                Dim count As Integer = Me.Library.ImportFile(dialog.SelectedItem.FullPath())
+                If count < 0 Then Throw New InvalidArgumentException(Me.Library.LastError)
+                Me.Host.ShellSnippetsChanged()
+                Me.RefreshChoices()
+                Me.Status.Text = "Imported " + String.From(count) + " templates."
+                Return
+            End If
+            If action = "Export" Then
+                Dim dialog As New SaveFileDialog()
+                dialog.Title = "Export user snippets — choose a new filename"
+                dialog.SuggestedFileName = "studio-snippets.json"
+                If Not dialog.Show(Me) Then Return
+                Dim filePath As String = dialog.SelectedItem.FullPath()
+                Dim content As String = Me.Library.ExportText()
+                StudioProjectCheckSaveDestination(filePath)
+                StudioShellReserveFile(filePath)
+                AtomicWriteText(filePath, content, "")
+                Me.Status.Text = "Exported user templates: " + filePath
+                Return
+            End If
+            Dim row As Integer = Me.Choices.SelectedIndex
+            If row < 0 Or row >= Array.Count(Me.Templates) Then Throw New InvalidArgumentException("Choose a snippet first")
+            Dim id As String = Me.Templates(row).Value("id").AsString().Value
+            If action = "Preview" Then
+                Dim expansion As StudioSnippetExpansion = Me.Library.ExpansionFor(id)
+                If expansion = Nil Then Throw New InvalidArgumentException(Me.Library.LastError)
+                Me.Preview.Text = expansion.Text
+                Me.Status.Text = "Preview only · " + String.From(Array.Count(expansion.TraversalOrder())) + " editable placeholder groups."
+            ElseIf action = "Insert" Then
+                Dim issue As String = Me.Host.ShellInsertSnippet(id, Me.ExpectedToken)
+                If issue <> "" Then Throw New InvalidArgumentException(issue)
+                Me.Visible = False
+            End If
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+    Public Sub Dispose()
+        Me.Host = Nil
+        Me.Library = Nil
+        Me.Visible = False
+        Me.Templates = []
+    End Sub
+    Handle Closing() As Boolean
+        Me.Visible = False
+        Return True
+    End Handle
+End Class

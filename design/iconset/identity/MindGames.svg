@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="title">
+  <title id="title">Mind Games application icon proposal</title>
+  <!-- Review proposal only; follows the shared rounded tile and ivory glyph style. -->
+  <defs>
+    <linearGradient id="tile" x2="0.3" y2="1"><stop stop-color="#9465da"/><stop offset="1" stop-color="#453282"/></linearGradient>
+    <linearGradient id="ivory" x2="0" y2="1"><stop stop-color="#fffdf7"/><stop offset="1" stop-color="#e9e2d2"/></linearGradient>
+  </defs>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#tile)"/>
+  <rect x="64" y="64" width="896" height="896" rx="206" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="4"/>
+  <path d="M343 380h338c56 0 94 40 108 94l45 172c19 76-62 119-110 64l-70-80H370l-70 80c-48 55-129 12-110-64l45-172c14-54 52-94 108-94Z" fill="#241547" opacity=".3" transform="translate(0 22)"/>
+  <path d="M343 380h338c56 0 94 40 108 94l45 172c19 76-62 119-110 64l-70-80H370l-70 80c-48 55-129 12-110-64l45-172c14-54 52-94 108-94Z" fill="url(#ivory)"/>
+  <path d="M310 500h104M362 448v104" stroke="#67509c" stroke-width="28" stroke-linecap="round"/>
+  <g fill="#67509c"><circle cx="673" cy="466" r="24"/><circle cx="724" cy="517" r="24"/></g>
+  <path d="M351 297h94l35-64 54 110 38-70 24 24h79" fill="none" stroke="#fffdf7" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

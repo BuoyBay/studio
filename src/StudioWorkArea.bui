@@ -1,0 +1,94 @@
+' Startup frame fit against the real desktop work area (Windows).
+' Buoy 0.72 reports only full monitor bounds (Screen) and content sizes (Window.Width/Height);
+' on Windows the title bar, menu bar and toolbar band are added outside the content size,
+' so a frame computed from Screen alone can extend under the taskbar. After the window is
+' shown, Win32 reports its actual outer rectangle and its monitor's work area.
+
+#If TargetWindows Then
+Sequential Structure StudioWinRect
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+End Structure
+
+Sequential Structure StudioWinMonitorInfo
+    Size As UInt32
+    MonitorLeft As Int32
+    MonitorTop As Int32
+    MonitorRight As Int32
+    MonitorBottom As Int32
+    WorkLeft As Int32
+    WorkTop As Int32
+    WorkRight As Int32
+    WorkBottom As Int32
+    Flags As UInt32
+End Structure
+
+Private Optional Declare Function StudioWinWindowRect Lib "user32" Alias "GetWindowRect" (widget As Ptr, bounds As Ptr) As Int32
+Private Optional Declare Function StudioWinMonitorFromWindow Lib "user32" Alias "MonitorFromWindow" (widget As Ptr, fallback As UInt32) As Ptr
+Private Optional Declare Function StudioWinMonitorInfo Lib "user32" Alias "GetMonitorInfoW" (monitor As Ptr, info As Ptr) As Int32
+Private Optional Declare Function StudioWinDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function StudioWinZoomed Lib "user32" Alias "IsZoomed" (widget As Ptr) As Int32
+Private Optional Declare Function StudioWinIconic Lib "user32" Alias "IsIconic" (widget As Ptr) As Int32
+#End If
+
+''' Shrinks and, if needed, moves a shown window so its whole outer frame (GetWindowRect,
+''' invisible resize borders included) lies inside its monitor's work area. Keeps the
+''' content at least minWidth x minHeight. Returns True when the frame was changed.
+''' A no-op on macOS and Linux, and for minimized or maximized windows.
+Public Function StudioFitWindowToWorkArea(window As Window, minWidth As Integer, minHeight As Integer) As Boolean
+    #If TargetWindows Then
+        If window = Nil Then Return False
+        Dim widget As Ptr = window.NativeWidget
+        If widget = Nil Then Return False
+        If StudioWinZoomed(widget) <> 0 Or StudioWinIconic(widget) <> 0 Then Return False
+        Dim outer As StudioWinRect
+        If StudioWinWindowRect(widget, CType(outer, Ptr)) = 0 Then Return False
+        Dim monitor As Ptr = StudioWinMonitorFromWindow(widget, 2) ' MONITOR_DEFAULTTONEAREST
+        If monitor = Nil Then Return False
+        Dim info As StudioWinMonitorInfo
+        info.Size = 40
+        If StudioWinMonitorInfo(monitor, CType(info, Ptr)) = 0 Then Return False
+        ' Plain Integer locals: mixing Int32 fields with Double in Math.Max/Min fails codegen in 0.72.
+        Dim outerLeft As Integer = outer.Left
+        Dim outerTop As Integer = outer.Top
+        Dim workLeft As Integer = info.WorkLeft
+        Dim workTop As Integer = info.WorkTop
+        Dim workRight As Integer = info.WorkRight
+        Dim workBottom As Integer = info.WorkBottom
+        Dim outerWidth As Integer = outer.Right - outerLeft
+        Dim outerHeight As Integer = outer.Bottom - outerTop
+        Dim workWidth As Integer = workRight - workLeft
+        Dim workHeight As Integer = workBottom - workTop
+        If outerWidth <= 0 Or outerHeight <= 0 Or workWidth <= 0 Or workHeight <= 0 Then Return False
+        Dim dpi As Integer = 96
+        Try
+            dpi = StudioWinDPI(widget)
+        Catch e As LibraryUnavailableException
+            ' Older Windows versions have no GetDpiForWindow export.
+            dpi = 96
+        End Try
+        If dpi <= 0 Then dpi = 96
+        ' Keep the requested position where possible: clamp it onto the work area, shrink the
+        ' content until the outer frame ends inside it, and only then move back if the
+        ' minimum size still overflows.
+        Dim left As Integer = Math.Max(workLeft, outerLeft)
+        Dim top As Integer = Math.Max(workTop, outerTop)
+        Dim width As Integer = window.Width
+        Dim height As Integer = window.Height
+        Dim overflowX As Integer = left + outerWidth - workRight
+        Dim overflowY As Integer = top + outerHeight - workBottom
+        If overflowX > 0 Then width = Math.Max(minWidth, width - (overflowX * 96 + dpi - 1) \ dpi)
+        If overflowY > 0 Then height = Math.Max(minHeight, height - (overflowY * 96 + dpi - 1) \ dpi)
+        Dim fittedWidth As Integer = outerWidth - ((window.Width - width) * dpi) \ 96
+        Dim fittedHeight As Integer = outerHeight - ((window.Height - height) * dpi) \ 96
+        left = Math.Max(workLeft, Math.Min(left, workRight - fittedWidth))
+        top = Math.Max(workTop, Math.Min(top, workBottom - fittedHeight))
+        If width = window.Width And height = window.Height And left = outerLeft And top = outerTop Then Return False
+        window.Move((left * 96) \ dpi, (top * 96) \ dpi, width, height)
+        Return True
+    #Else
+        Return False
+    #End If
+End Function

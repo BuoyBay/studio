@@ -1,0 +1,215 @@
+Import StudioDocumentIO
+Import atomicfilekit
+
+''' One atomic manifest per stable, caller-supplied workspace state directory.
+''' Recovery is independent from source files. Corruption is reported, not fatal.
+Public Class StudioDocumentStore
+    Private Property mFile As String = ""
+    Private Property mBaseline As String = ""
+    Private Property mExists As Boolean = False
+    Private Property mData As JSONItem
+    Public Property LastError As String = ""
+    Public Const MaxRecordBytes As Integer = 4194304
+    Public Const MaxStoreBytes As Integer = 16777216
+    Public Const MaxHistory As Integer = 64
+    Public Const MaxRecovery As Integer = 32
+
+    Public Sub Constructor(stateDirectory As String)
+        Dim folder As New FileSystemItem(StudioDocumentStablePath(stateDirectory))
+        If Not folder.CreateFolder(True) Then Throw New InvalidArgumentException("Cannot create document state directory")
+        Me.mFile = folder.Child("studio-documents-v1.json").FullPath()
+        Me.mData = Me.EmptyState()
+        Me.mExists = New FileSystemItem(Me.mFile).Exists()
+        If Not Me.mExists Then Return
+        Try
+            If New FileSystemItem(Me.mFile).Length() > StudioDocumentStore.MaxStoreBytes Then Throw New InvalidArgumentException("Document state exceeds size limit")
+            Dim read As Result Of String, String = New FileSystemItem(Me.mFile).ReadAllText()
+            If read.IsErr Then Throw New InvalidArgumentException(read.Error)
+            Me.mBaseline = read.Value
+            If String.LenBytes(read.Value) > StudioDocumentStore.MaxStoreBytes Then Throw New InvalidArgumentException("Document state exceeds size limit")
+            Dim loaded As JSONItem = Json.Parse(read.Value)
+            If Not loaded.IsObject() Or loaded.Value("version").AsNumber().Or(0.0) <> 1.0 Then Throw New InvalidArgumentException("Unsupported document state")
+            If Not loaded.Value("recovery").IsArray() Or Not loaded.Value("history").IsArray() Or Not loaded.Value("session").IsObject() Then Throw New InvalidArgumentException("Invalid document state structure")
+            If loaded.Value("recovery").Count() > StudioDocumentStore.MaxRecovery Or loaded.Value("history").Count() > StudioDocumentStore.MaxHistory Then Throw New InvalidArgumentException("Document state retention exceeded")
+            Me.mData = loaded
+        Catch e As Exception
+            Me.LastError = "Document state was not loaded: " + e.Message
+        End Try
+    End Sub
+
+    Private Function EmptyState() As JSONItem
+        Dim state As JSONItem = JSONItem.NewObject()
+        state.Value("version") = 1.0
+        state.Value("recovery") = JSONItem.NewArray()
+        state.Value("history") = JSONItem.NewArray()
+        state.Value("session") = JSONItem.NewObject()
+        Return state
+    End Function
+
+    Private Sub Publish(nextState As JSONItem)
+        Dim raw As String = Json.Stringify(nextState)
+        If String.LenBytes(raw) > StudioDocumentStore.MaxStoreBytes Then Throw New InvalidArgumentException("Document state byte limit exceeded; remove older records")
+        Try
+            If Me.mExists Then
+                AtomicWriteText(Me.mFile, raw, Me.mBaseline)
+            Else
+                If New FileSystemItem(Me.mFile).Exists() Then Throw New InvalidArgumentException("Document state appeared on disk; reload first")
+                Dim transaction As New AtomicFileTransaction(Me.mFile, StudioDocumentStore.MaxStoreBytes)
+                transaction.Append(Bytes.FromString(raw, Text.Encodings.UTF8))
+                transaction.Commit()
+            End If
+        Catch e As AtomicFileException
+            If e.IsCommitted Then
+                Me.mBaseline = raw
+                Me.mExists = True
+                Me.mData = Json.Parse(raw)
+            End If
+            Throw e
+        End Try
+        Me.mBaseline = raw
+        Me.mExists = True
+        Me.mData = Json.Parse(raw)
+    End Sub
+
+    Private Function CopyState() As JSONItem
+        Return Json.Parse(Json.Stringify(Me.mData))
+    End Function
+
+    Public Function Session() As JSONItem
+        Return Json.Parse(Json.Stringify(Me.mData.Value("session")))
+    End Function
+
+    ''' Host supplies tabs/active path/caret/selection/scroll/layout in this object.
+    Public Sub SaveSession(sessionState As JSONItem)
+        If Not sessionState.IsObject() Then Throw New InvalidArgumentException("Session must be an object")
+        If String.LenBytes(Json.Stringify(sessionState)) > StudioDocumentStore.MaxRecordBytes Then Throw New InvalidArgumentException("Session too large")
+        Dim state As JSONItem = Me.CopyState()
+        state.Value("session") = sessionState
+        Me.Publish(state)
+    End Sub
+
+    Public Sub PutRecovery(documentKey As String, buffer As StudioDocumentBuffer)
+        If documentKey = "" Or buffer = Nil Then Throw New InvalidArgumentException("Recovery needs a stable document key")
+        Dim snapshot As JSONItem = buffer.Snapshot()
+        If String.LenBytes(Json.Stringify(snapshot)) > StudioDocumentStore.MaxRecordBytes Then Throw New InvalidArgumentException("Recovery record too large")
+        Dim state As JSONItem = Me.CopyState()
+        Dim records As JSONItem = state.Value("recovery")
+        For i As Integer = records.Count() - 1 To 0 Step -1
+            If String.Compare(records.ValueAt(i).Value("key").AsString().Or(""), documentKey, True) = 0 Then records.RemoveAt(i)
+        Next
+        Dim entry As JSONItem = JSONItem.NewObject()
+        entry.Value("key") = documentKey
+        entry.Value("timestamp") = DateTime.Now().SecondsFrom1970
+        entry.Value("snapshot") = snapshot
+        records.Add(entry)
+        While records.Count() > StudioDocumentStore.MaxRecovery
+            records.RemoveAt(0)
+        End While
+        Me.TrimToBudget(state, "recovery")
+        Me.Publish(state)
+    End Sub
+
+    Public Function RecoveryKeys() As Array Of String
+        Dim keys As Array Of String = []
+        Dim records As JSONItem = Me.mData.Value("recovery")
+        For i As Integer = 0 To records.Count() - 1
+            Dim key As String = records.ValueAt(i).Value("key").AsString().Or("")
+            If key <> "" Then
+                If Me.Recover(key) <> Nil Then Array.Append(keys, key)
+            End If
+        Next
+        Return keys
+    End Function
+
+    ''' Corrupt individual records cannot prevent startup or other recoveries.
+    Public Function Recover(documentKey As String) As StudioDocumentBuffer
+        Dim records As JSONItem = Me.mData.Value("recovery")
+        For i As Integer = records.Count() - 1 To 0 Step -1
+            If String.Compare(records.ValueAt(i).Value("key").AsString().Or(""), documentKey, True) = 0 Then
+                Try
+                    Return StudioDocumentBuffer.FromSnapshot(records.ValueAt(i).Value("snapshot"))
+                Catch e As Exception
+                    Me.LastError = "Invalid recovery for " + documentKey + ": " + e.Message
+                    Return Nil
+                End Try
+            End If
+        Next
+        Return Nil
+    End Function
+
+    Public Function RecoveryConflicts(buffer As StudioDocumentBuffer) As Boolean
+        If buffer = Nil Then Return True
+        If Not buffer.HasBaseline Then Return False
+        Try
+            Return String.Compare(StudioDocumentReadUTF8(buffer.Path), buffer.Baseline, True) <> 0
+        Catch e As Exception
+            Return True
+        End Try
+    End Function
+
+    Public Sub RemoveRecovery(documentKey As String)
+        Dim state As JSONItem = Me.CopyState()
+        Dim records As JSONItem = state.Value("recovery")
+        For i As Integer = records.Count() - 1 To 0 Step -1
+            If String.Compare(records.ValueAt(i).Value("key").AsString().Or(""), documentKey, True) = 0 Then records.RemoveAt(i)
+        Next
+        Me.Publish(state)
+    End Sub
+
+    ''' Record the disk baseline BEFORE save; never just the normalized buffer.
+    Public Sub AddHistory(documentKey As String, raw As String, label As String = "before save")
+        If documentKey = "" Then Throw New InvalidArgumentException("History needs a stable document key")
+        If String.LenBytes(raw) > StudioDocumentStore.MaxRecordBytes Then Throw New InvalidArgumentException("History record too large")
+        Dim state As JSONItem = Me.CopyState()
+        Dim records As JSONItem = state.Value("history")
+        Dim entry As JSONItem = JSONItem.NewObject()
+        entry.Value("key") = documentKey
+        entry.Value("timestamp") = DateTime.Now().SecondsFrom1970
+        entry.Value("raw") = raw
+        entry.Value("label") = label
+        records.Add(entry)
+        While records.Count() > StudioDocumentStore.MaxHistory
+            records.RemoveAt(0)
+        End While
+        Me.TrimToBudget(state, "history")
+        Me.Publish(state)
+    End Sub
+
+    Private Sub TrimToBudget(state As JSONItem, preferred As String)
+        While String.LenBytes(Json.Stringify(state)) > StudioDocumentStore.MaxStoreBytes
+            Dim records As JSONItem = state.Value(preferred)
+            If records.Count() <= 1 Then
+                If preferred = "history" Then
+                    records = state.Value("recovery")
+                Else
+                    records = state.Value("history")
+                End If
+            End If
+            If records.Count() = 0 Then Throw New InvalidArgumentException("Document state byte limit exceeded")
+            records.RemoveAt(0)
+        End While
+    End Sub
+
+    ''' Detached entries ordered oldest to newest. Host previews then explicitly
+    ''' restores via ReplaceText/ConvertEndings or a snapshot (never overwrites disk).
+    Public Sub RestoreHistory(documentKey As String, index As Integer, buffer As StudioDocumentBuffer, expectedRevision As Integer, importUnicode As Boolean = False)
+        If buffer = Nil Then Throw New InvalidArgumentException("Missing history destination buffer")
+        Dim entries As JSONItem = Me.History(documentKey)
+        If index < 0 Or index >= entries.Count() Then Throw New InvalidArgumentException("History index is no longer available")
+        Dim entry As JSONItem = entries.ValueAt(index)
+        If Not entry.Value("raw").IsString() Then Throw New InvalidArgumentException("Invalid history record")
+        Dim historical As StudioDocumentBuffer = StudioDocumentBuffer.FromText(entry.Value("raw").AsString().Value, importUnicode)
+        ' Restore deliberately keeps the current disk baseline and path.
+        buffer.Restore(historical.Snapshot(), expectedRevision)
+    End Sub
+
+    Public Function History(documentKey As String) As JSONItem
+        Dim entries As JSONItem = JSONItem.NewArray()
+        Dim records As JSONItem = Me.mData.Value("history")
+        For i As Integer = 0 To records.Count() - 1
+            Dim entry As JSONItem = records.ValueAt(i)
+            If String.Compare(entry.Value("key").AsString().Or(""), documentKey, True) = 0 Then entries.Add(entry)
+        Next
+        Return Json.Parse(Json.Stringify(entries))
+    End Function
+End Class

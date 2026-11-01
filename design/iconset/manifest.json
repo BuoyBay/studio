@@ -1,0 +1,841 @@
+{
+  "schema": "buoy.iconset",
+  "schemaVersion": 1,
+  "name": "buoy-glyphs",
+  "version": "1.0.0",
+  "grid": {
+    "viewBox": "0 0 24 24",
+    "liveArea": [
+      2,
+      22
+    ],
+    "strokeWidth": 1.75,
+    "linecap": "round",
+    "linejoin": "round",
+    "tint": "currentColor",
+    "renderSizes": [
+      16,
+      20,
+      24
+    ],
+    "minimumOpacity": 0.2,
+    "secondaryOpacity": 0.45
+  },
+  "resolution": [
+    "declared: a plugin.json control \"icon\" (or a caller-supplied key) that names a glyph in this manifest",
+    "mapping: controls / items / navigator / projectTypes / symbols tables below",
+    "category fallback: fallbacks[category]; a package-qualified control type (contains \".\") uses fallbacks.packageControl",
+    "last resort: fallbacks.any"
+  ],
+  "fallbacks": {
+    "control": "control.generic",
+    "packageControl": "control.package",
+    "item": "file.document",
+    "project": "brand.buoy",
+    "symbol": "symbol.module",
+    "any": "status.unknown"
+  },
+  "controls": {
+    "catalog": {
+      "Button": "control.button",
+      "Label": "control.label",
+      "TextField": "control.text-field",
+      "Checkbox": "control.checkbox",
+      "designerwidgets.StatusBadge": "control.status-badge",
+      "DisclosureTriangle": "control.disclosure-triangle",
+      "TextArea": "control.text-area",
+      "ComboBox": "control.combo-box",
+      "RadioGroup": "control.radio-group",
+      "Slider": "control.slider",
+      "Stepper": "control.stepper",
+      "DateTimePicker": "control.date-time-picker",
+      "View": "control.view",
+      "GroupBox": "control.group-box",
+      "TabView": "control.tab-view",
+      "PagePanel": "control.page-panel",
+      "ProgressBar": "control.progress-bar",
+      "ListBox": "control.list-box",
+      "ImageView": "control.image-view",
+      "Canvas": "control.canvas",
+      "HTMLView": "control.html-view"
+    },
+    "layoutRoots": {
+      "Window": "control.window",
+      "View": "control.view"
+    },
+    "framework": {
+      "TextArea": "control.text-area",
+      "ImageView": "control.image-view",
+      "ProgressBar": "control.progress-bar",
+      "Slider": "control.slider",
+      "Stepper": "control.stepper",
+      "RadioGroup": "control.radio-group",
+      "RadioButton": "control.radio-button",
+      "ComboBox": "control.combo-box",
+      "ListBox": "control.list-box",
+      "TabView": "control.tab-view",
+      "PagePanel": "control.page-panel",
+      "GroupBox": "control.group-box",
+      "DisclosureTriangle": "control.disclosure-triangle",
+      "DateTimePicker": "control.date-time-picker",
+      "HTMLView": "control.html-view",
+      "Canvas": "control.canvas",
+      "StackView": "control.stack-view",
+      "Splitter": "control.splitter",
+      "Toolbar": "control.toolbar",
+      "MenuBar": "control.menu-bar",
+      "PopupMenu": "control.combo-box",
+      "DatePicker": "control.date-time-picker",
+      "NumericField": "control.number-box",
+      "PasswordField": "control.text-field"
+    },
+    "components": {
+      "TreeView": "control.tree-view",
+      "SearchField": "control.search-field",
+      "SegmentedButton": "control.segmented-button",
+      "ScrollView": "control.scroll-view",
+      "NumberBox": "control.number-box",
+      "BevelButton": "control.bevel-button",
+      "ColorPicker": "control.color-picker",
+      "FontPicker": "control.font-picker",
+      "ActivityIndicator": "control.activity-indicator",
+      "NativeSeparator": "control.separator",
+      "NativePopover": "control.popover",
+      "NativeTooltip": "control.tooltip",
+      "GTKContextMenu": "control.context-menu"
+    }
+  },
+  "navigator": {
+    "group:project": "brand.buoy",
+    "group:library": "nav.library",
+    "item:": "@items",
+    "node:": "@controls",
+    "library:": "@controls"
+  },
+  "items": {
+    "layoutSource": "file.layout",
+    "names": {
+      "main.bui": "file.entry"
+    },
+    "suffixes": {
+      "_test.bui": "file.test",
+      ".bui": "file.source",
+      ".buipkg": "project.library",
+      ".json": "file.config",
+      ".plist": "file.config",
+      ".toml": "file.config",
+      ".yaml": "file.config",
+      ".yml": "file.config",
+      ".md": "file.text",
+      ".txt": "file.text",
+      ".png": "file.image",
+      ".svg": "file.image",
+      ".jpg": "file.image",
+      ".jpeg": "file.image",
+      ".icns": "file.image",
+      ".ico": "file.image",
+      ".html": "file.source",
+      "/": "file.folder"
+    }
+  },
+  "projectTypes": {
+    "desktop": "project.desktop",
+    "console": "project.console",
+    "library": "project.library",
+    "plugin": "project.plugin",
+    "web": "project.web",
+    "server": "project.server",
+    "tests": "project.tests"
+  },
+  "apps": {
+    "BuoyDocs": {
+      "projectType": "desktop",
+      "identity": "apps/BuoyDocs/resources/AppIcon.png"
+    },
+    "BuoyStudio": {
+      "projectType": "desktop",
+      "identity": "apps/BuoyStudio/resources/AppIcon.png",
+      "proposal": "design/iconset/identity/BuoyStudio.svg"
+    },
+    "Calls": {
+      "projectType": "desktop",
+      "identity": "apps/Calls/resources/AppIcon.png"
+    },
+    "Permissions": {
+      "projectType": "desktop",
+      "identity": null,
+      "proposal": "design/iconset/identity/Permissions.svg"
+    },
+    "Xippets": {
+      "projectType": "desktop",
+      "identity": "apps/Xippets/resources/AppIcon.png",
+      "components": {
+        "server": "project.server"
+      }
+    },
+    "BuoyBase": {
+      "projectType": "desktop",
+      "identity": null,
+      "proposal": "design/iconset/identity/BuoyBase.svg"
+    },
+    "MindGames": {
+      "projectType": "desktop",
+      "identity": null,
+      "proposal": "design/iconset/identity/MindGames.svg"
+    }
+  },
+  "symbols": {
+    "Module": "symbol.module",
+    "Class": "symbol.class",
+    "Interface": "symbol.interface",
+    "Enum": "symbol.enum",
+    "Structure": "symbol.structure",
+    "Function": "symbol.method",
+    "Sub": "symbol.method",
+    "Property": "symbol.property",
+    "Event": "symbol.event",
+    "Handle": "symbol.event",
+    "Const": "symbol.constant"
+  },
+  "icons": {
+    "project.desktop": {
+      "title": "Desktop app",
+      "category": "project",
+      "file": "svg/project.desktop.svg",
+      "native": {
+        "sfSymbol": "desktopcomputer",
+        "fluent": "desktop"
+      }
+    },
+    "project.console": {
+      "title": "Console tool",
+      "category": "project",
+      "file": "svg/project.console.svg",
+      "native": {
+        "sfSymbol": "terminal",
+        "fluent": "window-console"
+      }
+    },
+    "project.library": {
+      "title": "Library package",
+      "category": "project",
+      "file": "svg/project.library.svg",
+      "native": {
+        "sfSymbol": "shippingbox",
+        "fluent": "cube"
+      }
+    },
+    "project.plugin": {
+      "title": "Designer plug-in package",
+      "category": "project",
+      "file": "svg/project.plugin.svg",
+      "native": {
+        "sfSymbol": "powerplug",
+        "fluent": "plug-connected"
+      }
+    },
+    "project.web": {
+      "title": "Web content project",
+      "category": "project",
+      "file": "svg/project.web.svg",
+      "native": {
+        "sfSymbol": "globe",
+        "fluent": "globe"
+      }
+    },
+    "project.server": {
+      "title": "Server / service",
+      "category": "project",
+      "file": "svg/project.server.svg",
+      "native": {
+        "sfSymbol": "server.rack",
+        "fluent": "server"
+      }
+    },
+    "project.tests": {
+      "title": "Test suite",
+      "category": "project",
+      "file": "svg/project.tests.svg",
+      "native": {
+        "sfSymbol": "checkmark.diamond",
+        "fluent": "beaker"
+      }
+    },
+    "brand.buoy": {
+      "title": "Buoy project",
+      "category": "navigator",
+      "file": "svg/brand.buoy.svg",
+      "native": {
+        "sfSymbol": "lifepreserver"
+      }
+    },
+    "nav.library": {
+      "title": "Control library",
+      "category": "navigator",
+      "file": "svg/nav.library.svg",
+      "native": {
+        "sfSymbol": "square.grid.2x2",
+        "fluent": "apps-add-in"
+      }
+    },
+    "file.document": {
+      "title": "Document",
+      "category": "item",
+      "file": "svg/file.document.svg",
+      "native": {
+        "sfSymbol": "doc",
+        "fluent": "document"
+      }
+    },
+    "file.source": {
+      "title": "Buoy source",
+      "category": "item",
+      "file": "svg/file.source.svg",
+      "native": {
+        "sfSymbol": "chevron.left.forwardslash.chevron.right",
+        "fluent": "document-code"
+      }
+    },
+    "file.layout": {
+      "title": "Layout source",
+      "category": "item",
+      "file": "svg/file.layout.svg",
+      "native": {
+        "sfSymbol": "macwindow",
+        "fluent": "window-header-horizontal"
+      }
+    },
+    "file.entry": {
+      "title": "Entry module (main.bui)",
+      "category": "item",
+      "file": "svg/file.entry.svg",
+      "native": {
+        "sfSymbol": "play"
+      }
+    },
+    "file.config": {
+      "title": "Configuration / data",
+      "category": "item",
+      "file": "svg/file.config.svg",
+      "native": {
+        "sfSymbol": "curlybraces",
+        "fluent": "braces"
+      }
+    },
+    "file.text": {
+      "title": "Text / Markdown",
+      "category": "item",
+      "file": "svg/file.text.svg",
+      "native": {
+        "sfSymbol": "doc.text",
+        "fluent": "document-text"
+      }
+    },
+    "file.image": {
+      "title": "Image resource",
+      "category": "item",
+      "file": "svg/file.image.svg",
+      "native": {
+        "sfSymbol": "photo",
+        "fluent": "document-image"
+      }
+    },
+    "file.test": {
+      "title": "Test source",
+      "category": "item",
+      "file": "svg/file.test.svg",
+      "native": {
+        "sfSymbol": "checkmark.circle",
+        "fluent": "document-checkmark"
+      }
+    },
+    "file.folder": {
+      "title": "Folder",
+      "category": "item",
+      "file": "svg/file.folder.svg",
+      "native": {
+        "sfSymbol": "folder",
+        "fluent": "folder"
+      }
+    },
+    "control.window": {
+      "title": "Window",
+      "category": "control",
+      "file": "svg/control.window.svg",
+      "native": {
+        "sfSymbol": "macwindow",
+        "fluent": "window"
+      }
+    },
+    "control.view": {
+      "title": "View",
+      "category": "control",
+      "file": "svg/control.view.svg",
+      "native": {
+        "sfSymbol": "rectangle",
+        "fluent": "content-view"
+      }
+    },
+    "control.group-box": {
+      "title": "GroupBox",
+      "category": "control",
+      "file": "svg/control.group-box.svg",
+      "native": {
+        "fluent": "group"
+      }
+    },
+    "control.tab-view": {
+      "title": "TabView",
+      "category": "control",
+      "file": "svg/control.tab-view.svg",
+      "native": {
+        "fluent": "tabs"
+      }
+    },
+    "control.page-panel": {
+      "title": "PagePanel",
+      "category": "control",
+      "file": "svg/control.page-panel.svg",
+      "native": {
+        "sfSymbol": "square.stack"
+      }
+    },
+    "control.stack-view": {
+      "title": "StackView",
+      "category": "control",
+      "file": "svg/control.stack-view.svg",
+      "native": {
+        "sfSymbol": "rectangle.stack",
+        "fluent": "layout-row-two"
+      }
+    },
+    "control.splitter": {
+      "title": "Splitter",
+      "category": "control",
+      "file": "svg/control.splitter.svg",
+      "native": {
+        "sfSymbol": "rectangle.split.2x1",
+        "fluent": "split-vertical"
+      }
+    },
+    "control.scroll-view": {
+      "title": "ScrollView",
+      "category": "control",
+      "file": "svg/control.scroll-view.svg",
+      "native": {
+        "sfSymbol": "scroll"
+      }
+    },
+    "control.button": {
+      "title": "Button",
+      "category": "control",
+      "file": "svg/control.button.svg",
+      "native": {
+        "fluent": "button"
+      }
+    },
+    "control.bevel-button": {
+      "title": "BevelButton",
+      "category": "control",
+      "file": "svg/control.bevel-button.svg"
+    },
+    "control.segmented-button": {
+      "title": "SegmentedButton",
+      "category": "control",
+      "file": "svg/control.segmented-button.svg",
+      "native": {
+        "sfSymbol": "rectangle.split.3x1"
+      }
+    },
+    "control.checkbox": {
+      "title": "Checkbox",
+      "category": "control",
+      "file": "svg/control.checkbox.svg",
+      "native": {
+        "sfSymbol": "checkmark.square",
+        "fluent": "checkbox-checked"
+      }
+    },
+    "control.radio-button": {
+      "title": "RadioButton",
+      "category": "control",
+      "file": "svg/control.radio-button.svg",
+      "native": {
+        "sfSymbol": "record.circle",
+        "fluent": "radio-button"
+      }
+    },
+    "control.radio-group": {
+      "title": "RadioGroup",
+      "category": "control",
+      "file": "svg/control.radio-group.svg"
+    },
+    "control.disclosure-triangle": {
+      "title": "DisclosureTriangle",
+      "category": "control",
+      "file": "svg/control.disclosure-triangle.svg",
+      "native": {
+        "sfSymbol": "arrowtriangle.down.fill",
+        "fluent": "chevron-down"
+      }
+    },
+    "control.toolbar": {
+      "title": "Toolbar",
+      "category": "control",
+      "file": "svg/control.toolbar.svg"
+    },
+    "control.label": {
+      "title": "Label",
+      "category": "control",
+      "file": "svg/control.label.svg",
+      "native": {
+        "sfSymbol": "textformat",
+        "fluent": "text-t"
+      }
+    },
+    "control.text-field": {
+      "title": "TextField",
+      "category": "control",
+      "file": "svg/control.text-field.svg",
+      "native": {
+        "sfSymbol": "character.cursor.ibeam",
+        "fluent": "text-field"
+      }
+    },
+    "control.text-area": {
+      "title": "TextArea",
+      "category": "control",
+      "file": "svg/control.text-area.svg",
+      "native": {
+        "sfSymbol": "text.alignleft",
+        "fluent": "textbox"
+      }
+    },
+    "control.search-field": {
+      "title": "SearchField",
+      "category": "control",
+      "file": "svg/control.search-field.svg",
+      "native": {
+        "sfSymbol": "magnifyingglass",
+        "fluent": "search"
+      }
+    },
+    "control.font-picker": {
+      "title": "FontPicker",
+      "category": "control",
+      "file": "svg/control.font-picker.svg",
+      "native": {
+        "sfSymbol": "textformat.size",
+        "fluent": "text-font"
+      }
+    },
+    "control.combo-box": {
+      "title": "ComboBox",
+      "category": "control",
+      "file": "svg/control.combo-box.svg",
+      "native": {
+        "sfSymbol": "chevron.up.chevron.down"
+      }
+    },
+    "control.number-box": {
+      "title": "NumberBox",
+      "category": "control",
+      "file": "svg/control.number-box.svg",
+      "native": {
+        "fluent": "number-symbol-square"
+      }
+    },
+    "control.stepper": {
+      "title": "Stepper",
+      "category": "control",
+      "file": "svg/control.stepper.svg",
+      "native": {
+        "sfSymbol": "plusminus"
+      }
+    },
+    "control.slider": {
+      "title": "Slider",
+      "category": "control",
+      "file": "svg/control.slider.svg"
+    },
+    "control.progress-bar": {
+      "title": "ProgressBar",
+      "category": "control",
+      "file": "svg/control.progress-bar.svg"
+    },
+    "control.activity-indicator": {
+      "title": "ActivityIndicator",
+      "category": "control",
+      "file": "svg/control.activity-indicator.svg",
+      "native": {
+        "fluent": "spinner-ios"
+      }
+    },
+    "control.date-time-picker": {
+      "title": "DateTimePicker",
+      "category": "control",
+      "file": "svg/control.date-time-picker.svg",
+      "native": {
+        "sfSymbol": "calendar",
+        "fluent": "calendar"
+      }
+    },
+    "control.color-picker": {
+      "title": "ColorPicker",
+      "category": "control",
+      "file": "svg/control.color-picker.svg",
+      "native": {
+        "sfSymbol": "paintpalette",
+        "fluent": "color"
+      }
+    },
+    "control.list-box": {
+      "title": "ListBox",
+      "category": "control",
+      "file": "svg/control.list-box.svg",
+      "native": {
+        "sfSymbol": "tablecells",
+        "fluent": "table"
+      }
+    },
+    "control.tree-view": {
+      "title": "TreeView",
+      "category": "control",
+      "file": "svg/control.tree-view.svg",
+      "native": {
+        "sfSymbol": "list.bullet.indent"
+      }
+    },
+    "control.image-view": {
+      "title": "ImageView",
+      "category": "control",
+      "file": "svg/control.image-view.svg",
+      "native": {
+        "sfSymbol": "photo",
+        "fluent": "image"
+      }
+    },
+    "control.canvas": {
+      "title": "Canvas",
+      "category": "control",
+      "file": "svg/control.canvas.svg",
+      "native": {
+        "sfSymbol": "scribble",
+        "fluent": "draw-shape"
+      }
+    },
+    "control.html-view": {
+      "title": "HTMLView",
+      "category": "control",
+      "file": "svg/control.html-view.svg",
+      "native": {
+        "sfSymbol": "globe",
+        "fluent": "web-asset"
+      }
+    },
+    "control.popover": {
+      "title": "Popover",
+      "category": "control",
+      "file": "svg/control.popover.svg",
+      "native": {
+        "sfSymbol": "bubble.middle.bottom",
+        "fluent": "chat"
+      }
+    },
+    "control.tooltip": {
+      "title": "Tooltip",
+      "category": "control",
+      "file": "svg/control.tooltip.svg",
+      "native": {
+        "sfSymbol": "text.bubble",
+        "fluent": "tooltip-quote"
+      }
+    },
+    "control.context-menu": {
+      "title": "Context menu",
+      "category": "control",
+      "file": "svg/control.context-menu.svg",
+      "native": {
+        "sfSymbol": "filemenu.and.selection"
+      }
+    },
+    "control.menu-bar": {
+      "title": "MenuBar",
+      "category": "control",
+      "file": "svg/control.menu-bar.svg",
+      "native": {
+        "sfSymbol": "menubar.rectangle"
+      }
+    },
+    "control.separator": {
+      "title": "Separator",
+      "category": "control",
+      "file": "svg/control.separator.svg",
+      "native": {
+        "sfSymbol": "minus",
+        "fluent": "line-horizontal-1"
+      }
+    },
+    "control.status-badge": {
+      "title": "Status badge",
+      "category": "control",
+      "file": "svg/control.status-badge.svg",
+      "native": {
+        "fluent": "status"
+      }
+    },
+    "control.generic": {
+      "title": "Control (fallback)",
+      "category": "control",
+      "file": "svg/control.generic.svg",
+      "native": {
+        "sfSymbol": "square.dashed",
+        "fluent": "select-object"
+      }
+    },
+    "control.package": {
+      "title": "Package control (fallback)",
+      "category": "control",
+      "file": "svg/control.package.svg",
+      "native": {
+        "sfSymbol": "puzzlepiece",
+        "fluent": "puzzle-piece"
+      }
+    },
+    "status.unknown": {
+      "title": "Unknown (last-resort fallback)",
+      "category": "fallback",
+      "file": "svg/status.unknown.svg",
+      "native": {
+        "sfSymbol": "questionmark.square.dashed",
+        "fluent": "question-circle"
+      }
+    },
+    "symbol.module": {
+      "title": "Module",
+      "category": "symbol",
+      "file": "svg/symbol.module.svg",
+      "native": {
+        "sfSymbol": "curlybraces",
+        "fluent": "braces"
+      }
+    },
+    "symbol.class": {
+      "title": "Class",
+      "category": "symbol",
+      "file": "svg/symbol.class.svg",
+      "native": {
+        "sfSymbol": "c.square"
+      }
+    },
+    "symbol.interface": {
+      "title": "Interface",
+      "category": "symbol",
+      "file": "svg/symbol.interface.svg",
+      "native": {
+        "sfSymbol": "i.square"
+      }
+    },
+    "symbol.enum": {
+      "title": "Enum",
+      "category": "symbol",
+      "file": "svg/symbol.enum.svg",
+      "native": {
+        "sfSymbol": "e.square"
+      }
+    },
+    "symbol.structure": {
+      "title": "Structure",
+      "category": "symbol",
+      "file": "svg/symbol.structure.svg",
+      "native": {
+        "sfSymbol": "s.square"
+      }
+    },
+    "symbol.method": {
+      "title": "Function / Sub",
+      "category": "symbol",
+      "file": "svg/symbol.method.svg",
+      "native": {
+        "sfSymbol": "f.cursive"
+      }
+    },
+    "symbol.property": {
+      "title": "Property",
+      "category": "symbol",
+      "file": "svg/symbol.property.svg",
+      "native": {
+        "sfSymbol": "p.circle"
+      }
+    },
+    "symbol.event": {
+      "title": "Event / Handle",
+      "category": "symbol",
+      "file": "svg/symbol.event.svg",
+      "native": {
+        "sfSymbol": "bolt"
+      }
+    },
+    "symbol.constant": {
+      "title": "Const",
+      "category": "symbol",
+      "file": "svg/symbol.constant.svg",
+      "native": {
+        "sfSymbol": "equal.circle"
+      }
+    },
+    "action.open": {
+      "title": "Open",
+      "category": "action",
+      "file": "svg/action.open.svg"
+    },
+    "action.save": {
+      "title": "Save",
+      "category": "action",
+      "file": "svg/action.save.svg"
+    },
+    "action.undo": {
+      "title": "Undo",
+      "category": "action",
+      "file": "svg/action.undo.svg"
+    },
+    "action.redo": {
+      "title": "Redo",
+      "category": "action",
+      "file": "svg/action.redo.svg"
+    },
+    "action.navigator": {
+      "title": "Navigator",
+      "category": "action",
+      "file": "svg/action.navigator.svg"
+    },
+    "action.agent": {
+      "title": "Agent",
+      "category": "action",
+      "file": "svg/action.agent.svg"
+    },
+    "action.tests": {
+      "title": "Tests",
+      "category": "action",
+      "file": "svg/action.tests.svg"
+    }
+  },
+  "toolbar": {
+    "open": "action.open",
+    "save": "action.save",
+    "undo": "action.undo",
+    "redo": "action.redo",
+    "navigator": "action.navigator",
+    "agent": "action.agent",
+    "tests": "action.tests"
+  },
+  "actions": {
+    "open": "action.open",
+    "save": "action.save",
+    "undo": "action.undo",
+    "redo": "action.redo",
+    "navigator": "action.navigator",
+    "agent": "action.agent",
+    "tests": "action.tests"
+  }
+}

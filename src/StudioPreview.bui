@@ -1,0 +1,1024 @@
+Import processkit
+Import progresskit
+Import layoutkit.LayoutDocument
+Import guilintkit
+
+' Native-runtime preview for the layout designer.
+'
+' The designer draws a literal-frame model of a layout. The only exact rendering is
+' the real compiler and the real native runtime, so Preview stages the project in a
+' private temporary folder, generates a tiny harness that constructs the active
+' Window (or hosts a View in a generated Window), checks and builds it with the
+' installed `buoy`, and runs it as a child process. Every step is an explicit
+' argument array (no shell) polled from a UI timer, so Studio never blocks.
+'
+' The harness records runtime bounds for named literal-frame controls shortly after
+' the window opens. Studio compares them with the designer's literal frames and
+' reports where the native layout differs (constraints, native minimum sizes).
+
+#If TargetMac Then
+    Private Declare Function PreviewClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function PreviewDictionary Lib "Foundation" Selector "dictionaryWithContentsOfFile:" (cls As Ptr, fileName As CFStringRef) As Ptr
+    Private Declare Function PreviewDictionaryValue Lib "Foundation" Selector "objectForKey:" (object As Ptr, key As CFStringRef) As Ptr
+    Private Declare Function PreviewIsString Lib "Foundation" Selector "isKindOfClass:" (object As Ptr, cls As Ptr) As Boolean
+#End If
+
+#If TargetWindows Then
+    Private Declare Function PreviewPathAttributes Lib "kernel32" Alias "GetFileAttributesW" (name As Ptr) As UInt32
+#Else
+    Private Declare Function PreviewReadLink Lib "c" Alias "readlink" (name As String, buffer As Ptr, count As UInt64) As Int64
+#End If
+
+Private Sub StudioPreviewCheckDiskPath(item As FileSystemItem)
+    #If TargetWindows Then
+        Dim attributes As UInt32 = PreviewPathAttributes(item.Handle)
+        If attributes = &hffffffff Or (attributes And &h400) <> 0 Then Throw New InvalidArgumentException("Preview cannot stage missing or reparse paths: " + item.FullPath())
+    #Else
+        Dim buffer As New Bytes()
+        buffer.Append(0)
+        If PreviewReadLink(item.FullPath(), buffer.DataPtr(), 1) >= 0 Then Throw New InvalidArgumentException("Preview cannot stage symbolic links: " + item.FullPath())
+        If Not item.Exists() Then Throw New InvalidArgumentException("Missing preview dependency: " + item.FullPath())
+    #End If
+End Sub
+
+Private Sub StudioPreviewCheckPath(value As String)
+    If value = "" Or String.Contains(value, "\\") Or String.Contains(value, ":") Or String.StartsWith(value, "/") Then Throw New InvalidArgumentException("Unsafe preview relative path: " + value)
+    For Each part As String In String.Split(value, "/")
+        If part = "" Or part = "." Or part = ".." Then Throw New InvalidArgumentException("Unsafe preview relative path: " + value)
+    Next
+    For Each character As String In String.Chars(value)
+        If String.Asc(character) < 32 Then Throw New InvalidArgumentException("Unsafe preview relative path.")
+    Next
+End Sub
+
+''' One staged source file, identified by its project-relative path.
+Public Class StudioPreviewSource
+    Public Property FileName As String
+    Public Property Text As String
+    Public Sub Constructor(fileName As String, text As String)
+        Me.FileName = fileName
+        Me.Text = text
+    End Sub
+End Class
+
+''' Designer frame of one control, compared with its runtime bounds.
+Public Class StudioPreviewFrame
+    Public Property Name As String
+    Public Property Member As String
+    Public Property X As Integer
+    Public Property Y As Integer
+    Public Property Width As Integer
+    Public Property Height As Integer
+End Class
+
+Private Function StudioPreviewIdentifier(name As String) As Boolean
+    If name = "" Then Return False
+    Dim encoded As Bytes = Bytes.FromString(name, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        Dim c As Integer = encoded.Item(i)
+        Dim letter As Boolean = (c >= 65 And c <= 90) Or (c >= 97 And c <= 122) Or c = 95
+        Dim digit As Boolean = c >= 48 And c <= 57
+        If Not letter And Not (digit And i > 0) Then Return False
+    Next
+    Return True
+End Function
+
+Private Function StudioPreviewQuote(text As String) As String
+    Dim escaped As String = String.Replace(text, "\\", "\\\\")
+    escaped = String.Replace(escaped, "\"", "\\\"")
+    Return "\"" + escaped + "\""
+End Function
+
+Private Function StudioPreviewPlatform() As String
+    #If TargetMac Then
+        Return "macos"
+    #ElseIf TargetWindows Then
+        Return "windows"
+    #Else
+        Return "linux"
+    #End If
+End Function
+
+''' Everything needed to build one preview: the layout module, its active root, the
+''' sources to stage, and the designer frames to compare against.
+Public Class StudioPreviewPlan
+    Public Property ModuleName As String
+    Public Property RootName As String
+    ''' "window" or "view".
+    Public Property RootKind As String = "window"
+    Public Property RootWidth As Integer = 400
+    Public Property RootHeight As Integer = 300
+    Public Property Frames As Array Of StudioPreviewFrame = []
+    Public Property Sources As Array Of StudioPreviewSource = []
+    Public Property LintReport As JSONItem
+    ''' Optional folder whose sources, packages and manifest resources are staged first;
+    ''' registered buffers then replace the exact project-relative source paths.
+    Public Property ProjectFolder As String
+    Public Property LayoutRelativePath As String
+    Public Const HarnessFileName As String = "_studio_preview_main.bui"
+    ''' Optional agent capture (project_render). When CapturePath is set, the caller must
+    ''' also stage CaptureModuleName + ".bui"; the harness then captures its own window
+    ''' into CapturePath (+ ".json" report) CaptureDelay ms after the bounds report (shown at 700 ms, +300 ms margin) and quits.
+    Public Property CapturePath As String = ""
+    Public Property CaptureWidth As Integer = 0
+    Public Property CaptureHeight As Integer = 0
+    ''' "light", "dark" or "" for the system appearance.
+    Public Property CaptureAppearance As String = ""
+    Public Property CaptureDelay As Integer = 1000
+    Public Const CaptureModuleName As String = "_studio_render_capture"
+
+    ''' Plans a preview of one root of a parsed layout document.
+    Public Shared Function ForRoot(document As LayoutDocument, rootId As String, moduleName As String) As StudioPreviewPlan
+        If Not StudioPreviewIdentifier(moduleName) Then Throw New InvalidArgumentException("Preview needs a layout file whose name is a Buoy module name (letters, digits and underscores).")
+        Dim root As LayoutNode = document.FindNode(rootId)
+        If root = Nil Then Throw New InvalidArgumentException("Choose a Window or View layout to preview.")
+        If root.ParentId <> "" Then Throw New InvalidArgumentException("Preview starts from a root Window or View.")
+        If Not StudioPreviewIdentifier(root.Name) Then Throw New InvalidArgumentException("The layout root has no usable type name.")
+        Dim plan As New StudioPreviewPlan()
+        plan.ModuleName = moduleName
+        plan.RootName = root.Name
+        Dim linter As New GuiLinter()
+        linter.RegisterBuiltinRules()
+        plan.LintReport = linter.Analyse(document, moduleName + ".bui", StudioPreviewPlatform(), Nil, Nil)
+        If String.Compare(root.TypeName, "view", False) = 0 Then plan.RootKind = "view"
+        If root.Width > 0 Then plan.RootWidth = root.Width
+        If root.Height > 0 Then plan.RootHeight = root.Height
+        ' Every named descendant of the root is a typed property of the lowered class.
+        Dim inside As New Map Of String, Boolean()
+        inside.Set(root.Id, True)
+        Dim grew As Boolean = True
+        While grew
+            grew = False
+            For Each node As LayoutNode In document.Nodes
+                If inside.ContainsKey(node.Id) Then Continue For
+                If node.ParentId <> "" And inside.ContainsKey(node.ParentId) Then
+                    inside.Set(node.Id, True)
+                    grew = True
+                End If
+            Next
+        End While
+        For Each node As LayoutNode In document.Nodes
+            If node.Id = root.Id Or Not inside.ContainsKey(node.Id) Then Continue For
+            If Not StudioPreviewIdentifier(node.Name) Or Not node.HasLiteralFrame Then Continue For
+            Dim frame As New StudioPreviewFrame()
+            frame.Name = node.Name
+            frame.Member = node.Name
+            Dim ancestor As LayoutNode = document.FindNode(node.ParentId)
+            While ancestor <> Nil And ancestor.Id <> root.Id
+                frame.Name = ancestor.Name + "." + frame.Name
+                ancestor = document.FindNode(ancestor.ParentId)
+            End While
+            frame.X = node.X
+            frame.Y = node.Y
+            frame.Width = node.Width
+            frame.Height = node.Height
+            plan.Frames.Append(frame)
+        Next
+        Return plan
+    End Function
+
+    Public Sub AddSource(fileName As String, text As String)
+        StudioPreviewCheckPath(fileName)
+        If Not String.EndsWith(fileName, ".bui", True) Then Throw New InvalidArgumentException("Preview source must be .bui.")
+        If String.Compare(fileName, StudioPreviewPlan.HarnessFileName, False) = 0 Then Throw New InvalidArgumentException("Reserved preview harness path.")
+        For i As Integer = 0 To Array.Count(Me.Sources) - 1
+            If String.Compare(Me.Sources(i).FileName, fileName, False) = 0 Then
+                Me.Sources(i).Text = text
+                Return
+            End If
+        Next
+        Me.Sources.Append(New StudioPreviewSource(fileName, text))
+    End Sub
+
+    ''' The generated program. It is ordinary Buoy: Import the layout, construct the
+    ''' root, show it, report runtime bounds once, and quit when the window closes.
+    Public Function Harness() As String
+        Dim lines As Array Of String = []
+        lines.Append("' Generated by Buoy Studio for a native-runtime preview. Safe to delete.")
+        If Me.LayoutRelativePath = "" Then
+            lines.Append("Import " + Me.ModuleName)
+        Else
+            StudioPreviewCheckPath(Me.LayoutRelativePath)
+            lines.Append("Import " + StudioPreviewQuote("./" + Me.LayoutRelativePath))
+        End If
+        lines.Append("Import previewkit")
+        Dim capture As Boolean = Me.CapturePath <> ""
+        Dim sized As Boolean = capture And Me.CaptureWidth > 0 And Me.CaptureHeight > 0
+        If capture Then lines.Append("Import " + StudioPreviewPlan.CaptureModuleName)
+        lines.Append("")
+        If Me.RootKind = "view" Then
+            lines.Append("Class StudioPreviewHost Inherits Window")
+        Else
+            lines.Append("Class StudioPreviewHost Inherits " + Me.RootName)
+        End If
+        lines.Append("    Handle Closed()")
+        lines.Append("        Application.Quit()")
+        lines.Append("    End Handle")
+        lines.Append("End Class")
+        lines.Append("")
+        lines.Append("Class StudioPreviewState")
+        lines.Append("    Public Shared Property Root As " + Me.RootName)
+        lines.Append("    Public Shared Property Session As PreviewSession")
+        lines.Append("End Class")
+        lines.Append("")
+        lines.Append("Sub Main(args As Array Of String)")
+        If capture Then lines.Append("    Dim appearanceApplied As Boolean = StudioRenderApplyAppearance(" + StudioPreviewQuote(Me.CaptureAppearance) + ")")
+        Dim size As String = "root.Width, root.Height"
+        If sized Then size = String.From(Me.CaptureWidth) + ", " + String.From(Me.CaptureHeight)
+        If Me.RootKind = "view" Then
+            lines.Append("    Dim root As New " + Me.RootName + "()")
+            lines.Append("    Dim host As New StudioPreviewHost()")
+            lines.Append("    host.Title = " + StudioPreviewQuote(Me.RootName + " · Preview") )
+            lines.Append("    host.Move(80, 80, " + size + ")")
+            lines.Append("    root.Move(0, 0, " + size + ")")
+            lines.Append("    host.AddSubview(root)")
+        Else
+            lines.Append("    Dim root As New StudioPreviewHost()")
+            lines.Append("    Dim host As Window = root")
+            If sized Then lines.Append("    host.Move(80, 80, " + size + ")")
+        End If
+        lines.Append("    StudioPreviewState.Root = root")
+        lines.Append("    StudioPreviewState.Session = New PreviewSession(host)")
+        lines.Append("    If Array.Count(args) > 1 Then StudioPreviewState.Session.ReadyPath = args(1)")
+        For Each frame As StudioPreviewFrame In Me.Frames
+            ' Declarative descendants are lowered to root-level typed members.
+            ' Evidence names retain their source hierarchy for unique matching.
+            Dim member As String = frame.Member
+            If member = "" Then member = frame.Name
+            lines.Append("    StudioPreviewState.Session.Track(" + StudioPreviewQuote(frame.Name) + ", root." + member + ")")
+        Next
+        lines.Append("    StudioPreviewState.Session.Show(700)")
+        If capture Then lines.Append("    StudioRenderSchedule(host, " + StudioPreviewQuote(Me.CapturePath) + ", appearanceApplied, " + String.From(1000 + Me.CaptureDelay) + ")")
+        lines.Append("    Application.Run()")
+        lines.Append("End Sub")
+        lines.Append("")
+        Return String.Join(lines, "\n")
+    End Function
+End Class
+
+''' The installed compiler: BUOY_STUDIO_COMPILER, BUOY, then PATH and standard installs.
+Public Function StudioCompilerPath() As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_COMPILER").Or(System.EnvironmentVariable("BUOY").Or(""))
+    If configured <> "" Then
+        If String.IndexOf(configured, "/") < 0 And String.IndexOf(configured, "\\") < 0 Then
+            Dim found As String = StudioFindOnPath(configured)
+            If found <> "" Then Return found
+        End If
+        Return configured
+    End If
+    Dim onPath As String = StudioFindOnPath("buoy")
+    If onPath <> "" Then Return onPath
+    Dim candidates As Array Of String = []
+    #If TargetWindows Then
+        candidates = ["C:\\Program Files\\Buoy\\buoy.exe", "C:\\Program Files\\Buoy\\bin\\buoy.exe"]
+    #ElseIf TargetMac Then
+        candidates = ["/usr/local/bin/buoy", "/opt/homebrew/bin/buoy", "/Applications/Buoy/bin/buoy", "/Applications/Buoy/buoy"]
+    #Else
+        candidates = ["/usr/local/bin/buoy", "/usr/bin/buoy", "/usr/share/buoy/buoy"]
+    #End If
+    For Each candidate As String In candidates
+        If New FileSystemItem(candidate).IsFile() Then Return candidate
+    Next
+    Return ""
+End Function
+
+Private Function StudioFindOnPath(name As String) As String
+    Dim separator As String = ":"
+    Dim executable As String = name
+    #If TargetWindows Then
+        separator = ";"
+        If String.Compare(String.Right(name, 4), ".exe", True) <> 0 Then executable = name + ".exe"
+    #End If
+    Dim entries As Array Of String = String.Split(System.EnvironmentVariable("PATH").Or(""), separator)
+    For Each entry As String In entries
+        If entry = "" Then Continue For
+        Dim candidate As New FileSystemItem(Path.Join(entry, executable))
+        If candidate.IsFile() Then Return candidate.FullPath()
+    Next
+    Return ""
+End Function
+
+''' Callbacks from a preview job; implementations must tolerate calls at any time.
+Public Interface StudioPreviewListener
+    Sub PreviewMessage(message As String)
+    Sub PreviewStateChanged()
+End Interface
+
+''' Holder for a weak listener; Buoy interfaces cannot be declared Weak directly.
+Public Class StudioPreviewLink
+    Public Property Listener As StudioPreviewListener
+End Class
+
+Private Class StudioPreviewPoller Inherits Timer
+    Public Property Owner As Weak StudioPreviewJob
+    Public Overrides Sub NotifyTick()
+        Dim job As StudioPreviewJob = Me.Owner
+        If job <> Nil Then job.Poll()
+    End Sub
+End Class
+
+''' ProgressKit messages accept at most 4096 UTF-8 bytes; 1000 characters always fit.
+Private Function StudioPreviewProgressText(message As String) As String
+    If String.Len(message) <= 1000 Then Return message
+    Return String.Left(message, 999) + "…"
+End Function
+
+''' One preview at a time: stage → check → build → run. CheckOnly stops after the
+''' compiler check (used by the self-test and by "Check Preview Harness").
+'''
+''' Each Start creates a new Progress tree with four leaves: checking (including
+''' staging), building, launching and inspecting. Every leaf becomes terminal on
+''' success, failure, stop or a skipped phase, so Progress.Snapshot().IsFinished
+''' proves the pipeline is settled. Inspecting succeeds once runtime bounds are
+''' read; the preview window may stay open afterwards. StopPreview requests
+''' cancellation, terminates the owned process tree and acknowledges (State
+''' "stopped", unfinished leaves cancelled) only after the child is reaped and the
+''' staging folder removed. A pipeline that already succeeded stays succeeded.
+Public Class StudioPreviewJob
+    ''' idle, checking, building, running, stopping, finished, failed, stopped
+    Public Property State As String = "idle"
+    Public Property CheckOnly As Boolean = False
+    Public Property Folder As String
+    Public Property Plan As StudioPreviewPlan
+    Public Property CompilerPath As String
+    Public Property Diagnostics As Array Of String = []
+    Public Property Differences As Array Of String = []
+    Public Property GeometryReported As Boolean = False
+    Public Property KeepFolder As Boolean = False
+    ''' Cleanup failures remain visible across restarts; retained folders need manual removal.
+    Public Property CleanupError As String = ""
+    Public Property RetainedFolders As Array Of String = []
+    Public Property HostLink As Weak StudioPreviewLink
+    Private Property mProcess As PipeProcess
+    Private Property mOutput As String
+    Private Property mErrors As String
+    Private Property mExited As Integer = 0
+    Private Property mPoller As StudioPreviewPoller = New StudioPreviewPoller()
+    Private Property mProgress As ProgressNode
+    Private Property mLeaves As Array Of ProgressNode = []
+    Private Property mStopStarted As Integer = 0
+    Private Property mLaunchedAt As Integer = 0
+    Private Property mTreeConfirmed As Boolean = True
+    ''' A running child that has not reported bounds by then fails Inspecting (it keeps running).
+    Public Const InspectTimeoutMicroseconds As Integer = 30000000
+    ''' Grace period for a terminated child to exit before Close forces it.
+    Public Const StopTimeoutMicroseconds As Integer = 5000000
+
+    Public Sub Constructor()
+        Me.mPoller.Owner = Me
+        Me.mPoller.Period = 100
+    End Sub
+
+    Public Function IsActive() As Boolean
+        Return Me.State = "checking" Or Me.State = "building" Or Me.State = "running" Or Me.State = "stopping"
+    End Function
+
+    ''' The current operation's progress tree; Nil before the first Start. Stable until
+    ''' the next Start replaces it. Read snapshots only; the job owns its leaves.
+    Public Property Progress As ProgressNode
+        Get
+            Return Me.mProgress
+        End Get
+    End Property
+
+    ''' A stop was requested for the current operation (it may not be acknowledged yet).
+    Public Property IsStopRequested As Boolean
+        Get
+            If Me.mProgress = Nil Then Return False
+            Return Me.mProgress.Cancellation.IsRequested
+        End Get
+    End Property
+
+    ''' Legacy name: True means termination APIs reported no error. It does not
+    ''' verify every descendant exited; detached children can escape the owned group.
+    Public Property ProcessTreeConfirmed As Boolean
+        Get
+            Return Me.mTreeConfirmed
+        End Get
+    End Property
+
+    Private Function LeafOpen(index As Integer) As Boolean
+        If Me.mProgress = Nil Or index >= Array.Count(Me.mLeaves) Then Return False
+        Return Not Me.mLeaves(index).Snapshot().IsFinished
+    End Function
+
+    Private Sub ReportLeaf(index As Integer, message As String)
+        If Me.LeafOpen(index) Then Me.mLeaves(index).ReportUnknown(StudioPreviewProgressText(message))
+    End Sub
+
+    Private Sub CompleteLeaf(index As Integer, message As String)
+        If Me.LeafOpen(index) Then Me.mLeaves(index).Complete(StudioPreviewProgressText(message))
+    End Sub
+
+    ''' Terminalizes every unfinished leaf: the first gets message, later ones are skipped.
+    Private Sub SettleLeaves(outcome As String, message As String, skipped As String)
+        Dim first As Boolean = True
+        For i As Integer = 0 To Array.Count(Me.mLeaves) - 1
+            If Not Me.LeafOpen(i) Then Continue For
+            Dim text As String = skipped
+            If first Then text = message
+            first = False
+            text = StudioPreviewProgressText(text)
+            If outcome = "succeeded" Then
+                Me.mLeaves(i).Complete(text)
+            ElseIf outcome = "cancelled" Then
+                Me.mLeaves(i).Cancel(text)
+            Else
+                Me.mLeaves(i).Fail(text)
+            End If
+        Next
+    End Sub
+
+    Public Function IsComplete() As Boolean
+        Return Me.State = "finished" Or Me.State = "failed" Or Me.State = "stopped"
+    End Function
+
+    Private Sub Announce(message As String)
+        Dim link As StudioPreviewLink = Me.HostLink
+        If link <> Nil Then
+            If link.Listener <> Nil Then link.Listener.PreviewMessage(message)
+        End If
+    End Sub
+
+    Private Sub Changed()
+        Dim link As StudioPreviewLink = Me.HostLink
+        If link <> Nil Then
+            If link.Listener <> Nil Then link.Listener.PreviewStateChanged()
+        End If
+    End Sub
+
+    Public Property HarnessPath As String
+        Get
+            Return Path.Join(Me.Folder, StudioPreviewPlan.HarnessFileName)
+        End Get
+    End Property
+
+    Public Property ReportPath As String
+        Get
+            Return Path.Join(Me.Folder, "_studio_preview_bounds.json")
+        End Get
+    End Property
+
+    Private Property StagedCount As Integer = 0
+    Private Property StagedBytes As Integer = 0
+
+    Private Sub CopyFile(original As FileSystemItem, destination As FileSystemItem)
+        StudioPreviewCheckDiskPath(original)
+        Me.StagedCount += 1
+        Me.StagedBytes += original.Length()
+        If Me.StagedCount > 4096 Or Me.StagedBytes > 536870912 Then Throw New InvalidArgumentException("Preview snapshot size limit exceeded.")
+        If Not New FileSystemItem(destination.ParentPath()).CreateFolder(True) Then Throw New InvalidArgumentException("Could not create preview dependency folder.")
+        If Not original.CopyTo(destination) Then Throw New InvalidArgumentException("Could not stage project file " + original.Name())
+    End Sub
+
+    Private Sub CopyProject(original As FileSystemItem, destination As FileSystemItem, depth As Integer)
+        StudioPreviewCheckDiskPath(original)
+        If depth > 32 Then Throw New InvalidArgumentException("Preview project nesting limit exceeded.")
+        For Each child As FileSystemItem In original.Children()
+            Dim name As String = child.Name()
+            If name = ".git" Or name = ".hg" Or name = ".svn" Or name = ".buoy" Or name = "packages" Then Continue For
+            StudioPreviewCheckPath(name)
+            StudioPreviewCheckDiskPath(child)
+            If child.IsFolder() Then
+                Me.CopyProject(child, destination.Child(name), depth + 1)
+            ElseIf child.IsFile() Then
+                If String.EndsWith(name, ".bui", True) Then Me.CopyFile(child, destination.Child(name))
+                If name = "app_resources.json" Then
+                    Me.CopyFile(child, destination.Child(name))
+                    Dim contents As Result Of String, String = child.ReadAllText()
+                    If contents.IsErr Then Throw New InvalidArgumentException(contents.Error)
+                    Dim manifest As JSONItem = Json.Parse(contents.Value)
+                    Dim resources As JSONItem = manifest.Value("resources")
+                    If Not resources.IsArray() Then Throw New InvalidArgumentException("Invalid preview resource manifest.")
+                    For i As Integer = 0 To resources.Count() - 1
+                        Dim relative As String = resources.ValueAt(i).Value("path").AsString().Or("")
+                        StudioPreviewCheckPath(relative)
+                        Dim source As FileSystemItem = original
+                        For Each part As String In String.Split(relative, "/")
+                            source = source.Child(part)
+                            StudioPreviewCheckDiskPath(source)
+                        Next
+                        If Not source.IsFile() Then Throw New InvalidArgumentException("Preview resource is not a file: " + relative)
+                        Me.CopyFile(source, destination.Child(relative))
+                    Next
+                End If
+            End If
+        Next
+    End Sub
+
+    ''' Writes the project and harness into a fresh private folder.
+    Public Sub Stage(plan As StudioPreviewPlan)
+        Me.Plan = plan
+        Me.Folder = ""
+        Dim parent As FileSystemItem = System.Folders.Temporary().Child("buoy-studio-preview")
+        If Not parent.CreateFolder(True) Then Throw New InvalidArgumentException("Could not create " + parent.FullPath())
+        Dim folder As FileSystemItem = Nil
+        For attempt As Integer = 1 To 20
+            Dim candidate As FileSystemItem = parent.Child("preview-" + String.From(Random.RandomInteger(100000000, 999999999)) + "-" + String.From(Random.RandomInteger(100000000, 999999999)))
+            If Not candidate.Exists() Then
+                If candidate.CreateFolder(False) Then
+                    folder = candidate
+                    Exit For
+                End If
+            End If
+        Next
+        If folder = Nil Then Throw New InvalidArgumentException("Could not create a private preview folder.")
+        Me.Folder = folder.FullPath()
+        If plan.ProjectFolder <> "" Then
+            Dim project As New FileSystemItem(plan.ProjectFolder)
+            Me.StagedCount = 0
+            Me.StagedBytes = 0
+            Me.CopyProject(project, folder, 0)
+            Dim packages As FileSystemItem = project.Child("packages")
+            If packages.IsFolder() Then
+                StudioPreviewCheckDiskPath(packages)
+                Dim staged As FileSystemItem = folder.Child("packages")
+                If Not staged.CreateFolder(False) Then Throw New InvalidArgumentException("Could not create staged project packages folder")
+                For Each archive As FileSystemItem In packages.Children()
+                    If archive.IsFile() And String.Compare(String.Right(archive.Name(), 7), ".buipkg", True) = 0 Then
+                        Me.CopyFile(archive, staged.Child(archive.Name()))
+                    End If
+                Next
+            End If
+        End If
+        Dim previewLibrary As FileSystemItem = FileSystemItem.AppResource("studio-previewkit-0.1.0.buipkg")
+        If previewLibrary = Nil Then Throw New InvalidArgumentException("Studio's bundled PreviewKit archive was not found; rebuild Studio.")
+        If Not previewLibrary.IsFile() Then Throw New InvalidArgumentException("Studio's bundled PreviewKit archive was not found; rebuild Studio.")
+        Dim packageFolder As FileSystemItem = folder.Child("packages")
+        If Not packageFolder.CreateFolder(True) Then Throw New InvalidArgumentException("Could not create preview packages folder.")
+        Dim bundledCopy As FileSystemItem = packageFolder.Child("previewkit-0.1.0.buipkg")
+        If bundledCopy.Exists() Then Call bundledCopy.Delete()
+        If Not previewLibrary.CopyTo(bundledCopy) Then Throw New InvalidArgumentException("Could not stage Studio's PreviewKit archive.")
+        Dim paths As New Map Of String, Boolean()
+        For Each source As StudioPreviewSource In plan.Sources
+            If source = Nil Then Throw New InvalidArgumentException("Missing preview source.")
+            StudioPreviewCheckPath(source.FileName)
+            If Not String.EndsWith(source.FileName, ".bui", True) Or String.Compare(source.FileName, StudioPreviewPlan.HarnessFileName, False) = 0 Then Throw New InvalidArgumentException("Unsafe preview source path.")
+            Dim key As String = String.LCase(source.FileName)
+            If paths.ContainsKey(key) Then Throw New InvalidArgumentException("Ambiguous preview source path: " + source.FileName)
+            paths.Set(key, True)
+            If Not New FileSystemItem(folder.Child(source.FileName).ParentPath()).CreateFolder(True) Then Throw New InvalidArgumentException("Could not create preview source folder.")
+            Dim written As Result Of Integer, String = folder.Child(source.FileName).WriteAllText(source.Text)
+            If written.IsErr Then Throw New InvalidArgumentException("Could not stage " + source.FileName + ": " + written.Error)
+        Next
+        Dim harness As Result Of Integer, String = folder.Child(StudioPreviewPlan.HarnessFileName).WriteAllText(plan.Harness())
+        If harness.IsErr Then Throw New InvalidArgumentException("Could not write the preview harness: " + harness.Error)
+    End Sub
+
+    ''' Stages the plan and starts the compiler check. Never waits for the compiler.
+    ''' Precondition failures throw before a new Progress tree exists; staging failures
+    ''' remove the partial folder and fail the new tree instead of throwing.
+    Public Sub Start(plan As StudioPreviewPlan, compilerPath As String)
+        If Me.IsActive() Then Throw New InvalidArgumentException("A preview is already running. Stop it first.")
+        If plan = Nil Then Throw New InvalidArgumentException("Choose a layout to preview.")
+        If compilerPath = "" Then Throw New InvalidArgumentException("The Buoy compiler was not found. Put buoy on PATH or set BUOY_STUDIO_COMPILER.")
+        Me.CompilerPath = compilerPath
+        Me.Plan = plan
+        Me.Diagnostics = []
+        Me.Differences = []
+        Me.GeometryReported = False
+        Me.mTreeConfirmed = True
+        Me.mStopStarted = 0
+        Me.mLaunchedAt = 0
+        Me.mProgress = New ProgressNode(StudioPreviewProgressText("Preview " + plan.RootName))
+        Me.mLeaves = Me.mProgress.Split([1.0, 4.0, 1.0, 1.0])
+        Me.mProgress.Start()
+        Me.ReportLeaf(0, "Staging " + plan.RootName)
+        Try
+            Me.Stage(plan)
+        Catch e As Exception
+            Me.Fail("Preview could not stage " + plan.RootName + ": " + e.Message)
+            Return
+        End Try
+        If plan.LintReport <> Nil Then
+            Me.Announce("GUI lint: source snapshot only; native accessibility and interaction behaviour remain unverified.")
+            Dim findings As JSONItem = plan.LintReport.Value("diagnostics")
+            For i As Integer = 0 To findings.Count() - 1
+                Dim finding As JSONItem = findings.ValueAt(i)
+                Me.Announce("  " + finding.Value("rule").AsString().Or("") + " " + finding.Value("control").AsString().Or("") + ": " + finding.Value("message").AsString().Or(""))
+            Next
+            Me.Announce("GUI lint: " + String.From(findings.Count()) + " finding(s), " + String.From(plan.LintReport.Value("unverified").Count()) + " unverified check(s).")
+        End If
+        Dim arguments As Array Of String = [StudioPreviewPlan.HarnessFileName, "--check", "--diagnostic-format", "json"]
+        Me.ReportLeaf(0, "Checking " + plan.RootName)
+        Me.Launch(compilerPath, arguments, "checking")
+        If Me.State = "checking" Then Me.Announce("Preview: checking " + plan.RootName + " with " + compilerPath + "…")
+    End Sub
+
+    Private Sub Launch(executable As String, arguments As Array Of String, state As String)
+        Me.mOutput = ""
+        Me.mErrors = ""
+        Me.mExited = 0
+        Try
+            Me.mProcess = New PipeProcess(executable, arguments, Me.Folder, True)
+            Me.mProcess.CloseInput()
+        Catch e As Exception
+            If Me.mProcess <> Nil Then Me.mProcess.Close()
+            Me.mProcess = Nil
+            Me.Fail("Preview could not start " + executable + ": " + e.Message)
+            Return
+        End Try
+        Me.State = state
+        Me.mPoller.Start()
+        Me.Changed()
+    End Sub
+
+    Private Sub Drain()
+        For i As Integer = 1 To 32
+            Dim read As Boolean = False
+            Dim chunk As Bytes = Me.mProcess.ReadOutput(65536)
+            If chunk.Count > 0 Then
+                read = True
+                If String.Len(Me.mOutput) < 1048576 Then Me.mOutput += String.Left(chunk.ToString(Text.Encodings.UTF8), 1048576 - String.Len(Me.mOutput))
+            End If
+            Dim errorChunk As Bytes = Me.mProcess.ReadError(65536)
+            If errorChunk.Count > 0 Then
+                read = True
+                If String.Len(Me.mErrors) < 65536 Then Me.mErrors += String.Left(errorChunk.ToString(Text.Encodings.UTF8), 65536 - String.Len(Me.mErrors))
+            End If
+            If Not read Then Exit For
+        Next
+    End Sub
+
+    ''' Advances the job from the UI timer.
+    Public Sub Poll()
+        If Me.mProcess = Nil Then
+            Me.mPoller.Stop()
+            Return
+        End If
+        Try
+            Me.Drain()
+            If Me.State = "stopping" Then
+                Me.PollStopping()
+                Return
+            End If
+            If Me.State = "running" And Not Me.GeometryReported Then Me.ReadGeometry()
+            If Me.State = "running" And Me.LeafOpen(3) And System.Microseconds() - Me.mLaunchedAt > StudioPreviewJob.InspectTimeoutMicroseconds Then
+                Me.mLeaves(3).Fail("No runtime bounds within 30 seconds")
+                Me.Announce("Preview: " + Me.Plan.RootName + " reported no runtime bounds within 30 seconds; it keeps running until closed or stopped.")
+                Me.Changed()
+            End If
+            If Me.mProcess.Poll() Then Return
+            Me.Drain()
+            If Me.mExited = 0 Then Me.mExited = System.Microseconds()
+            If (Not Me.mProcess.OutputClosed Or Not Me.mProcess.ErrorClosed) And System.Microseconds() - Me.mExited < 2000000 Then Return
+            Dim code As Integer = Me.mProcess.ExitCode
+            Me.ReleaseProcess()
+            Me.Advance(code)
+        Catch e As Exception
+            Dim stopping As Boolean = Me.State = "stopping"
+            Me.Kill()
+            If stopping Then
+                Me.AcknowledgeStop()
+            Else
+                Me.Fail("Preview failed: " + e.Message)
+            End If
+        End Try
+    End Sub
+
+    Private Sub Advance(code As Integer)
+        Select Case Me.State
+            Case "checking"
+                Me.ReadDiagnostics()
+                If code <> 0 Or Array.Count(Me.Diagnostics) > 0 Then
+                    If Array.Count(Me.Diagnostics) = 0 Then Me.Diagnostics.Append(String.Trim(Me.mErrors + " " + Me.mOutput))
+                    For Each line As String In Me.Diagnostics
+                        Me.Announce("Preview error: " + line)
+                    Next
+                    Me.Fail("Preview: " + Me.Plan.RootName + " does not compile (" + String.From(Array.Count(Me.Diagnostics)) + " error(s)). The roots of previewed layouts must be Public.")
+                    Return
+                End If
+                Me.CompleteLeaf(0, "Harness compiles")
+                If Me.CheckOnly Then
+                    Me.Finish("Preview: harness for " + Me.Plan.RootName + " compiles cleanly.", "Skipped: check only")
+                    Return
+                End If
+                Me.ReportLeaf(1, "Building " + Me.Plan.RootName)
+                ' A nonempty array literal is fixed-size at runtime; start empty so Append can grow it.
+                Dim arguments As Array Of String = []
+                arguments.Append(StudioPreviewPlan.HarnessFileName)
+                arguments.Append("--app-type")
+                arguments.Append("desktop")
+                arguments.Append("-o")
+                arguments.Append(Path.Join(Me.Folder, "preview"))
+                #If TargetLinux Then
+                    Dim lifecycle As FileSystemItem = FileSystemItem.AppResource("studio-gtk-lifecycle.o")
+                    If lifecycle = Nil Then
+                        Me.Fail("Preview: the bundled Linux lifecycle guard is missing. Rebuild Studio before starting a native preview.")
+                        Return
+                    End If
+                    If Not lifecycle.IsFile() Then
+                        Me.Fail("Preview: the bundled Linux lifecycle guard is missing. Rebuild Studio before starting a native preview.")
+                        Return
+                    End If
+                    arguments.Append("--extra-obj")
+                    arguments.Append(lifecycle.FullPath())
+                #End If
+                Me.Launch(Me.CompilerPath, arguments, "building")
+                If Me.State = "building" Then Me.Announce("Preview: building " + Me.Plan.RootName + "…")
+            Case "building"
+                If code <> 0 Then
+                    Me.Diagnostics.Append(String.Trim(Me.mErrors + "\n" + Me.mOutput))
+                    Me.Announce("Preview build error: " + String.Trim(Me.mErrors + " " + Me.mOutput))
+                    Me.Fail("Preview: building " + Me.Plan.RootName + " failed (exit " + String.From(code) + ").")
+                    Return
+                End If
+                Dim binary As String = Me.BinaryPath()
+                If binary = "" Then
+                    Me.CompleteLeaf(1, "Compiler exited successfully")
+                    Me.Fail("Preview: the compiler reported success but produced no executable.")
+                    Return
+                End If
+                Me.CompleteLeaf(1, "Built " + Me.Plan.RootName)
+                Me.ReportLeaf(2, "Launching " + Me.Plan.RootName)
+                Me.Launch(binary, [Me.ReportPath], "running")
+                If Me.State = "running" Then
+                    Me.mLaunchedAt = System.Microseconds()
+                    Me.CompleteLeaf(2, "Launched " + Me.Plan.RootName)
+                    Me.ReportLeaf(3, "Waiting for runtime bounds")
+                    Me.Announce("Preview: " + Me.Plan.RootName + " is running in the native runtime. Close its window or choose Stop Preview to end it.")
+                End If
+            Case "running"
+                If Not Me.GeometryReported Then Me.ReadGeometry()
+                If Not Me.GeometryReported Then
+                    Me.Fail("Preview: " + Me.Plan.RootName + " closed before reporting runtime bounds (exit " + String.From(code) + ").")
+                    Return
+                End If
+                Me.Finish("Preview: " + Me.Plan.RootName + " closed (exit " + String.From(code) + ").", "")
+        End Select
+    End Sub
+
+    Private Function BinaryPath() As String
+        Dim plain As New FileSystemItem(Path.Join(Me.Folder, "preview"))
+        If plain.IsFile() Then Return plain.FullPath()
+        Dim windows As New FileSystemItem(Path.Join(Me.Folder, "preview.exe"))
+        If windows.IsFile() Then Return windows.FullPath()
+        Dim bundle As New FileSystemItem(Path.Join(Me.Folder, "preview.app"))
+        If bundle.IsFolder() Then
+            #If TargetMac Then
+                Dim plist As Ptr = PreviewDictionary(PreviewClass("NSDictionary"), CType(bundle.Child("Contents").Child("Info.plist").FullPath(), CFStringRef))
+                If plist = Nil Then Return ""
+                Dim value As Ptr = PreviewDictionaryValue(plist, CType("CFBundleExecutable", CFStringRef))
+                If value = Nil Then Return ""
+                If Not PreviewIsString(value, PreviewClass("NSString")) Then Return ""
+                Dim name As String = CType(CType(value, CFStringRef), String)
+                If name = "" Or name = "." Or name = ".." Then Return ""
+                If String.Contains(name, "/") Or String.Contains(name, "\\") Then Return ""
+                Dim executable As FileSystemItem = bundle.Child("Contents").Child("MacOS").Child(name)
+                If executable.IsFile() Then Return executable.FullPath()
+            #End If
+        End If
+        Return ""
+    End Function
+
+    Private Sub ReadDiagnostics()
+        Me.Diagnostics = []
+        Dim parsed As Optional Of JSONItem = Json.TryParse(String.Trim(Me.mOutput))
+        If Not parsed.HasValue Then Return
+        Dim errors As JSONItem = parsed.Value.Value("errors")
+        If Not errors.IsArray() Then Return
+        For i As Integer = 0 To errors.Count() - 1
+            Dim item As JSONItem = errors.ValueAt(i)
+            Dim file As String = item.Value("file").AsString().Or("?")
+            If String.StartsWith(file, Me.Folder) And String.Len(file) > String.Len(Me.Folder) + 1 Then file = String.Substring(file, String.Len(Me.Folder) + 1)
+            Dim location As String = file + ":" + String.From(Math.Round(item.Value("line").AsNumber().Or(0.0))) + ":" + String.From(Math.Round(item.Value("character").AsNumber().Or(0.0)))
+            Me.Diagnostics.Append(location + ": " + item.Value("message").AsString().Or(""))
+        Next
+    End Sub
+
+    ''' Compares the runtime bounds report with the designer's literal frames.
+    Private Sub ReadGeometry()
+        Dim file As New FileSystemItem(Me.ReportPath)
+        If Not file.IsFile() Then Return
+        Dim contents As Result Of String, String = file.ReadAllText()
+        If contents.IsErr Then Return
+        Dim parsed As Optional Of JSONItem = Json.TryParse(String.Trim(contents.Value))
+        If Not parsed.HasValue Then Return
+        Dim report As JSONItem = parsed.Value
+        If Not StudioPreviewGeometryUsable(Me.Plan, report) Then Return
+        Me.GeometryReported = True
+        Me.Differences = StudioPreviewCompare(Me.Plan, report)
+        If Array.Count(Me.Differences) = 0 Then
+            Me.CompleteLeaf(3, "Runtime bounds match the designer")
+            Me.Announce("Preview: native runtime bounds match the designer for " + String.From(Array.Count(Me.Plan.Frames)) + " controls.")
+        Else
+            Me.CompleteLeaf(3, "Runtime bounds differ for " + String.From(Array.Count(Me.Differences)) + " item(s)")
+            Me.Announce("Preview: native runtime bounds differ from the designer for " + String.From(Array.Count(Me.Differences)) + " item(s):")
+            For Each difference As String In Me.Differences
+                Me.Announce("  " + difference)
+            Next
+        End If
+        Me.Changed()
+    End Sub
+
+    ''' Forces the owned process tree down. Polling (or Close) still has to reap it.
+    Private Sub TerminateProcess()
+        If Me.mProcess = Nil Then Return
+        Try
+            Me.mProcess.TerminateTree()
+        Catch e As Exception
+            Me.mTreeConfirmed = False
+            Try
+                Me.mProcess.Terminate()
+            Catch inner As Exception
+                ' Already gone; Close reaps it.
+            End Try
+        End Try
+    End Sub
+
+    ''' Close reaps the child, kills the owned tree and can wait for the OS to finish.
+    Private Sub ReleaseProcess()
+        If Me.mProcess <> Nil Then
+            Try
+                Me.mProcess.Close()
+            Catch e As Exception
+                Me.mTreeConfirmed = False
+            End Try
+        End If
+        Me.mProcess = Nil
+        Me.mPoller.Stop()
+    End Sub
+
+    Private Sub Kill()
+        If Me.mProcess = Nil Then Return
+        Me.TerminateProcess()
+        Me.ReleaseProcess()
+    End Sub
+
+    ''' Requests a stop without blocking the UI: the process tree is terminated now and
+    ''' the stop is acknowledged from Poll once the child has exited (or after the
+    ''' grace period, when Close forces it). Ignored when nothing is active.
+    Public Sub StopPreview()
+        If Not Me.IsActive() Or Me.State = "stopping" Then Return
+        If Me.mProgress <> Nil Then Me.mProgress.Cancellation.Request()
+        If Me.mProcess = Nil Then
+            Me.AcknowledgeStop()
+            Return
+        End If
+        Me.TerminateProcess()
+        Me.State = "stopping"
+        Me.mStopStarted = System.Microseconds()
+        Me.mPoller.Start()
+        Me.Announce("Preview: stopping…")
+        Me.Changed()
+    End Sub
+
+    ''' Stops synchronously: used to restart a preview and when Studio closes.
+    ''' Close waits for the OS; this method has no hard shutdown deadline.
+    Public Sub StopAndWait()
+        If Not Me.IsActive() Then Return
+        If Me.mProgress <> Nil Then Me.mProgress.Cancellation.Request()
+        Me.Kill()
+        Me.AcknowledgeStop()
+    End Sub
+
+    Private Sub PollStopping()
+        Dim exited As Boolean = Not Me.mProcess.Poll()
+        If Not exited And System.Microseconds() - Me.mStopStarted < StudioPreviewJob.StopTimeoutMicroseconds Then Return
+        If Not exited Then Me.Announce("Preview: the process did not exit after termination; forcing it closed.")
+        Me.ReleaseProcess()
+        Me.AcknowledgeStop()
+    End Sub
+
+    ''' The child is reaped; remove staging, then acknowledge the cancellation.
+    Private Sub AcknowledgeStop()
+        Me.State = "stopped"
+        Me.mPoller.Stop()
+        Me.Cleanup()
+        If Me.CleanupError <> "" Then
+            Me.State = "failed"
+            Me.SettleLeaves("failed", Me.CleanupError, "Skipped: preview cleanup failed")
+            Me.Announce(Me.CleanupError)
+            Me.Changed()
+            Return
+        Else
+            Me.SettleLeaves("cancelled", "Preview stopped", "Skipped: preview stopped")
+        End If
+        If Me.mTreeConfirmed Then
+            Me.Announce("Preview child exited; process-tree termination requested. Detached descendants cannot be verified.")
+        Else
+            Me.Announce("Preview stopped, but Studio could not confirm that every process started by the preview exited.")
+        End If
+        Me.Changed()
+    End Sub
+
+    Private Sub Fail(message As String)
+        Me.State = "failed"
+        Me.mPoller.Stop()
+        Me.Cleanup()
+        If Me.CleanupError <> "" Then message += "; " + Me.CleanupError
+        Me.SettleLeaves("failed", message, "Skipped after an earlier failure")
+        Me.Announce(message)
+        Me.Changed()
+    End Sub
+
+    Private Sub Finish(message As String, skipped As String)
+        Me.State = "finished"
+        Me.mPoller.Stop()
+        Me.Cleanup()
+        If Me.CleanupError <> "" Then
+            Me.State = "failed"
+            Me.SettleLeaves("failed", Me.CleanupError, "Skipped: preview cleanup failed")
+            message += "; " + Me.CleanupError
+        Else
+            Me.SettleLeaves("succeeded", skipped, skipped)
+        End If
+        Me.Announce(message)
+        Me.Changed()
+    End Sub
+
+    Private Sub Cleanup()
+        Me.CleanupError = ""
+        If Me.KeepFolder Or Me.Folder = "" Then Return
+        Try
+            Dim item As New FileSystemItem(Me.Folder)
+            If item.Exists() Then
+                If Not item.Delete(True) Then Throw New InvalidArgumentException("Directory deletion failed")
+            End If
+        Catch e As Exception
+            Me.CleanupError = StudioPreviewProgressText("Preview cleanup failed; retained " + Me.Folder + ": " + e.Message)
+            Dim recorded As Boolean = False
+            For Each retained As String In Me.RetainedFolders
+                If String.Compare(retained, Me.Folder, True) = 0 Then recorded = True
+            Next
+            If Not recorded Then Me.RetainedFolders.Append(Me.Folder)
+            Me.Announce(Me.CleanupError)
+        End Try
+    End Sub
+
+    ''' Called when Studio closes: never leave a preview child behind. Waits for it.
+    Public Sub Shutdown()
+        Me.KeepFolder = False
+        Me.HostLink = Nil
+        Me.StopAndWait()
+        Me.Cleanup()
+    End Sub
+End Class
+
+''' A report must contain root dimensions and one complete observation per tracked control.
+Public Function StudioPreviewGeometryUsable(plan As StudioPreviewPlan, report As JSONItem) As Boolean
+    If report = Nil Then Return False
+    If Not report.IsObject() Then Return False
+    For Each key As String In ["width", "height"]
+        If Not report.Value(key).IsNumber() Then Return False
+        Dim value As Double = report.Value(key).AsNumber().Value
+        If value <> value Or value <= 0 Or value > 2147483647.0 Then Return False
+    Next
+    Dim controls As JSONItem = report.Value("controls")
+    If Not controls.IsArray() Then Return False
+    For Each frame As StudioPreviewFrame In plan.Frames
+        Dim matches As Integer = 0
+        For i As Integer = 0 To controls.Count() - 1
+            Dim observed As JSONItem = controls.ValueAt(i)
+            If Not observed.IsObject() Then Return False
+            If String.Compare(observed.Value("member").AsString().Or(""), frame.Name, True) <> 0 Then Continue For
+            matches += 1
+            For Each key As String In ["x", "y", "width", "height"]
+                If Not observed.Value(key).IsNumber() Then Return False
+                Dim value As Double = observed.Value(key).AsNumber().Value
+                If value <> value Or value < -2147483647.0 Or value > 2147483647.0 Then Return False
+                If (key = "width" Or key = "height") And value < 0 Then Return False
+            Next
+        Next
+        If matches <> 1 Then Return False
+    Next
+    Return True
+End Function
+
+''' Human-readable differences between designer frames and a runtime bounds report
+''' from PreviewKit, with one named control observation per source path.
+Public Function StudioPreviewCompare(plan As StudioPreviewPlan, report As JSONItem) As Array Of String
+    Dim differences As Array Of String = []
+    If report.Value("width").IsNumber() And report.Value("height").IsNumber() Then
+        Dim w As Integer = Math.Round(report.Value("width").AsNumber().Value)
+        Dim h As Integer = Math.Round(report.Value("height").AsNumber().Value)
+        If w <> plan.RootWidth Or h <> plan.RootHeight Then differences.Append(plan.RootName + ": designer " + String.From(plan.RootWidth) + "×" + String.From(plan.RootHeight) + " · native " + String.From(w) + "×" + String.From(h))
+    End If
+    Dim controls As JSONItem = report.Value("controls")
+    For Each frame As StudioPreviewFrame In plan.Frames
+        Dim bounds As JSONItem = Nil
+        Dim count As Integer = 0
+        For i As Integer = 0 To controls.Count() - 1
+            Dim observed As JSONItem = controls.ValueAt(i)
+            If String.Compare(observed.Value("member").AsString().Or(""), frame.Name, False) <> 0 Then Continue For
+            bounds = observed
+            count += 1
+        Next
+        If count <> 1 Then
+            differences.Append(frame.Name + ": no unique runtime bounds")
+            Continue For
+        End If
+        If Not bounds.Value("x").IsNumber() Or Not bounds.Value("y").IsNumber() Or Not bounds.Value("width").IsNumber() Or Not bounds.Value("height").IsNumber() Then
+            differences.Append(frame.Name + ": incomplete runtime bounds")
+            Continue For
+        End If
+        Dim x As Integer = Math.Round(bounds.Value("x").AsNumber().Value)
+        Dim y As Integer = Math.Round(bounds.Value("y").AsNumber().Value)
+        Dim w As Integer = Math.Round(bounds.Value("width").AsNumber().Value)
+        Dim h As Integer = Math.Round(bounds.Value("height").AsNumber().Value)
+        If x <> frame.X Or y <> frame.Y Or w <> frame.Width Or h <> frame.Height Then
+            differences.Append(frame.Name + ": designer (" + String.From(frame.X) + ", " + String.From(frame.Y) + ", " + String.From(frame.Width) + ", " + String.From(frame.Height) + ") · native (" + String.From(x) + ", " + String.From(y) + ", " + String.From(w) + ", " + String.From(h) + ")")
+        End If
+    Next
+    Return differences
+End Function

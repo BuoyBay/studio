@@ -1,0 +1,174 @@
+Import diffkit
+
+''' Hosts must reject stale revisions/text atomically and record accepted edits in editor undo.
+Public Interface StudioDiffHost
+    Function ApplyDiffEdit(documentID As String, expectedRevision As Integer, expectedText As String, replacement As String, undoLabel As String) As Boolean
+    Function ResolveExternalChange(documentID As String, expectedRevision As Integer, expectedLocal As String, expectedDisk As String, choice As String) As Boolean
+End Interface
+
+Public Class StudioDiffSnapshot
+    Private Property IDValue As String
+    Private Property LabelValue As String
+    Private Property TextValue As String
+    Private Property RevisionValue As Integer
+    Public Sub Constructor(documentID As String, label As String, text As String, revision As Integer)
+        Me.IDValue = documentID
+        Me.LabelValue = label
+        Me.TextValue = text
+        Me.RevisionValue = revision
+    End Sub
+    Public Property DocumentID As String
+        Get
+            Return Me.IDValue
+        End Get
+    End Property
+    Public Property Label As String
+        Get
+            Return Me.LabelValue
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return Me.TextValue
+        End Get
+    End Property
+    Public Property Revision As Integer
+        Get
+            Return Me.RevisionValue
+        End Get
+    End Property
+End Class
+
+Public Function StudioDiffDisplay(text As String) As String
+    #If TargetWindows Then
+        Return String.Replace(String.Replace(text, "\r\n", "\n"), "\n", "\r\n")
+    #Else
+        Return text
+    #End If
+End Function
+
+Private Function SafeLabel(label As String) As String
+    Return String.Replace(String.Replace(String.Replace(label, "\n", " "), "\r", " "), "\t", " ")
+End Function
+
+Public Class StudioDiffSession
+    Private Property LeftValue As StudioDiffSnapshot
+    Private Property RightValue As StudioDiffSnapshot
+    Private Property DiffValue As TextDiff
+    Private Property Failure As String
+    Public Sub Constructor(left As StudioDiffSnapshot, right As StudioDiffSnapshot)
+        If left = Nil Or right = Nil Then Throw New InvalidArgumentException("Two snapshots are required")
+        Me.LeftValue = left
+        Me.RightValue = right
+        If String.LenBytes(left.Text) > 1048576 Or String.LenBytes(right.Text) > 1048576 Then
+            Me.Failure = "Comparison refused: a snapshot exceeds 1 MiB. Compare smaller regions."
+            Return
+        End If
+        For Each snapshotText As String In [left.Text, right.Text]
+            Dim encoded As Bytes = Bytes.FromString(snapshotText, Text.Encodings.UTF8)
+            For i As Integer = 0 To encoded.Count - 1
+                If encoded.Item(i) = 0 Then
+                    Me.Failure = "Comparison refused: binary text containing NUL is not supported."
+                    Return
+                End If
+            Next
+        Next
+        Try
+            Me.DiffValue = DiffLines(left.Text, right.Text, 1000000)
+        Catch e As Exception
+            Me.Failure = "Comparison unavailable: " + e.Message
+        End Try
+    End Sub
+    Public Property Left As StudioDiffSnapshot
+        Get
+            Return Me.LeftValue
+        End Get
+    End Property
+    Public Property Right As StudioDiffSnapshot
+        Get
+            Return Me.RightValue
+        End Get
+    End Property
+    Public Property ErrorText As String
+        Get
+            Return Me.Failure
+        End Get
+    End Property
+    Public Property Hunks As Array Of LineHunk
+        Get
+            Dim empty() As LineHunk
+            If Me.DiffValue = Nil Then Return empty
+            Return Me.DiffValue.Hunks
+        End Get
+    End Property
+    Public Function Patch() As String
+        If Me.Failure <> "" Then Return Me.Failure
+        If Not Me.DiffValue.HasChanges Then Return "Snapshots are identical (including final newline)."
+        Return Me.DiffValue.UnifiedDiff(SafeLabel(Me.Left.Label), SafeLabel(Me.Right.Label), 3)
+    End Function
+    ''' Revert one right-side hunk to left, preserving exact CR/LF and final newline bytes.
+    Public Function RevertHunk(index As Integer, host As StudioDiffHost) As Boolean
+        If host = Nil Or Me.DiffValue = Nil Then Return False
+        Dim hunks As Array Of LineHunk = Me.DiffValue.Hunks
+        If index < 0 Or index >= Array.Count(hunks) Then Return False
+        Dim hunk As LineHunk = hunks(index)
+        Dim pieces As Array Of String = String.Split(Me.Right.Text, "\n")
+        Dim tokens() As String
+        For i As Integer = 0 To Array.Count(pieces) - 1
+            If i < Array.Count(pieces) - 1 Then
+                tokens.Append(pieces(i) + "\n")
+            ElseIf String.LenBytes(pieces(i)) > 0 Then
+                tokens.Append(pieces(i))
+            End If
+        Next
+        Dim output() As String
+        For i As Integer = 0 To hunk.NewStart - 1
+            output.Append(tokens(i))
+        Next
+        For Each line As String In hunk.OldLines
+            output.Append(line)
+        Next
+        For i As Integer = hunk.NewStart + hunk.NewCount To Array.Count(tokens) - 1
+            output.Append(tokens(i))
+        Next
+        Return host.ApplyDiffEdit(Me.Right.DocumentID, Me.Right.Revision, Me.Right.Text, String.Join(output, ""), "Revert comparison hunk")
+    End Function
+End Class
+
+''' Explicit three-snapshot review: no automatic merge and no hidden writes.
+Public Class StudioExternalReview
+    Private Property BaseValue As StudioDiffSnapshot
+    Private Property LocalValue As StudioDiffSnapshot
+    Private Property DiskValue As StudioDiffSnapshot
+    Private Property ResolvedValue As Boolean = False
+    Public Property IsResolved As Boolean
+        Get
+            Return Me.ResolvedValue
+        End Get
+    End Property
+    Public Sub Constructor(saved As StudioDiffSnapshot, local As StudioDiffSnapshot, disk As StudioDiffSnapshot)
+        If saved = Nil Or local = Nil Or disk = Nil Then Throw New InvalidArgumentException("Saved, local and disk snapshots are required")
+        If String.Compare(local.DocumentID, disk.DocumentID, True) <> 0 Or String.Compare(local.DocumentID, saved.DocumentID, True) <> 0 Then Throw New InvalidArgumentException("External review snapshots must belong to one document")
+        Me.BaseValue = saved
+        Me.LocalValue = local
+        Me.DiskValue = disk
+    End Sub
+    Public Function Comparison(choice As String) As StudioDiffSession
+        If choice = "saved-local" Then Return New StudioDiffSession(Me.BaseValue, Me.LocalValue)
+        If choice = "saved-disk" Then Return New StudioDiffSession(Me.BaseValue, Me.DiskValue)
+        If choice = "disk-local" Then Return New StudioDiffSession(Me.DiskValue, Me.LocalValue)
+        Throw New InvalidArgumentException("Unknown snapshot comparison choice")
+    End Function
+    Public Function Resolve(choice As String, host As StudioDiffHost) As Boolean
+        If Me.IsResolved Then Return False
+        If choice = "cancel" Then
+            Me.ResolvedValue = True
+            Return True
+        End If
+        If choice <> "reload" And choice <> "keep" Then Return False
+        If host = Nil Then Return False
+        Dim accepted As Boolean = host.ResolveExternalChange(Me.LocalValue.DocumentID, Me.LocalValue.Revision, Me.LocalValue.Text, Me.DiskValue.Text, choice)
+        If accepted Then Me.ResolvedValue = True
+        Return accepted
+    End Function
+End Class

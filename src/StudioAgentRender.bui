@@ -1,0 +1,661 @@
+Import projectkit
+Import StudioPreview
+Import layoutkit.LayoutDocument
+
+' Agent tool: render a Window/View layout from the registered project buffers to a PNG.
+'
+' The render reuses Studio's native-runtime preview pipeline (StudioPreviewJob): the
+' current buffers, including unsaved edits, are staged in a private folder; the real
+' compiler checks and builds a generated harness; the harness shows the layout and
+' then captures its own window in-process (AppKit cacheDisplay, GTK widget paintable
+' or Win32 PrintWindow). No desktop capture or Screen Recording permission is used.
+' The PNG is written to a Studio temp folder, never into the project tree.
+
+Private Sub SRKeys(input As JSONItem, allowed As Array Of String)
+    If input = Nil Or Not input.IsObject() Then Throw New InvalidArgumentException("Agent tool arguments must be an object")
+    For Each key As String In input.Keys()
+        Dim known As Boolean = False
+        For Each candidate As String In allowed
+            If String.Compare(key, candidate, True) = 0 Then known = True
+        Next
+        If Not known Then Throw New InvalidArgumentException("Unknown agent tool argument: " + key + ". Read inputSchema; argument names are case sensitive.")
+    Next
+End Sub
+
+Private Function SRInteger(input As JSONItem, key As String, minimum As Integer, maximum As Integer, fallback As Integer) As Integer
+    If Not input.HasKey(key) Then Return fallback
+    Dim problem As String = key + " must be an integer in " + String.From(minimum) + ".." + String.From(maximum)
+    If Not input.Value(key).IsNumber() Then Throw New InvalidArgumentException(problem)
+    Dim number As Double = input.Value(key).AsNumber().Or(0.0)
+    If number <> number Or number < minimum Or number > maximum Or number <> Math.Floor(number) Then Throw New InvalidArgumentException(problem)
+    Dim value As Integer = number
+    Return value
+End Function
+
+Private Function SRLeaf(relativePath As String) As String
+    Dim parts As Array Of String = String.Split(String.Replace(relativePath, "\\", "/"), "/")
+    Return parts(Array.Count(parts) - 1)
+End Function
+
+Private Function SRIsSource(item As ProjectItem) As Boolean
+    Return String.Compare(String.Right(item.RelativePath, 4), ".bui", False) = 0
+End Function
+
+Private Class StudioAgentRenderWatch Inherits Timer
+    Public Property Owner As Weak StudioAgentRenderTools
+    Public Overrides Sub NotifyTick()
+        Dim tools As StudioAgentRenderTools = Me.Owner
+        If tools <> Nil Then tools.Watch()
+    End Sub
+End Class
+
+''' Session-scoped, main-thread render tools. One render runs at a time.
+Public Class StudioAgentRenderTools Implements ProjectToolExtension, ProjectToolLifecycle
+    ''' Destination folder for PNGs; defaults to <temp>/buoy-studio-render.
+    Public Property OutputFolder As String = ""
+    Public Const KeptImages As Integer = 8
+    Private Property Workspace As ProjectWorkspace
+    Private Property ProjectRoot As String
+    Private Property Compiler As String
+    Private Property Job As StudioPreviewJob
+    Private Property RenderId As String = ""
+    Private Property Sequence As Integer = 0
+    Private Property ImagePath As String = ""
+    Private Property ItemId As String = ""
+    Private Property ItemPath As String = ""
+    Private Property ItemVersion As Integer = 0
+    Private Property ItemDirty As Boolean = False
+    Private Property RootName As String = ""
+    Private Property RootKind As String = ""
+    Private Property Appearance As String = "system"
+    Private Property RequestedWidth As Integer = 0
+    Private Property RequestedHeight As Integer = 0
+    Private Property Deadline As Integer = 0
+    Private Property TimedOut As Boolean = False
+    Private Property Outputs As Array Of String = []
+    Private Property Closed As Boolean = False
+    Private Property Watcher As StudioAgentRenderWatch = New StudioAgentRenderWatch()
+
+    Public Sub Constructor(workspace As ProjectWorkspace, projectRoot As String, compilerPath As String)
+        If workspace = Nil Then Throw New InvalidArgumentException("Render tools require a project workspace")
+        Me.Workspace = workspace
+        Me.ProjectRoot = projectRoot
+        Me.Compiler = compilerPath
+        Me.Watcher.Owner = Me
+        Me.Watcher.Period = 250
+    End Sub
+
+    Public Function Tools() As JSONItem
+        Dim tools As JSONItem = JSONItem.NewArray()
+        If Me.Closed Then Return tools
+        Dim start As JSONItem = JSONItem.NewObject()
+        start.Value("name") = "project_render"
+        start.Value("description") = "Render a Window or View layout from a registered .bui buffer (unsaved edits included) to a PNG so you can see the UI. Studio compiles a private preview harness with the real compiler, shows the layout in the native runtime and captures only that window's content area. Runs project constructors; takes several seconds; the preview window appears briefly. Layout files are staged at the project top level with the other top-level .bui buffers. width/height resize the root (native minimum sizes may enlarge it). appearance is per-process on macOS and Linux (GTK_THEME overrides it); Windows renders the system appearance and reports appearanceApplied false for dark. Returns renderId immediately; poll project_render_result for imagePath, then open the PNG with your image/file viewer. The PNG is written to a Studio temp folder, never the project."
+        start.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024,\"description\":\"Registered .bui item path containing the layout, e.g. MainWindow.bui\"},\"root\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":256,\"description\":\"Window or View type name; default is the first layout root in the file\"},\"width\":{\"type\":\"integer\",\"minimum\":16,\"maximum\":4096},\"height\":{\"type\":\"integer\",\"minimum\":16,\"maximum\":4096},\"appearance\":{\"type\":\"string\",\"enum\":[\"system\",\"light\",\"dark\"],\"default\":\"system\"},\"settleMs\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000,\"default\":1000},\"timeoutMs\":{\"type\":\"integer\",\"minimum\":5000,\"maximum\":300000,\"default\":120000}},\"required\":[\"path\"],\"additionalProperties\":false}")
+        start.Value("annotations") = Json.Parse("{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":false,\"openWorldHint\":true}")
+        tools.Add(start)
+        Dim read As JSONItem = JSONItem.NewObject()
+        read.Value("name") = "project_render_result"
+        read.Value("description") = "Read nonblocking progress/result for the latest renderId. When status is captured, imagePath names a PNG of the layout's content area (imageWidth x imageHeight logical points at scale). Also returns compiler diagnostics, designer-vs-native bounds differences for literal-frame controls (root size is omitted when width/height were requested) and a stale flag when the buffer changed after capture."
+        read.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"renderId\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128}},\"required\":[\"renderId\"],\"additionalProperties\":false}")
+        read.Value("annotations") = Json.Parse("{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}")
+        tools.Add(read)
+        Return tools
+    End Function
+
+    Public Function Call(name As String, input As JSONItem) As JSONItem
+        If Me.Closed Then Throw New InvalidArgumentException("Agent tool session is closed")
+        If String.Compare(name, "project_render", True) = 0 Then Return Me.Start(input)
+        If String.Compare(name, "project_render_result", True) = 0 Then
+            SRKeys(input, ["renderId"])
+            If Not input.Value("renderId").IsString() Then Throw New InvalidArgumentException("renderId is required; use the ID returned by project_render")
+            Dim requested As String = input.Value("renderId").AsString().Or("")
+            If Me.Job = Nil Or requested = "" Or String.Compare(requested, Me.RenderId, True) <> 0 Then Throw New InvalidArgumentException("Unknown renderId for this agent session; use the latest project_render result")
+            Return Me.State()
+        End If
+        Throw New InvalidArgumentException("Unknown render tool: " + name)
+    End Function
+
+    Private Function FindItem(itemPath As String) As ProjectItem
+        Dim normalized As String = String.Replace(itemPath, "\\", "/")
+        Dim folded As ProjectItem = Nil
+        Dim foldedCount As Integer = 0
+        For Each item As ProjectItem In Me.Workspace.Items()
+            Dim candidate As String = String.Replace(item.RelativePath, "\\", "/")
+            If String.Compare(candidate, normalized, True) = 0 Then Return item
+            If String.Compare(candidate, normalized, False) = 0 Then
+                folded = item
+                foldedCount += 1
+            End If
+        Next
+        If foldedCount = 1 Then Return folded
+        Throw New InvalidArgumentException("path must name one registered .bui item; use project_list_items")
+    End Function
+
+    Private Function NextImagePath() As String
+        Dim folderPath As String = Me.OutputFolder
+        If folderPath = "" Then folderPath = System.Folders.Temporary().Child("buoy-studio-render").FullPath()
+        Dim folder As New FileSystemItem(folderPath)
+        If Not folder.CreateFolder(True) Then Throw New InvalidArgumentException("Could not create the render output folder " + folderPath)
+        Me.Sequence += 1
+        Dim target As String = folder.Child("render-" + String.From(System.Microseconds()) + "-" + String.From(Me.Sequence) + ".png").FullPath()
+        Me.Outputs.Append(target)
+        While Array.Count(Me.Outputs) > StudioAgentRenderTools.KeptImages
+            Dim oldest As String = Me.Outputs(0)
+            Me.Outputs.RemoveAt(0)
+            Call New FileSystemItem(oldest).Delete()
+            Call New FileSystemItem(oldest + ".json").Delete()
+        Wend
+        Return target
+    End Function
+
+    Private Function Start(input As JSONItem) As JSONItem
+        SRKeys(input, ["path", "root", "width", "height", "appearance", "settleMs", "timeoutMs"])
+        If Me.Job <> Nil Then
+            Me.Job.Poll()
+            If Me.Job.IsActive() Then Throw New InvalidArgumentException("A render is already active; poll project_render_result until complete first")
+        End If
+        If Not input.Value("path").IsString() Then Throw New InvalidArgumentException("path is required: a registered .bui item path")
+        Dim itemPath As String = input.Value("path").AsString().Or("")
+        If itemPath = "" Or String.LenBytes(itemPath) > 1024 Then Throw New InvalidArgumentException("path must contain 1..1024 UTF-8 bytes")
+        Dim rootName As String = ""
+        If input.HasKey("root") Then
+            If Not input.Value("root").IsString() Then Throw New InvalidArgumentException("root must be a Window or View type name")
+            rootName = input.Value("root").AsString().Or("")
+            If rootName = "" Or String.LenBytes(rootName) > 256 Then Throw New InvalidArgumentException("root must contain 1..256 UTF-8 bytes")
+        End If
+        If input.HasKey("width") <> input.HasKey("height") Then Throw New InvalidArgumentException("width and height must be given together")
+        Dim width As Integer = SRInteger(input, "width", 16, 4096, 0)
+        Dim height As Integer = SRInteger(input, "height", 16, 4096, 0)
+        Dim appearance As String = "system"
+        If input.HasKey("appearance") Then
+            If Not input.Value("appearance").IsString() Then Throw New InvalidArgumentException("appearance must be system, light or dark")
+            appearance = input.Value("appearance").AsString().Or("")
+            If String.Compare(appearance, "system", True) <> 0 And String.Compare(appearance, "light", True) <> 0 And String.Compare(appearance, "dark", True) <> 0 Then Throw New InvalidArgumentException("appearance must be system, light or dark")
+        End If
+        Dim settle As Integer = SRInteger(input, "settleMs", 0, 10000, 1000)
+        Dim timeout As Integer = SRInteger(input, "timeoutMs", 5000, 300000, 120000)
+        Dim item As ProjectItem = Me.FindItem(itemPath)
+        If Not SRIsSource(item) Then Throw New InvalidArgumentException("path must name a .bui layout source")
+        Dim leaf As String = SRLeaf(item.RelativePath)
+        Dim moduleName As String = String.Left(leaf, String.Len(leaf) - 4)
+        Dim document As New LayoutDocument(item.Text, item.Version)
+        Dim root As LayoutNode = Nil
+        Dim names As Array Of String = []
+        For Each node As LayoutNode In document.Nodes
+            If node.ParentId <> "" Then Continue For
+            names.Append(node.Name)
+            If root = Nil And (rootName = "" Or String.Compare(node.Name, rootName, False) = 0) Then root = node
+        Next
+        If Array.Count(names) = 0 Then Throw New InvalidArgumentException(item.RelativePath + " declares no Window or View layout to render")
+        If root = Nil Then Throw New InvalidArgumentException("No layout root named " + rootName + " in " + item.RelativePath + "; available: " + String.Join(names, ", "))
+        Dim plan As StudioPreviewPlan = StudioPreviewPlan.ForRoot(document, root.Id, moduleName)
+        plan.LayoutRelativePath = item.RelativePath
+        If Me.ProjectRoot <> "" Then
+            If New FileSystemItem(Me.ProjectRoot).IsFolder() Then plan.ProjectFolder = Me.ProjectRoot
+        End If
+        ' Registered top-level buffers replace the folder's files, including unsaved text.
+        For Each other As ProjectItem In Me.Workspace.Items()
+            If other.Id = item.Id Or Not SRIsSource(other) Then Continue For
+            plan.AddSource(other.RelativePath, other.Text)
+        Next
+        plan.AddSource(item.RelativePath, item.Text)
+        plan.AddSource(StudioPreviewPlan.CaptureModuleName + ".bui", StudioRenderCaptureSource())
+        Dim compiler As String = Me.Compiler
+        If compiler = "" Then compiler = StudioCompilerPath()
+        If compiler = "" Then Throw New InvalidArgumentException("The Buoy compiler was not found; project_render needs the same compiler as project_check")
+        Dim imagePath As String = Me.NextImagePath()
+        plan.CapturePath = imagePath
+        plan.CaptureWidth = width
+        plan.CaptureHeight = height
+        plan.CaptureDelay = settle
+        If appearance <> "system" Then plan.CaptureAppearance = appearance
+        If Me.Job <> Nil Then Me.Job.Shutdown()
+        Me.Job = New StudioPreviewJob()
+        Me.RenderId = "render-" + String.From(System.Microseconds()) + "-" + String.From(Me.Sequence)
+        Me.ImagePath = imagePath
+        Me.ItemId = item.Id
+        Me.ItemPath = item.RelativePath
+        Me.ItemVersion = item.Version
+        Me.ItemDirty = item.IsDirty
+        Me.RootName = plan.RootName
+        Me.RootKind = plan.RootKind
+        Me.Appearance = appearance
+        Me.RequestedWidth = width
+        Me.RequestedHeight = height
+        Me.TimedOut = False
+        Me.Deadline = System.Microseconds() + timeout * 1000
+        Me.Job.Start(plan, compiler)
+        If Me.Job.IsActive() Then Me.Watcher.Start()
+        Return Me.State()
+    End Function
+
+    ''' Enforces the render deadline even when the agent is not polling.
+    Public Sub Watch()
+        If Me.Job = Nil Then
+            Me.Watcher.Stop()
+            Return
+        End If
+        If Not Me.Job.IsActive() Then
+            Me.Watcher.Stop()
+            Return
+        End If
+        If Me.Job.State <> "stopping" And System.Microseconds() > Me.Deadline Then
+            Me.TimedOut = True
+            Me.Job.StopPreview()
+        End If
+    End Sub
+
+    Private Function State() As JSONItem
+        If Me.Job.IsActive() Then
+            Me.Job.Poll()
+            Me.Watch()
+        End If
+        Dim output As JSONItem = JSONItem.NewObject()
+        output.Value("renderId") = Me.RenderId
+        output.Value("path") = Me.ItemPath
+        output.Value("itemId") = Me.ItemId
+        output.Value("version") = Me.ItemVersion
+        output.Value("dirty") = Me.ItemDirty
+        output.Value("root") = Me.RootName
+        output.Value("rootKind") = Me.RootKind
+        output.Value("appearance") = Me.Appearance
+        If Me.RequestedWidth > 0 Then
+            output.Value("requestedWidth") = Me.RequestedWidth
+            output.Value("requestedHeight") = Me.RequestedHeight
+        End If
+        output.Value("phase") = Me.Job.State
+        Dim complete As Boolean = Me.Job.IsComplete()
+        output.Value("complete") = complete
+        Dim stale As Boolean = True
+        Try
+            stale = Me.Workspace.ReadItem(Me.ItemId).Version <> Me.ItemVersion
+        Catch e As Exception
+            stale = True
+        End Try
+        output.Value("stale") = stale
+        Dim status As String = "pending"
+        Dim message As String = ""
+        If complete Then
+            Dim report As JSONItem = Nil
+            Dim reportFile As New FileSystemItem(Me.ImagePath + ".json")
+            If reportFile.IsFile() Then
+                Dim text As Result Of String, String = reportFile.ReadAllText()
+                If text.IsOk Then
+                    Dim parsed As Optional Of JSONItem = Json.TryParse(String.Trim(text.Value))
+                    If parsed.HasValue Then report = parsed.Value
+                End If
+            End If
+            Dim image As New FileSystemItem(Me.ImagePath)
+            If report <> Nil And image.IsFile() Then
+                If report.Value("status").AsString().Or("") = "captured" Then status = "captured"
+            End If
+            If status = "captured" Then
+                output.Value("imagePath") = Me.ImagePath
+                output.Value("mimeType") = "image/png"
+                output.Value("imageBytes") = image.Length()
+                output.Value("imageWidth") = report.Value("width").AsNumber().Or(0.0)
+                output.Value("imageHeight") = report.Value("height").AsNumber().Or(0.0)
+                output.Value("scale") = report.Value("scale").AsNumber().Or(1.0)
+                output.Value("appearanceApplied") = report.Value("appearanceApplied").AsBoolean().Or(False)
+                output.Value("imageDelivery") = "file: open imagePath with your image-capable file viewer (for example Read or view_image). Content area only, no title bar."
+            ElseIf Me.TimedOut Then
+                status = "timedOut"
+                message = "The render did not finish before timeoutMs; the preview process was stopped."
+            ElseIf Me.Job.State = "stopped" Then
+                status = "stopped"
+                message = "The render was stopped before a capture was written."
+            Else
+                status = "failed"
+                If report <> Nil Then message = report.Value("message").AsString().Or("")
+                If message = "" And Array.Count(Me.Job.Diagnostics) > 0 Then message = "The layout or its harness does not compile; see diagnostics. Previewed layout roots must be Public with a parameterless constructor."
+                If message = "" Then message = "The preview exited without writing a capture. Check that the layout constructs and shows without user interaction."
+            End If
+        End If
+        output.Value("status") = status
+        If message <> "" Then output.Value("message") = String.Left(message, 1024)
+        Dim diagnostics As JSONItem = JSONItem.NewArray()
+        For Each line As String In Me.Job.Diagnostics
+            If diagnostics.Count() >= 50 Then Exit For
+            diagnostics.Add(JSONItem.From(String.Left(line, 2048)))
+        Next
+        output.Value("diagnostics") = diagnostics
+        Dim differences As JSONItem = JSONItem.NewArray()
+        For Each line As String In Me.Job.Differences
+            ' A requested size changes the root on purpose; that is not a layout mismatch.
+            If Me.RequestedWidth > 0 And String.StartsWith(line, Me.RootName + ": designer ", True) Then Continue For
+            If differences.Count() >= 100 Then Exit For
+            differences.Add(JSONItem.From(String.Left(line, 512)))
+        Next
+        output.Value("boundsDifferences") = differences
+        Return output
+    End Function
+
+    Public Sub Shutdown()
+        If Me.Closed Then Return
+        Me.Closed = True
+        Me.Watcher.Stop()
+        If Me.Job <> Nil Then Me.Job.Shutdown()
+    End Sub
+
+    Public Sub Destructor()
+        Me.Shutdown()
+    End Sub
+End Class
+
+''' Source of the generated capture module staged beside each render harness.
+Public Function StudioRenderCaptureSource() As String
+    Dim lines As Array Of String = []
+    lines.Append("' Generated by Buoy Studio for project_render. Captures this process's own preview")
+    lines.Append("' window into a PNG; it never captures the desktop or other applications.")
+    lines.Append("#If TargetMac Then")
+    lines.Append("Sequential Structure RCPoint")
+    lines.Append("    X As Double")
+    lines.Append("    Y As Double")
+    lines.Append("End Structure")
+    lines.Append("Sequential Structure RCSize")
+    lines.Append("    W As Double")
+    lines.Append("    H As Double")
+    lines.Append("End Structure")
+    lines.Append("Sequential Structure RCRect")
+    lines.Append("    Origin As RCPoint")
+    lines.Append("    Size As RCSize")
+    lines.Append("End Structure")
+    lines.Append("Private Declare Function RCClass Lib \"objc\" Alias \"objc_getClass\" (name As String) As Ptr")
+    lines.Append("Private Declare Function RCApplication Lib \"AppKit\" Selector \"sharedApplication\" (cls As Ptr) As Ptr")
+    lines.Append("Private Declare Function RCAppearanceNamed Lib \"AppKit\" Selector \"appearanceNamed:\" (cls As Ptr, name As CFStringRef) As Ptr")
+    lines.Append("Private Declare Sub RCSetAppearance Lib \"AppKit\" Selector \"setAppearance:\" (obj As Ptr, appearance As Ptr)")
+    lines.Append("Private Declare Sub RCReleaseString Lib \"CoreFoundation\" Alias \"CFRelease\" (value As CFStringRef)")
+    lines.Append("Private Declare Function RCContentView Lib \"AppKit\" Selector \"contentView\" (window As Ptr) As Ptr")
+    lines.Append("Private Declare Sub RCDisplay Lib \"AppKit\" Selector \"displayIfNeeded\" (view As Ptr)")
+    lines.Append("Private Declare Function RCCacheRep Lib \"AppKit\" Selector \"bitmapImageRepForCachingDisplayInRect:\" (view As Ptr, rect As RCRect) As Ptr")
+    lines.Append("Private Declare Sub RCCache Lib \"AppKit\" Selector \"cacheDisplayInRect:toBitmapImageRep:\" (view As Ptr, rect As RCRect, rep As Ptr)")
+    lines.Append("Private Declare Function RCEncode Lib \"AppKit\" Selector \"representationUsingType:properties:\" (rep As Ptr, fileType As Integer, properties As Ptr) As Ptr")
+    lines.Append("Private Declare Function RCDictionary Lib \"Foundation\" Selector \"dictionary\" (cls As Ptr) As Ptr")
+    lines.Append("Private Declare Function RCLength Lib \"Foundation\" Selector \"length\" (data As Ptr) As Integer")
+    lines.Append("Private Declare Function RCBytes Lib \"Foundation\" Selector \"bytes\" (data As Ptr) As Ptr")
+    lines.Append("#ElseIf TargetWindows Then")
+    lines.Append("Sequential Structure RCBitmapInfo")
+    lines.Append("    Size As UInt32")
+    lines.Append("    Width As Int32")
+    lines.Append("    Height As Int32")
+    lines.Append("    Planes As UInt16")
+    lines.Append("    Bits As UInt16")
+    lines.Append("    Compression As UInt32")
+    lines.Append("    ImageSize As UInt32")
+    lines.Append("    XPels As Int32")
+    lines.Append("    YPels As Int32")
+    lines.Append("    Used As UInt32")
+    lines.Append("    Important As UInt32")
+    lines.Append("    Colors As UInt32")
+    lines.Append("End Structure")
+    lines.Append("Sequential Structure RCClientRect")
+    lines.Append("    Left As Int32")
+    lines.Append("    Top As Int32")
+    lines.Append("    Right As Int32")
+    lines.Append("    Bottom As Int32")
+    lines.Append("End Structure")
+    lines.Append("Private Optional Declare Function RCClient Lib \"user32\" Alias \"GetClientRect\" (window As Ptr, ByRef rect As RCClientRect) As Int32")
+    lines.Append("Private Optional Declare Function RCPrint Lib \"user32\" Alias \"PrintWindow\" (window As Ptr, dc As Ptr, options As UInt32) As Int32")
+    lines.Append("Private Optional Declare Function RCGetDC Lib \"user32\" Alias \"GetDC\" (window As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCReleaseDC Lib \"user32\" Alias \"ReleaseDC\" (window As Ptr, dc As Ptr) As Int32")
+    lines.Append("Private Optional Declare Function RCMemoryDC Lib \"gdi32\" Alias \"CreateCompatibleDC\" (dc As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCDeleteDC Lib \"gdi32\" Alias \"DeleteDC\" (dc As Ptr) As Int32")
+    lines.Append("Private Optional Declare Function RCDIB Lib \"gdi32\" Alias \"CreateDIBSection\" (dc As Ptr, info As Ptr, usage As UInt32, ByRef bits As Ptr, section As Ptr, offset As UInt32) As Ptr")
+    lines.Append("Private Optional Declare Function RCSelect Lib \"gdi32\" Alias \"SelectObject\" (dc As Ptr, obj As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCDelete Lib \"gdi32\" Alias \"DeleteObject\" (obj As Ptr) As Int32")
+    lines.Append("Private Optional Declare Function RCFlush Lib \"gdi32\" Alias \"GdiFlush\" () As Int32")
+    lines.Append("#Else")
+    lines.Append("Private Optional Declare Function RCInit Lib \"libgtk-4.so.1\" Alias \"gtk_init_check\" () As Int32")
+    lines.Append("Private Optional Declare Function RCSettings Lib \"libgtk-4.so.1\" Alias \"gtk_settings_get_default\" () As Ptr")
+    lines.Append("Sequential Structure RCGValue")
+    lines.Append("    TypeID As UInt64")
+    lines.Append("    A As UInt64")
+    lines.Append("    B As UInt64")
+    lines.Append("End Structure")
+    lines.Append("Private Optional Declare Function RCValueInit Lib \"libgobject-2.0.so.0\" Alias \"g_value_init\" (ByRef value As RCGValue, typeID As UInt64) As Ptr")
+    lines.Append("Private Optional Declare Sub RCValueBoolean Lib \"libgobject-2.0.so.0\" Alias \"g_value_set_boolean\" (ByRef value As RCGValue, flag As Int32)")
+    lines.Append("Private Optional Declare Sub RCValueUnset Lib \"libgobject-2.0.so.0\" Alias \"g_value_unset\" (ByRef value As RCGValue)")
+    lines.Append("Private Optional Declare Sub RCSetProperty Lib \"libgobject-2.0.so.0\" Alias \"g_object_set_property\" (obj As Ptr, name As String, ByRef value As RCGValue)")
+    lines.Append("Private Optional Declare Function RCChild Lib \"libgtk-4.so.1\" Alias \"gtk_window_get_child\" (window As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCWidth Lib \"libgtk-4.so.1\" Alias \"gtk_widget_get_width\" (widget As Ptr) As Int32")
+    lines.Append("Private Optional Declare Function RCHeight Lib \"libgtk-4.so.1\" Alias \"gtk_widget_get_height\" (widget As Ptr) As Int32")
+    lines.Append("Private Optional Declare Function RCScale Lib \"libgtk-4.so.1\" Alias \"gtk_widget_get_scale_factor\" (widget As Ptr) As Int32")
+    lines.Append("Private Optional Declare Function RCTranslate Lib \"libgtk-4.so.1\" Alias \"gtk_widget_translate_coordinates\" (source As Ptr, dest As Ptr, sx As Double, sy As Double, ByRef dx As Double, ByRef dy As Double) As Int32")
+    lines.Append("Private Optional Declare Function RCPaintable Lib \"libgtk-4.so.1\" Alias \"gtk_widget_paintable_new\" (widget As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCSnapshotNew Lib \"libgtk-4.so.1\" Alias \"gtk_snapshot_new\" () As Ptr")
+    lines.Append("Private Optional Declare Sub RCSnapshotScale Lib \"libgtk-4.so.1\" Alias \"gtk_snapshot_scale\" (snapshot As Ptr, sx As Single, sy As Single)")
+    lines.Append("Private Optional Declare Sub RCPaint Lib \"libgtk-4.so.1\" Alias \"gdk_paintable_snapshot\" (paintable As Ptr, snapshot As Ptr, width As Double, height As Double)")
+    lines.Append("Private Optional Declare Function RCNode Lib \"libgtk-4.so.1\" Alias \"gtk_snapshot_free_to_node\" (snapshot As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Sub RCNodeUnref Lib \"libgtk-4.so.1\" Alias \"gsk_render_node_unref\" (node As Ptr)")
+    lines.Append("Private Optional Declare Function RCRenderer Lib \"libgtk-4.so.1\" Alias \"gtk_native_get_renderer\" (widget As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCTexture Lib \"libgtk-4.so.1\" Alias \"gsk_renderer_render_texture\" (renderer As Ptr, node As Ptr, viewport As Ptr) As Ptr")
+    lines.Append("Private Optional Declare Function RCSavePNG Lib \"libgtk-4.so.1\" Alias \"gdk_texture_save_to_png\" (texture As Ptr, fileName As String) As Int32")
+    lines.Append("Private Optional Declare Sub RCUnref Lib \"libgobject-2.0.so.0\" Alias \"g_object_unref\" (obj As Ptr)")
+    lines.Append("Sequential Structure RCViewport")
+    lines.Append("    X As Single")
+    lines.Append("    Y As Single")
+    lines.Append("    W As Single")
+    lines.Append("    H As Single")
+    lines.Append("End Structure")
+    lines.Append("#End If")
+    lines.Append("")
+    lines.Append("Private Class StudioRenderState")
+    lines.Append("    Public Shared Property Mode As String = \"\"")
+    lines.Append("    Public Shared Property PixelScale As Double = 0.0")
+    lines.Append("End Class")
+    lines.Append("")
+    lines.Append("''' Requests a process-local light/dark appearance before the preview is built.")
+    lines.Append("''' Returns False when this platform has no per-process appearance switch.")
+    lines.Append("Public Function StudioRenderApplyAppearance(mode As String) As Boolean")
+    lines.Append("    If mode <> \"light\" And mode <> \"dark\" Then Return False")
+    lines.Append("    StudioRenderState.Mode = mode")
+    lines.Append("    #If TargetMac Then")
+    lines.Append("        Dim name As String = \"NSAppearanceNameAqua\"")
+    lines.Append("        If mode = \"dark\" Then name = \"NSAppearanceNameDarkAqua\"")
+    lines.Append("        Dim nativeName As CFStringRef = CType(name, CFStringRef)")
+    lines.Append("        Try")
+    lines.Append("            Dim appearance As Ptr = RCAppearanceNamed(RCClass(\"NSAppearance\"), nativeName)")
+    lines.Append("            If appearance = Nil Then Return False")
+    lines.Append("            RCSetAppearance(RCApplication(RCClass(\"NSApplication\")), appearance)")
+    lines.Append("            Return True")
+    lines.Append("        Finally")
+    lines.Append("            RCReleaseString(nativeName)")
+    lines.Append("        End Try")
+    lines.Append("    #ElseIf TargetWindows Then")
+    lines.Append("        ' Win32 common controls have no supported per-process dark appearance.")
+    lines.Append("        Return mode = \"light\" And Not System.IsDarkMode")
+    lines.Append("    #Else")
+    lines.Append("        If RCInit() = 0 Then Return False")
+    lines.Append("        Dim settings As Ptr = RCSettings()")
+    lines.Append("        If settings = Nil Then Return False")
+    lines.Append("        Dim flag As Int32 = 0")
+    lines.Append("        If mode = \"dark\" Then flag = 1")
+    lines.Append("        Dim value As RCGValue")
+    lines.Append("        RCValueInit(value, 20) ' G_TYPE_BOOLEAN")
+    lines.Append("        RCValueBoolean(value, flag)")
+    lines.Append("        RCSetProperty(settings, \"gtk-application-prefer-dark-theme\", value)")
+    lines.Append("        RCValueUnset(value)")
+    lines.Append("        Return System.EnvironmentVariable(\"GTK_THEME\").Or(\"\") = \"\"")
+    lines.Append("    #End If")
+    lines.Append("End Function")
+    lines.Append("")
+    lines.Append("''' Scopes the requested appearance to the preview window itself (macOS).")
+    lines.Append("Private Sub StudioRenderApplyWindowAppearance(host As Window)")
+    lines.Append("    #If TargetMac Then")
+    lines.Append("        If StudioRenderState.Mode = \"\" Or host.NativeWidget = Nil Then Return")
+    lines.Append("        Dim name As String = \"NSAppearanceNameAqua\"")
+    lines.Append("        If StudioRenderState.Mode = \"dark\" Then name = \"NSAppearanceNameDarkAqua\"")
+    lines.Append("        Dim nativeName As CFStringRef = CType(name, CFStringRef)")
+    lines.Append("        Try")
+    lines.Append("            Dim appearance As Ptr = RCAppearanceNamed(RCClass(\"NSAppearance\"), nativeName)")
+    lines.Append("            If appearance <> Nil Then RCSetAppearance(host.NativeWidget, appearance)")
+    lines.Append("        Finally")
+    lines.Append("            RCReleaseString(nativeName)")
+    lines.Append("        End Try")
+    lines.Append("    #End If")
+    lines.Append("End Sub")
+    lines.Append("")
+    lines.Append("''' One capture of the window's content area into target; returns \"\" or an error.")
+    lines.Append("Private Function StudioRenderWrite(host As Window, target As String) As String")
+    lines.Append("    If host.NativeWidget = Nil Then Return \"the preview window has no native handle\"")
+    lines.Append("    #If TargetMac Then")
+    lines.Append("        Dim view As Ptr = RCContentView(host.NativeWidget)")
+    lines.Append("        If view = Nil Then Return \"the preview window has no content view\"")
+    lines.Append("        Dim bounds As RCRect = { Origin: { X: 0.0, Y: 0.0 }, Size: { W: host.Width * 1.0, H: host.Height * 1.0 } }")
+    lines.Append("        RCDisplay(view)")
+    lines.Append("        Dim rep As Ptr = RCCacheRep(view, bounds)")
+    lines.Append("        If rep = Nil Then Return \"AppKit returned no bitmap for the content view\"")
+    lines.Append("        RCCache(view, bounds, rep)")
+    lines.Append("        Dim data As Ptr = RCEncode(rep, 4, RCDictionary(RCClass(\"NSDictionary\")))")
+    lines.Append("        If data = Nil Then Return \"AppKit could not encode the capture as PNG\"")
+    lines.Append("        Dim length As Integer = RCLength(data)")
+    lines.Append("        If length <= 0 Then Return \"AppKit produced an empty PNG\"")
+    lines.Append("        Dim png As New Bytes(length)")
+    lines.Append("        png.Append(RCBytes(data), length)")
+    lines.Append("        ' Keep AppKit's backing-scale PNG byte for byte.")
+    lines.Append("        Dim opened As Result Of BinaryStream, IOError = BinaryStream.Create(New FileSystemItem(target))")
+    lines.Append("        If opened.IsErr Then Return \"could not write the PNG: \" + opened.Error.Message")
+    lines.Append("        Dim stream As BinaryStream = opened.Value")
+    lines.Append("        Try")
+    lines.Append("            stream.Write(png)")
+    lines.Append("        Finally")
+    lines.Append("            stream.Close()")
+    lines.Append("        End Try")
+    lines.Append("        StudioRenderState.PixelScale = host.ScaleFactor")
+    lines.Append("        Return \"\"")
+    lines.Append("    #ElseIf TargetWindows Then")
+    lines.Append("        Dim client As RCClientRect")
+    lines.Append("        If RCClient(host.NativeWidget, client) = 0 Then Return \"GetClientRect failed\"")
+    lines.Append("        Dim pw As Integer = client.Right - client.Left")
+    lines.Append("        Dim ph As Integer = client.Bottom - client.Top")
+    lines.Append("        If pw <= 0 Or ph <= 0 Then Return \"the preview window has an empty client area\"")
+    lines.Append("        Dim screen As Ptr = RCGetDC(host.NativeWidget)")
+    lines.Append("        Dim memory As Ptr = Nil")
+    lines.Append("        Dim bitmap As Ptr = Nil")
+    lines.Append("        Dim previous As Ptr = Nil")
+    lines.Append("        Try")
+    lines.Append("            memory = RCMemoryDC(screen)")
+    lines.Append("            If memory = Nil Then Return \"CreateCompatibleDC failed\"")
+    lines.Append("            Dim info As RCBitmapInfo")
+    lines.Append("            info.Size = 40")
+    lines.Append("            info.Width = pw")
+    lines.Append("            info.Height = -ph ' Top-down BGRA.")
+    lines.Append("            info.Planes = 1")
+    lines.Append("            info.Bits = 32")
+    lines.Append("            Dim pixels As Ptr = Nil")
+    lines.Append("            bitmap = RCDIB(memory, CType(info, Ptr), 0, pixels, Nil, 0)")
+    lines.Append("            If bitmap = Nil Or pixels = Nil Then Return \"CreateDIBSection failed\"")
+    lines.Append("            previous = RCSelect(memory, bitmap)")
+    lines.Append("            ' PW_CLIENTONLY | PW_RENDERFULLCONTENT: this window only, never the desktop.")
+    lines.Append("            If RCPrint(host.NativeWidget, memory, 3) = 0 Then Return \"PrintWindow failed\"")
+    lines.Append("            RCFlush()")
+    lines.Append("            Dim rgba As New Bytes(pw * ph * 4)")
+    lines.Append("            rgba.Append(pixels, pw * ph * 4)")
+    lines.Append("            For i As Integer = 0 To rgba.Count - 1 Step 4")
+    lines.Append("                Dim blue As Integer = rgba.Item(i)")
+    lines.Append("                rgba.SetItem(i, rgba.Item(i + 2))")
+    lines.Append("                rgba.SetItem(i + 2, blue)")
+    lines.Append("                rgba.SetItem(i + 3, 255)")
+    lines.Append("            Next")
+    lines.Append("            Dim image As Picture = Picture.FromBuffer(rgba.DataPtr(), rgba.Count, 0, pw, ph)")
+    lines.Append("            If image = Nil Then Return \"could not build a Picture from the captured pixels\"")
+    lines.Append("            If host.Width > 0 Then StudioRenderState.PixelScale = pw / (host.Width * 1.0)")
+    lines.Append("            Dim saved As Result Of Boolean, IOError = image.Save(New FileSystemItem(target), Picture.ImageFormat.PNG)")
+    lines.Append("            If saved.IsErr Then Return \"could not write the PNG: \" + saved.Error.Message")
+    lines.Append("            Return \"\"")
+    lines.Append("        Finally")
+    lines.Append("            If previous <> Nil Then RCSelect(memory, previous)")
+    lines.Append("            If bitmap <> Nil Then RCDelete(bitmap)")
+    lines.Append("            If memory <> Nil Then RCDeleteDC(memory)")
+    lines.Append("            If screen <> Nil Then RCReleaseDC(host.NativeWidget, screen)")
+    lines.Append("        End Try")
+    lines.Append("    #Else")
+    lines.Append("        Dim window As Ptr = host.NativeWidget")
+    lines.Append("        Dim child As Ptr = RCChild(window)")
+    lines.Append("        If child = Nil Then Return \"the GTK window has no content child\"")
+    lines.Append("        Dim w As Integer = RCWidth(child)")
+    lines.Append("        Dim h As Integer = RCHeight(child)")
+    lines.Append("        If w <= 0 Or h <= 0 Then Return \"the GTK content is not allocated yet\"")
+    lines.Append("        Dim scale As Integer = RCScale(window)")
+    lines.Append("        If scale < 1 Then scale = 1")
+    lines.Append("        ' Paint the whole window (its themed background included), then crop the")
+    lines.Append("        ' render to the content child so client-side title bars and shadows drop out.")
+    lines.Append("        Dim ox As Double = 0.0")
+    lines.Append("        Dim oy As Double = 0.0")
+    lines.Append("        If RCTranslate(child, window, 0.0, 0.0, ox, oy) = 0 Then Return \"the GTK content is not inside its window\"")
+    lines.Append("        Dim ww As Integer = RCWidth(window)")
+    lines.Append("        Dim wh As Integer = RCHeight(window)")
+    lines.Append("        If ww <= 0 Or wh <= 0 Then Return \"the GTK window is not allocated yet\"")
+    lines.Append("        Dim paintable As Ptr = RCPaintable(window)")
+    lines.Append("        If paintable = Nil Then Return \"gtk_widget_paintable_new failed\"")
+    lines.Append("        Dim node As Ptr = Nil")
+    lines.Append("        Dim texture As Ptr = Nil")
+    lines.Append("        Try")
+    lines.Append("            Dim snapshot As Ptr = RCSnapshotNew()")
+    lines.Append("            RCSnapshotScale(snapshot, scale, scale)")
+    lines.Append("            RCPaint(paintable, snapshot, ww, wh)")
+    lines.Append("            node = RCNode(snapshot)")
+    lines.Append("            If node = Nil Then Return \"the GTK content produced no render node\"")
+    lines.Append("            Dim renderer As Ptr = RCRenderer(window)")
+    lines.Append("            If renderer = Nil Then Return \"the GTK window has no renderer\"")
+    lines.Append("            Dim viewport As RCViewport = { X: ox * scale, Y: oy * scale, W: w * scale, H: h * scale }")
+    lines.Append("            texture = RCTexture(renderer, node, CType(viewport, Ptr))")
+    lines.Append("            If texture = Nil Then Return \"GSK could not render the window content\"")
+    lines.Append("            If RCSavePNG(texture, target) = 0 Then Return \"could not write the PNG\"")
+    lines.Append("            StudioRenderState.PixelScale = scale * 1.0")
+    lines.Append("            Return \"\"")
+    lines.Append("        Finally")
+    lines.Append("            If texture <> Nil Then RCUnref(texture)")
+    lines.Append("            If node <> Nil Then RCNodeUnref(node)")
+    lines.Append("            RCUnref(paintable)")
+    lines.Append("        End Try")
+    lines.Append("    #End If")
+    lines.Append("End Function")
+    lines.Append("")
+    lines.Append("Public Class StudioRenderCapture Inherits Timer")
+    lines.Append("    Public Shared Property Active As StudioRenderCapture")
+    lines.Append("    Public Property Host As Window")
+    lines.Append("    Public Property Target As String")
+    lines.Append("    Public Property AppearanceApplied As Boolean")
+    lines.Append("")
+    lines.Append("    Public Overrides Sub NotifyTick()")
+    lines.Append("        Me.Stop()")
+    lines.Append("        Dim report As JSONItem = JSONItem.NewObject()")
+    lines.Append("        report.Value(\"appearanceApplied\") = Me.AppearanceApplied")
+    lines.Append("        Dim problem As String = \"\"")
+    lines.Append("        Try")
+    lines.Append("            problem = StudioRenderWrite(Me.Host, Me.Target)")
+    lines.Append("        Catch e As Exception")
+    lines.Append("            problem = e.Message")
+    lines.Append("        End Try")
+    lines.Append("        If problem = \"\" Then")
+    lines.Append("            report.Value(\"status\") = \"captured\"")
+    lines.Append("            report.Value(\"width\") = Me.Host.Width")
+    lines.Append("            report.Value(\"height\") = Me.Host.Height")
+    lines.Append("            Dim pixelScale As Double = StudioRenderState.PixelScale")
+    lines.Append("            If pixelScale <= 0.0 Then pixelScale = Me.Host.ScaleFactor")
+    lines.Append("            report.Value(\"scale\") = pixelScale")
+    lines.Append("        Else")
+    lines.Append("            report.Value(\"status\") = \"failed\"")
+    lines.Append("            report.Value(\"message\") = problem")
+    lines.Append("        End If")
+    lines.Append("        Call New FileSystemItem(Me.Target + \".json\").WriteAllText(report.ToString())")
+    lines.Append("        Application.Quit()")
+    lines.Append("    End Sub")
+    lines.Append("End Class")
+    lines.Append("")
+    lines.Append("''' Captures host once after delayMs, writes target plus target.json, then quits.")
+    lines.Append("Public Sub StudioRenderSchedule(host As Window, target As String, appearanceApplied As Boolean, delayMs As Integer)")
+    lines.Append("    Dim capture As New StudioRenderCapture()")
+    lines.Append("    capture.Host = host")
+    lines.Append("    capture.Target = target")
+    lines.Append("    capture.AppearanceApplied = appearanceApplied")
+    lines.Append("    StudioRenderApplyWindowAppearance(host)")
+    lines.Append("    capture.Period = delayMs")
+    lines.Append("    If capture.Period < 1 Then capture.Period = 1")
+    lines.Append("    StudioRenderCapture.Active = capture")
+    lines.Append("    capture.Start()")
+    lines.Append("End Sub")
+    Return String.Join(lines, "\n") + "\n"
+End Function

@@ -1,0 +1,19 @@
+Import StudioDocumentIO
+
+Public Class StudioShellFormatFrame
+    Public Property Before As JSONItem
+    Public Property After As JSONItem
+    Public Property ChangesText As Boolean
+End Class
+
+''' Stable directory key; the stored session also verifies the exact workspace path
+''' so a hash collision is refused rather than sharing another project's recovery.
+Public Function StudioShellStateKey(identity As String) As String
+    Dim first As Integer = 17
+    Dim second As Integer = 29
+    For Each character As String In String.Chars(identity)
+        first = (first * 131 + String.Asc(character)) Mod 2147483647
+        second = (second * 257 + String.Asc(character)) Mod 2147483629
+    Next
+    Return String.From(first) + "-" + String.From(second)
+End Function

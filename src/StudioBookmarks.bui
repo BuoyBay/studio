@@ -1,0 +1,100 @@
+Import StudioNavigation
+
+''' Source bookmarks are independent of breakpoints and document-format bookmarks.
+Public Class StudioSourceBookmark
+    Public Property Location As StudioLocation
+    Public Property Label As String
+    Public Property NeedsReview As Boolean = False
+End Class
+
+Public Class StudioBookmarks
+    Private Property Values As Array Of StudioSourceBookmark = []
+    Public Function Items() As Array Of StudioSourceBookmark
+        Dim copies As Array Of StudioSourceBookmark = []
+        For Each item As StudioSourceBookmark In Me.Values
+            Dim copy As New StudioSourceBookmark()
+            copy.Location = item.Location.Copy()
+            copy.Label = item.Label
+            copy.NeedsReview = item.NeedsReview
+            copies.Append(copy)
+        Next
+        Return copies
+    End Function
+    Public Sub Toggle(location As StudioLocation, label As String = "")
+        If location = Nil Or location.DocumentID = "" Then Return
+        Dim retained As Array Of StudioSourceBookmark = []
+        Dim found As Boolean = False
+        For Each item As StudioSourceBookmark In Me.Values
+            If item.Location.DocumentID = location.DocumentID And item.Location.Line = location.Line Then
+                found = True
+            Else
+                retained.Append(item)
+            End If
+        Next
+        If Not found Then
+            Dim item As New StudioSourceBookmark()
+            item.Location = location.Copy()
+            item.Label = label
+            retained.Append(item)
+        End If
+        Me.Values = retained
+    End Sub
+    ''' A committed edit replaces removedLines starting at firstLine with addedLines.
+    ''' Revision mismatch marks stale bookmarks rather than applying guessed offsets.
+    Public Sub Remap(documentID As String, beforeRevision As String, afterRevision As String, firstLine As Integer, removedLines As Integer, addedLines As Integer)
+        If firstLine < 1 Or removedLines < 0 Or addedLines < 0 Then Throw New InvalidArgumentException("Invalid bookmark edit range")
+        For Each item As StudioSourceBookmark In Me.Values
+            Dim loc As StudioLocation = item.Location
+            If loc.DocumentID <> documentID Then Continue For
+            If loc.Revision <> beforeRevision Then
+                item.NeedsReview = True
+                Continue For
+            End If
+            If loc.Line >= firstLine + removedLines Then
+                loc.Line = Math.Max(1, loc.Line + addedLines - removedLines)
+            ElseIf loc.Line >= firstLine Then
+                loc.Line = firstLine
+                loc.Column = 1
+                item.NeedsReview = True
+            End If
+            loc.Revision = afterRevision
+        Next
+    End Sub
+    Public Sub Save(domain As String)
+        Dim values As JSONItem = JSONItem.NewArray()
+        For Each item As StudioSourceBookmark In Me.Values
+            Dim row As JSONItem = JSONItem.NewObject()
+            row.Value("id") = item.Location.DocumentID
+            row.Value("path") = item.Location.Path
+            row.Value("revision") = item.Location.Revision
+            row.Value("line") = item.Location.Line
+            row.Value("column") = item.Location.Column
+            row.Value("label") = item.Label
+            row.Value("review") = item.NeedsReview
+            values.Add(row)
+        Next
+        Prefs.Set(domain, "navigation.sourceBookmarks", Json.Stringify(values))
+    End Sub
+    Public Sub Load(domain As String)
+        Dim parsed As Optional Of JSONItem = Json.TryParse(Prefs.Get(domain, "navigation.sourceBookmarks", "[]"))
+        If Not parsed.HasValue Then Return
+        If Not parsed.Value.IsArray() Then Return
+        Dim values As Array Of StudioSourceBookmark = []
+        For i As Integer = 0 To Math.Min(999, parsed.Value.Count() - 1)
+            Dim row As JSONItem = parsed.Value.ValueAt(i)
+            If Not row.IsObject() Then Continue For
+            Dim item As New StudioSourceBookmark()
+            item.Location = New StudioLocation()
+            item.Location.DocumentID = row.Value("id").AsString().Or("")
+            If item.Location.DocumentID = "" Then Continue For
+            item.Location.Path = row.Value("path").AsString().Or("")
+            item.Location.Revision = row.Value("revision").AsString().Or("")
+            item.Location.Line = Math.Max(1, Math.Round(row.Value("line").AsNumber().Or(1.0)))
+            item.Location.Column = Math.Max(1, Math.Round(row.Value("column").AsNumber().Or(1.0)))
+            item.Label = row.Value("label").AsString().Or("")
+            item.NeedsReview = row.Value("review").AsBoolean().Or(False)
+            values.Append(item)
+        Next
+        Me.Values = values
+    End Sub
+End Class

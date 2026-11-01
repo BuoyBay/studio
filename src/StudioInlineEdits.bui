@@ -1,0 +1,93 @@
+''' One previewed edit against a source snapshot. Offsets count Unicode codepoints.
+Public Class StudioInlineEdit
+    Public Property Start As Integer
+    Public Property Length As Integer
+    Public Property Text As String
+
+    Public Sub Constructor(start As Integer, length As Integer, text As String)
+        Me.Start = start
+        Me.Length = length
+        Me.Text = text
+    End Sub
+End Class
+
+''' Remove generated text already present immediately after the cursor. Stay on this
+''' line: a coincidental match with a later line must not hide an intended insertion.
+Public Function StudioInlineInsertion(text As String, suffix As String) As String
+    Dim line As String = String.Split(suffix, "\n", True)(0)
+    For size As Integer = Math.Min(String.Len(text), String.Len(line)) To 1 Step -1
+        If String.Compare(String.Right(text, size), String.Left(line, size), True) = 0 Then Return String.Left(text, String.Len(text) - size)
+    Next
+    Return text
+End Function
+
+''' Validate the entire sequence before showing any edit. A stable sorted, disjoint
+''' sequence makes remapping later edits after each acceptance unambiguous.
+Public Function StudioInlineValidate(source As String, edits As Array Of StudioInlineEdit) As Boolean
+    If Array.Count(edits) = 0 Or Array.Count(edits) > 16 Then Return False
+    Dim previousEnd As Integer = -1
+    Dim previousStart As Integer = -1
+    Dim total As Integer = 0
+    For Each edit As StudioInlineEdit In edits
+        If edit = Nil Then Return False
+        If edit.Start < 0 Or edit.Length < 0 Or edit.Start > String.Len(source) Then Return False
+        If edit.Length > String.Len(source) - edit.Start Then Return False
+        If edit.Start < previousEnd Or edit.Start = previousStart Then Return False
+        If String.Contains(edit.Text, "```") Or String.Contains(edit.Text, "\r") Then Return False
+        total += String.Len(edit.Text) + edit.Length
+        If total > 16384 Or String.Len(edit.Text) > 8192 Then Return False
+        If String.Compare(String.Substring(source, edit.Start, edit.Length), edit.Text, True) = 0 Then Return False
+        previousStart = edit.Start
+        previousEnd = edit.Start + edit.Length
+    Next
+    Return True
+End Function
+
+''' Structured agent edits require an exact oldText match for every snapshot range.
+''' Invalid JSON, fractional/missing offsets, overlapping or no-op edits reject as a unit.
+Public Function StudioInlineResponse(source As String, response As String) As Array Of StudioInlineEdit
+    If String.Len(response) > 65536 Then Return []
+    Dim edits As Array Of StudioInlineEdit = []
+    Try
+        Dim payload As JSONItem = Json.Parse(response)
+        Dim items As JSONItem = payload.Value("edits")
+        If Not items.IsArray() Or items.Count() = 0 Or items.Count() > 16 Then Return []
+        For i As Integer = 0 To items.Count() - 1
+            Dim item As JSONItem = items.ValueAt(i)
+            Dim startValue As Double = item.Value("start").AsNumber().Or(-1.0)
+            Dim endValue As Double = item.Value("end").AsNumber().Or(-1.0)
+            If startValue < 0.0 Or endValue < startValue Or endValue > String.Len(source) Then Return []
+            Dim start As Integer = Math.Round(startValue)
+            Dim finish As Integer = Math.Round(endValue)
+            If startValue <> start Or endValue <> finish Then Return []
+            If Not item.Value("text").IsString() Or Not item.Value("oldText").IsString() Then Return []
+            Dim oldText As String = item.Value("oldText").AsString().Or("")
+            If String.Compare(String.Substring(source, start, finish - start), oldText, True) <> 0 Then Return []
+            edits.Append(New StudioInlineEdit(start, finish - start, item.Value("text").AsString().Or("")))
+        Next
+        If Not StudioInlineValidate(source, edits) Then Return []
+        Return edits
+    Catch e As Exception
+        Return []
+    End Try
+End Function
+
+''' Convert an LSP UTF-16 position to a codepoint offset; reject split surrogates.
+Public Function StudioInlineLspOffset(source As String, line As Integer, units As Integer) As Integer
+    If line < 0 Or units < 0 Then Return -1
+    Dim lines As Array Of String = String.Split(source, "\n", True)
+    If line >= Array.Count(lines) Then Return String.Len(source)
+    Dim start As Integer = 0
+    For i As Integer = 0 To line - 1
+        start += String.Len(lines(i)) + 1
+    Next
+    Dim seen As Integer = 0
+    Dim column As Integer = 0
+    For Each character As String In String.Chars(lines(line))
+        If seen = units Then Return start + column
+        seen += If(String.Asc(character) > 65535, 2, 1)
+        column += 1
+    Next
+    If seen = units Then Return start + column
+    Return -1
+End Function

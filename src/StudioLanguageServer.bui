@@ -1,0 +1,1721 @@
+Import processkit
+
+' Asynchronous client for the Buoy toolchain's stdio language server (buoy-lsp).
+'
+' Studio owns one StudioLanguageServer per project. The editor calls Sync with the
+' current buffer text and then asks for definitions, references, hover text, document
+' symbols or renames. Answers arrive later through StudioLanguageServerListener, held
+' through a StudioLanguageServerLink the host keeps alive (the server only holds the
+' link weakly, like the other Studio jobs).
+'
+' Positions are 0-based lines and 0-based codepoint columns on both sides; the
+' conversion to and from LSP's UTF-16 units happens here. Returned paths are local
+' file paths (backslash separated on Windows).
+'
+' buoy-lsp answers definition/hover with null until it has published diagnostics for a
+' document, so requests wait for that (AnalysisTimeoutMilliseconds at most) before
+' they are sent.
+
+''' One location in a result: a definition, a reference, a document symbol (Name, Kind,
+''' Detail, Container, Depth) or a rename edit (NewText).
+Public Class StudioLanguageLocation
+    Public Property Path As String
+    ''' Path relative to the project root with "/" separators, or "" when outside it.
+    Public Property RelativePath As String
+    Public Property Uri As String
+    Public Property Line As Integer
+    Public Property Column As Integer
+    Public Property EndLine As Integer
+    Public Property EndColumn As Integer
+    Public Property Name As String
+    Public Property Detail As String
+    ''' LSP SymbolKind number (5 class, 6 method, 7 property, 12 function, 13 variable...).
+    Public Property Kind As Integer = 0
+    Public Property Container As String
+    Public Property Depth As Integer = 0
+    Public Property DocumentVersion As Integer = -1
+    Public Property NewText As String
+End Class
+
+''' The answer to one request. Kind is "definition", "references", "hover", "symbols",
+''' "prepareRename" or "rename". Error is "" unless the request failed, timed out or the
+''' server stopped; an empty answer (keyword, builtin without source) is not an error.
+Public Class StudioLanguageResult
+    Public Property RequestId As Integer
+    Public Property Kind As String
+    ''' The request's document and 0-based codepoint position.
+    Public Property Path As String
+    Public Property Line As Integer
+    Public Property Column As Integer
+    Public Property Locations As Array Of StudioLanguageLocation = []
+    ''' Hover markdown as sent by the server, e.g. "```buoy\nString.Trim As String\n```".
+    Public Property Hover As String
+    ''' The first fenced code block of Hover, e.g. "String.Trim As String".
+    Public Property HoverSignature As String
+    ''' prepareRename: the server's placeholder (or "" when it did not send one).
+    Public Property Placeholder As String
+    Public Property Error As String
+    Public Property Raw As JSONItem
+    Public Property Version As Integer = 0
+    Public Property SourceText As String
+
+    Public Sub AddLocation(location As StudioLanguageLocation)
+        Me.Locations.Append(location)
+    End Sub
+
+    Public Function Found() As Boolean
+        Return Me.Error = "" And (Array.Count(Me.Locations) > 0 Or Me.Hover <> "")
+    End Function
+End Class
+
+Public Interface StudioLanguageServerListener
+    ''' state is "starting", "ready", "restarting", "stopped" or "failed".
+    Sub LanguageServerStateChanged(state As String, message As String)
+    Sub DefinitionReady(answer As StudioLanguageResult)
+    Sub ReferencesReady(answer As StudioLanguageResult)
+    Sub HoverReady(answer As StudioLanguageResult)
+    Sub DocumentSymbolsReady(answer As StudioLanguageResult)
+    ''' Both prepareRename (Kind "prepareRename") and rename (Kind "rename") answers.
+    Sub RenameReady(answer As StudioLanguageResult)
+End Interface
+
+Public Interface StudioLanguageFeatureListener
+    Sub LanguageFeatureReady(answer As StudioLanguageResult)
+    Sub LanguageDiagnosticsReady(answer As StudioLanguageResult)
+End Interface
+
+Public Class StudioLanguageServerLink
+    Public Property Listener As StudioLanguageServerListener
+End Class
+
+''' Locates buoy-lsp: BUOY_LSP, then BUOY_ROOT, then the standard install roots, then
+''' next to every `buoy` executable on PATH. Returns "" when none exists.
+Public Function StudioLanguageServerPath() As String
+    Dim ext As String = ""
+    #If TargetWindows Then
+        ext = ".exe"
+    #End If
+    Dim configured As String = System.EnvironmentVariable("BUOY_LSP").Or("")
+    If configured <> "" Then Return configured
+    Dim roots As Array Of String = []
+    Dim root As String = System.EnvironmentVariable("BUOY_ROOT").Or("")
+    If root <> "" Then roots.Append(root)
+    #If TargetMac Then
+        roots.Append("/Applications/Buoy")
+        roots.Append("/usr/local/share/buoy")
+        roots.Append("/opt/homebrew/share/buoy")
+    #ElseIf TargetWindows Then
+        roots.Append("C:\\Buoy")
+        Dim programs As String = System.EnvironmentVariable("ProgramFiles").Or("")
+        If programs <> "" Then roots.Append(Path.Join(programs, "Buoy"))
+        Dim local As String = System.EnvironmentVariable("LOCALAPPDATA").Or("")
+        If local <> "" Then roots.Append(Path.Join(Path.Join(local, "Programs"), "Buoy"))
+    #Else
+        roots.Append("/usr/share/buoy")
+        roots.Append("/usr/local/share/buoy")
+        roots.Append("/opt/buoy")
+    #End If
+    Dim separator As String = ":"
+    #If TargetWindows Then
+        separator = ";"
+    #End If
+    For Each folder As String In String.Split(System.EnvironmentVariable("PATH").Or(""), separator)
+        If folder = "" Then Continue For
+        If New FileSystemItem(Path.Join(folder, "buoy" + ext)).IsFile() Then
+            roots.Append(folder)
+            roots.Append(Path.Join(folder, ".."))
+            roots.Append(Path.Join(Path.Join(Path.Join(folder, ".."), "share"), "buoy"))
+        End If
+    Next
+    Dim slot As String = "linux-x64"
+    #If TargetMac Then
+        slot = "darwin-universal"
+    #ElseIf TargetWindows Then
+        slot = "win32-x64"
+        #If TargetArm Then
+            slot = "win32-arm64"
+        #End If
+    #ElseIf TargetArm Then
+        slot = "linux-arm64"
+    #End If
+    For Each candidateRoot As String In roots
+        Dim candidates As Array Of String = []
+        candidates.Append(Path.Join(Path.Join(Path.Join(candidateRoot, "editors"), "mcp"), "buoy-lsp" + ext))
+        candidates.Append(Path.Join(candidateRoot, "buoy-lsp" + ext))
+        candidates.Append(Path.Join(Path.Join(Path.Join(candidateRoot, "build"), "lsp"), "buoy-lsp" + ext))
+        candidates.Append(Path.Join(Path.Join(Path.Join(Path.Join(candidateRoot, "editors"), "vscode"), Path.Join("bin", slot)), "buoy-lsp" + ext))
+        For Each candidate As String In candidates
+            If New FileSystemItem(candidate).IsFile() Then Return candidate
+        Next
+    Next
+    Return ""
+End Function
+
+''' The stdlib prelude folder handed to buoy-lsp as initializationOptions.stdlibPath, or "".
+Private Function StudioLanguageServerStdlib(serverPath As String) As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STDLIB").Or("")
+    If configured <> "" And New FileSystemItem(configured).IsFolder() Then Return configured
+    Dim item As New FileSystemItem(serverPath)
+    Dim parent As FileSystemItem = item.Parent
+    If parent = Nil Then Return ""
+    Dim adjacent As FileSystemItem = parent.Child("stdlib")
+    If adjacent.IsFolder() Then Return adjacent.FullPath()
+    Dim root As String = System.EnvironmentVariable("BUOY_ROOT").Or("")
+    If root <> "" Then
+        Dim development As New FileSystemItem(Path.Join(Path.Join(root, "runtime"), "stdlib"))
+        If development.IsFolder() Then Return development.FullPath()
+    End If
+    Return ""
+End Function
+
+' ---- Path, URI and column helpers ---------------------------------------------------------
+
+Private Function LspIsAbsolute(value As String) As Boolean
+    If String.Left(value, 1) = "/" Or String.Left(value, 1) = "\\" Then Return True
+    Return String.Len(value) >= 2 And String.Mid(value, 2, 1) = ":"
+End Function
+
+Private Function LspPercentEncode(value As String) As String
+    Dim bytes As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    Dim output As String = ""
+    For i As Integer = 0 To bytes.Count - 1
+        Dim b As Integer = bytes.Item(i)
+        Dim plain As Boolean = (b >= 48 And b <= 57) Or (b >= 65 And b <= 90) Or (b >= 97 And b <= 122)
+        If b = 45 Or b = 46 Or b = 95 Or b = 126 Or b = 47 Then plain = True
+        If plain Then
+            output += String.Chr(b)
+        Else
+            Dim one As New Bytes()
+            one.Append(b)
+            output += "%" + String.UCase(one.ToHex())
+        End If
+    Next
+    Return output
+End Function
+
+Private Function LspPercentDecode(value As String) As String
+    If Not String.Contains(value, "%") Then Return value
+    Dim source As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    Dim output As New Bytes()
+    Dim i As Integer = 0
+    While i < source.Count
+        Dim b As Integer = source.Item(i)
+        If b = 37 And i + 2 < source.Count Then
+            Dim hex As New Bytes()
+            hex.Append(source.Item(i + 1))
+            hex.Append(source.Item(i + 2))
+            Dim decoded As Result Of Bytes, String = Bytes.FromHex(hex.ToString(Text.Encodings.UTF8))
+            If decoded.IsOk Then
+                output.Append(decoded.Value)
+                i += 3
+                Continue While
+            End If
+        End If
+        output.Append(b)
+        i += 1
+    End While
+    Try
+        Return output.ToString(Text.Encodings.UTF8)
+    Catch e As Exception
+        Return value
+    End Try
+End Function
+
+''' A local path as a file URI: drive letters become file:///C:/..., UNC paths
+''' file://server/share/..., and everything outside the unreserved set is percent-encoded.
+Public Function StudioLanguagePathToUri(localPath As String) As String
+    Dim p As String = String.Replace(localPath, "\\", "/")
+    If String.Left(p, 2) = "//" Then
+        Dim rest As String = String.Mid(p, 3)
+        Dim slash As Integer = String.IndexOf(rest, "/")
+        If slash < 0 Then Return "file://" + LspPercentEncode(rest) + "/"
+        Return "file://" + LspPercentEncode(String.Left(rest, slash)) + LspPercentEncode(String.Mid(rest, slash + 1))
+    End If
+    If String.Len(p) >= 2 And String.Mid(p, 2, 1) = ":" Then
+        Return "file:///" + String.UCase(String.Left(p, 1)) + ":" + LspPercentEncode(String.Mid(p, 3))
+    End If
+    If String.Left(p, 1) <> "/" Then p = "/" + p
+    Return "file://" + LspPercentEncode(p)
+End Function
+
+''' A file URI as a local path (percent-decoded; drive letters and UNC hosts restored;
+''' backslashes on Windows). Non-file URIs are returned unchanged.
+Public Function StudioLanguageUriToPath(uri As String) As String
+    If Not String.StartsWith(uri, "file:") Then Return uri
+    Dim rest As String = String.Mid(uri, 6)
+    Dim host As String = ""
+    If String.Left(rest, 2) = "//" Then
+        rest = String.Mid(rest, 3)
+        Dim slash As Integer = String.IndexOf(rest, "/")
+        If slash < 0 Then
+            host = rest
+            rest = "/"
+        Else
+            host = String.Left(rest, slash)
+            rest = String.Mid(rest, slash + 1)
+        End If
+    End If
+    Dim decoded As String = LspPercentDecode(rest)
+    If String.Len(decoded) >= 3 And String.Left(decoded, 1) = "/" And String.Mid(decoded, 3, 1) = ":" Then
+        decoded = String.UCase(String.Mid(decoded, 2, 1)) + String.Mid(decoded, 3)
+    End If
+    host = LspPercentDecode(host)
+    If host <> "" And host <> "localhost" Then decoded = "//" + host + decoded
+    #If TargetWindows Then
+        decoded = String.Replace(decoded, "/", "\\")
+    #End If
+    Return decoded
+End Function
+
+Private Function LspSequenceLength(lead As Integer) As Integer
+    If lead >= 240 And lead < 248 Then Return 4
+    If lead >= 224 And lead < 240 Then Return 3
+    If lead >= 192 And lead < 224 Then Return 2
+    Return 1
+End Function
+
+''' Codepoint column -> UTF-16 code units within one line. Past the end passes through.
+Public Function StudioLanguageUtf16Column(lineText As String, column As Integer) As Integer
+    If column <= 0 Then Return 0
+    Dim bytes As Bytes = Bytes.FromString(lineText, Text.Encodings.UTF8)
+    Dim units As Integer = 0
+    Dim characters As Integer = 0
+    Dim i As Integer = 0
+    While i < bytes.Count And characters < column
+        Dim size As Integer = LspSequenceLength(bytes.Item(i))
+        If size = 4 Then
+            units += 2
+        Else
+            units += 1
+        End If
+        i += size
+        characters += 1
+    End While
+    Return units + (column - characters)
+End Function
+
+''' UTF-16 code units -> codepoint column within one line. Past the end passes through.
+Public Function StudioLanguageCodepointColumn(lineText As String, units As Integer) As Integer
+    If units <= 0 Then Return 0
+    Dim bytes As Bytes = Bytes.FromString(lineText, Text.Encodings.UTF8)
+    Dim counted As Integer = 0
+    Dim characters As Integer = 0
+    Dim i As Integer = 0
+    While i < bytes.Count And counted < units
+        Dim size As Integer = LspSequenceLength(bytes.Item(i))
+        If size = 4 Then
+            counted += 2
+        Else
+            counted += 1
+        End If
+        i += size
+        characters += 1
+    End While
+    Return characters + (units - counted)
+End Function
+
+Private Function LspLines(content As String) As Array Of String
+    Dim lines As Array Of String = []
+    For Each line As String In String.Split(content, "\n")
+        If String.Right(line, 1) = "\r" Then line = String.Left(line, String.Len(line) - 1)
+        lines.Append(line)
+    Next
+    Return lines
+End Function
+
+Private Function LspLineAt(lines As Array Of String, line As Integer) As String
+    If lines = Nil Then Return ""
+    If line < 0 Or line >= Array.Count(lines) Then Return ""
+    Return lines(line)
+End Function
+
+Private Function LspInteger(value As JSONItem, fallback As Integer) As Integer
+    If value = Nil Then Return fallback
+    If Not value.IsNumber() Then Return fallback
+    Return Math.Round(value.AsNumber().Or(0.0))
+End Function
+
+' ---- Internal state ----------------------------------------------------------------------
+
+Private Class StudioLspDocument
+    Public Property Key As String
+    Public Property Path As String
+    Public Property Uri As String
+    Public Property Text As String
+    Public Property Lines As Array Of String = []
+    Public Property LinesValid As Boolean = False
+    Public Property Version As Integer = 0
+    Public Property SentVersion As Integer = 0
+    Public Property AnalyzedVersion As Integer = 0
+    Public Property Diagnostics As JSONItem = JSONItem.NewArray()
+    Public Property Opened As Boolean = False
+End Class
+
+Private Class StudioLspRequest
+    Public Property SourceText As String
+    Public Property Version As Integer
+    Public Property Id As Integer
+    Public Property Kind As String
+    Public Property Method As String
+    Public Property DocumentKey As String
+    Public Property Params As JSONItem
+    Public Property Path As String
+    Public Property Line As Integer
+    Public Property Column As Integer
+    Public Property QueuedAt As Integer
+    Public Property SentAt As Integer = 0
+End Class
+
+Private Class StudioLanguageServerTimer Inherits Timer
+    Public Property Owner As Weak StudioLanguageServer
+    Public Overrides Sub NotifyTick()
+        Dim server As StudioLanguageServer = Me.Owner
+        If server <> Nil Then server.Poll()
+    End Sub
+End Class
+
+''' The buoy-lsp client. Construct, set Link, call Start; then Sync and Request*. All
+''' callbacks run on the UI thread from Poll (driven by an internal Timer, or call Poll
+''' yourself in a console test).
+Public Class StudioLanguageServer
+    Public Const MessageLimit As Integer = 67108864
+    Public Property ProjectRoot As String
+    ''' Resolved by the constructor with StudioLanguageServerPath(); may be replaced
+    ''' before Start.
+    Public Property ServerPath As String
+    Public Property State As String = "stopped"
+    Public Property LastError As String
+    Public Property Restarts As Integer = 0
+    Public Property MaxRestarts As Integer = 3
+    Public Property AnalysisTimeoutMilliseconds As Integer = 5000
+    Public Property RequestTimeoutMilliseconds As Integer = 20000
+    Public Property Link As Weak StudioLanguageServerLink
+    ''' Prints every message (truncated) to standard output; BUOY_LSP_TRACE=1 sets it.
+    Public Property Capabilities As JSONItem = JSONItem.NewObject()
+    Public Property Trace As Boolean = False
+    Private Property Process As PipeProcess
+    Private Property Poller As StudioLanguageServerTimer = New StudioLanguageServerTimer()
+    Private Property Inbox As Bytes = New Bytes()
+    Private Property Outgoing As Bytes = New Bytes()
+    Private Property OutgoingOffset As Integer = 0
+    Private Property ErrorTail As String
+    Private Property NextId As Integer = 1
+    Private Property InitializeId As Integer = 0
+    Private Property ShutdownId As Integer = 0
+    Private Property ShutdownAnswered As Boolean = False
+    Private Property Stopping As Boolean = False
+    Private Property Documents As Map Of String, StudioLspDocument = New Map Of String, StudioLspDocument()
+    Private Property Requests As Array Of StudioLspRequest = []
+    Private Property FileLines As Map Of String, Array Of String = New Map Of String, Array Of String()
+
+    Public Sub Constructor(projectRoot As String)
+        Me.ProjectRoot = projectRoot
+        Me.ServerPath = StudioLanguageServerPath()
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 25
+        Me.Trace = System.EnvironmentVariable("BUOY_LSP_TRACE").Or("") = "1"
+    End Sub
+
+    ''' True when a server binary exists and the client has not given up on it.
+    Public Function IsAvailable() As Boolean
+        If Me.State = "failed" Then Return False
+        If Me.ServerPath = "" Then Return False
+        Return New FileSystemItem(Me.ServerPath).IsFile()
+    End Function
+
+    Public Function IsReady() As Boolean
+        Return Me.State = "ready"
+    End Function
+
+    ' ---- Lifecycle -----------------------------------------------------------------------
+
+    Public Sub Start()
+        If Me.Process <> Nil Then Return
+        Me.Restarts = 0
+        Me.LastError = ""
+        If Me.ServerPath = "" Or Not New FileSystemItem(Me.ServerPath).IsFile() Then
+            Me.LastError = "buoy-lsp was not found. Set BUOY_LSP to its full path."
+            If Me.ServerPath <> "" Then Me.LastError = "buoy-lsp was not found at " + Me.ServerPath
+            Me.SetState("failed", Me.LastError)
+            Return
+        End If
+        Me.Launch()
+        Me.Poller.Start()
+    End Sub
+
+    Private Sub Launch()
+        Me.Inbox = New Bytes()
+        Me.Outgoing = New Bytes()
+        Me.OutgoingOffset = 0
+        Me.ErrorTail = ""
+        Me.Stopping = False
+        For Each doc As StudioLspDocument In Me.Documents.Values()
+            doc.Opened = False
+            doc.AnalyzedVersion = 0
+            doc.SentVersion = 0
+        Next
+        For Each request As StudioLspRequest In Me.Requests
+            request.SentAt = 0
+            request.QueuedAt = System.Microseconds()
+        Next
+        Try
+            Dim folder As String = ""
+            If Me.ProjectRoot <> "" And New FileSystemItem(Me.ProjectRoot).IsFolder() Then folder = Me.ProjectRoot
+            Dim noArguments As Array Of String = []
+            Me.Process = New PipeProcess(Me.ServerPath, noArguments, folder)
+        Catch e As Exception
+            Me.Process = Nil
+            Me.GiveUp("buoy-lsp could not be started: " + e.Message)
+            Return
+        End Try
+        Dim params As JSONItem = JSONItem.NewObject()
+        params.Value("processId") = JSONItem.Null()
+        Dim rootUri As String = ""
+        If Me.ProjectRoot <> "" Then
+            rootUri = StudioLanguagePathToUri(Me.ProjectRoot)
+            params.Value("rootUri") = rootUri
+            Dim workspace As JSONItem = JSONItem.NewObject()
+            workspace.Value("uri") = rootUri
+            workspace.Value("name") = New FileSystemItem(Me.ProjectRoot).Name()
+            Dim folders As JSONItem = JSONItem.NewArray()
+            folders.Add(workspace)
+            params.Value("workspaceFolders") = folders
+        Else
+            params.Value("rootUri") = JSONItem.Null()
+        End If
+        Dim stdlib As String = StudioLanguageServerStdlib(Me.ServerPath)
+        If stdlib <> "" Then
+            Dim options As JSONItem = JSONItem.NewObject()
+            options.Value("stdlibPath") = stdlib
+            params.Value("initializationOptions") = options
+        End If
+        params.Value("capabilities") = Me.ClientCapabilities()
+        Me.InitializeId = Me.AllocateId()
+        Me.SendRequest(Me.InitializeId, "initialize", params)
+        Me.Flush()
+        Me.SetState("starting", "Starting the Buoy language server…")
+    End Sub
+
+    Private Function ClientCapabilities() As JSONItem
+        Dim documentCaps As JSONItem = JSONItem.NewObject()
+        Dim hover As JSONItem = JSONItem.NewObject()
+        Dim formats As JSONItem = JSONItem.NewArray()
+        formats.Add("markdown")
+        formats.Add("plaintext")
+        hover.Value("contentFormat") = formats
+        documentCaps.Value("hover") = hover
+        Dim definition As JSONItem = JSONItem.NewObject()
+        definition.Value("linkSupport") = True
+        documentCaps.Value("definition") = definition
+        documentCaps.Value("references") = JSONItem.NewObject()
+        Dim symbols As JSONItem = JSONItem.NewObject()
+        symbols.Value("hierarchicalDocumentSymbolSupport") = True
+        documentCaps.Value("documentSymbol") = symbols
+        Dim rename As JSONItem = JSONItem.NewObject()
+        rename.Value("prepareSupport") = True
+        documentCaps.Value("rename") = rename
+        Dim diagnostics As JSONItem = JSONItem.NewObject()
+        diagnostics.Value("versionSupport") = True
+        documentCaps.Value("publishDiagnostics") = diagnostics
+        Dim sync As JSONItem = JSONItem.NewObject()
+        sync.Value("didSave") = False
+        documentCaps.Value("synchronization") = sync
+        documentCaps.Value("completion") = JSONItem.NewObject()
+        documentCaps.Value("signatureHelp") = JSONItem.NewObject()
+        documentCaps.Value("formatting") = JSONItem.NewObject()
+        documentCaps.Value("rangeFormatting") = JSONItem.NewObject()
+        documentCaps.Value("codeAction") = JSONItem.NewObject()
+        Dim general As JSONItem = JSONItem.NewObject()
+        Dim encodings As JSONItem = JSONItem.NewArray()
+        encodings.Add("utf-16")
+        general.Value("positionEncodings") = encodings
+        ' Versioned text edits are supported; file resource operations are not.
+        Dim workspaceEdit As JSONItem = JSONItem.NewObject()
+        workspaceEdit.Value("documentChanges") = True
+        Dim workspace As JSONItem = JSONItem.NewObject()
+        workspace.Value("workspaceEdit") = workspaceEdit
+        workspace.Value("symbol") = JSONItem.NewObject()
+        Dim capabilities As JSONItem = JSONItem.NewObject()
+        capabilities.Value("textDocument") = documentCaps
+        capabilities.Value("general") = general
+        capabilities.Value("workspace") = workspace
+        Return capabilities
+    End Function
+
+    ''' Graceful shutdown (shutdown request, exit notification), then terminates a server
+    ''' that does not exit within about a second. Pending requests are answered with an error.
+    Public Sub Stop()
+        Me.Poller.Stop()
+        If Me.Process = Nil Then
+            Me.FailRequests("The language server was stopped.")
+            If Me.State <> "failed" Then Me.SetState("stopped", "")
+            Return
+        End If
+        Me.Stopping = True
+        Try
+            If Me.State = "ready" Then
+                Me.ShutdownId = Me.AllocateId()
+                Me.ShutdownAnswered = False
+                Me.SendRequest(Me.ShutdownId, "shutdown", JSONItem.Null())
+                Dim started As Integer = System.Microseconds()
+                While Not Me.ShutdownAnswered And System.Microseconds() - started < 1000000
+                    Me.Flush()
+                    Me.ReadAvailable()
+                    If Not Me.Process.Poll() Then Exit While
+                    Thread.Sleep(5)
+                End While
+                Me.SendNotification("exit", JSONItem.Null())
+                Me.Flush()
+            End If
+            Me.Process.CloseInput()
+            Dim waited As Integer = System.Microseconds()
+            While Me.Process.Poll() And System.Microseconds() - waited < 500000
+                Me.ReadAvailable()
+                Thread.Sleep(5)
+            End While
+        Catch e As Exception
+            ' The server may already be gone; Close below terminates it either way.
+        End Try
+        Me.CloseProcess()
+        Me.FailRequests("The language server was stopped.")
+        Me.SetState("stopped", "")
+    End Sub
+
+    Private Sub CloseProcess()
+        If Me.Process = Nil Then Return
+        Try
+            If Me.Process.Poll() Then Me.Process.Terminate()
+        Catch e As Exception
+            ' Already exited.
+        End Try
+        Me.Process.Close()
+        Me.Process = Nil
+    End Sub
+
+    Private Sub GiveUp(message As String)
+        Me.LastError = message
+        Me.CloseProcess()
+        Me.Poller.Stop()
+        Me.FailRequests(message)
+        Me.SetState("failed", message)
+    End Sub
+
+    Private Sub HandleExit()
+        Dim code As Integer = -1
+        Try
+            code = Me.Process.ExitCode
+        Catch e As Exception
+            code = -1
+        End Try
+        Me.CloseProcess()
+        If Me.Stopping Then Return
+        Dim detail As String = "buoy-lsp exited (status " + String.From(code) + ")"
+        If String.Trim(Me.ErrorTail) <> "" Then detail += ": " + String.Trim(Me.ErrorTail)
+        Me.LastError = detail
+        If Me.Restarts >= Me.MaxRestarts Then
+            Me.GiveUp(detail + ". Gave up after " + String.From(Me.Restarts) + " restarts.")
+            Return
+        End If
+        Me.Restarts += 1
+        Me.SetState("restarting", detail + ". Restarting…")
+        ' The state listener may have called Stop(); do not resurrect an unpolled server.
+        If Me.State <> "restarting" Or Me.Stopping Then Return
+        Me.Launch()
+    End Sub
+
+    Private Sub SetState(state As String, message As String)
+        Me.State = state
+        Dim link As StudioLanguageServerLink = Me.Link
+        Try
+            If link <> Nil Then
+                If link.Listener <> Nil Then link.Listener.LanguageServerStateChanged(state, message)
+            End If
+        Catch e As Exception
+            Print "Language server state listener failed: " + e.Message
+        End Try
+    End Sub
+
+    ' ---- Documents -----------------------------------------------------------------------
+
+    Private Function FullPath(localPath As String) As String
+        If LspIsAbsolute(localPath) Or Me.ProjectRoot = "" Then Return localPath
+        Return Path.Join(Me.ProjectRoot, localPath)
+    End Function
+
+    Private Function DocumentKey(localPath As String) As String
+        Dim key As String = StudioLanguagePathToUri(Me.FullPath(localPath))
+        #If TargetWindows Then
+            key = String.LCase(key)
+        #End If
+        Return key
+    End Function
+
+    Private Function UriKey(uri As String) As String
+        Return Me.DocumentKey(StudioLanguageUriToPath(uri))
+    End Function
+
+    ''' Records the buffer text for path (absolute, or relative to the project root) and
+    ''' sends didOpen the first time, didChange (full text) when the text changed.
+    Public Sub Sync(localPath As String, content As String)
+        If localPath = "" Then Return
+        Dim key As String = Me.DocumentKey(localPath)
+        Dim doc As StudioLspDocument = Nil
+        Dim found As Optional Of StudioLspDocument = Me.Documents.Get(key)
+        If found.HasValue Then doc = found.Value
+        If doc = Nil Then
+            doc = New StudioLspDocument()
+            doc.Key = key
+            doc.Path = Me.FullPath(localPath)
+            doc.Uri = StudioLanguagePathToUri(doc.Path)
+            Me.Documents.Set(key, doc)
+        ElseIf doc.Version > 0 And String.Compare(doc.Text, content, True) = 0 Then
+            Return
+        End If
+        doc.Diagnostics = JSONItem.NewArray()
+        doc.Text = content
+        doc.LinesValid = False
+        doc.Version += 1
+        Me.SendDocument(doc)
+    End Sub
+
+    ''' Sends didClose and forgets the buffer; later results for it read the file on disk.
+    Public Sub Close(localPath As String)
+        Dim key As String = Me.DocumentKey(localPath)
+        Dim found As Optional Of StudioLspDocument = Me.Documents.Get(key)
+        If Not found.HasValue Then Return
+        If found.Value.Opened And Me.State = "ready" Then
+            Dim params As JSONItem = JSONItem.NewObject()
+            params.Value("textDocument") = Me.Identifier(found.Value)
+            Me.SendNotification("textDocument/didClose", params)
+            Me.Flush()
+        End If
+        Call Me.Documents.Remove(key)
+    End Sub
+
+    Private Function Identifier(doc As StudioLspDocument) As JSONItem
+        Dim item As JSONItem = JSONItem.NewObject()
+        item.Value("uri") = doc.Uri
+        Return item
+    End Function
+
+    Private Sub SendDocument(doc As StudioLspDocument)
+        If Me.State <> "ready" Or doc.SentVersion = doc.Version Then Return
+        Dim params As JSONItem = JSONItem.NewObject()
+        If Not doc.Opened Then
+            Dim item As JSONItem = JSONItem.NewObject()
+            item.Value("uri") = doc.Uri
+            item.Value("languageId") = "buoy"
+            item.Value("version") = doc.Version
+            item.Value("text") = doc.Text
+            params.Value("textDocument") = item
+            Me.SendNotification("textDocument/didOpen", params)
+            doc.Opened = True
+        Else
+            Dim item As JSONItem = JSONItem.NewObject()
+            item.Value("uri") = doc.Uri
+            item.Value("version") = doc.Version
+            params.Value("textDocument") = item
+            Dim change As JSONItem = JSONItem.NewObject()
+            change.Value("text") = doc.Text
+            Dim changes As JSONItem = JSONItem.NewArray()
+            changes.Add(change)
+            params.Value("contentChanges") = changes
+            Me.SendNotification("textDocument/didChange", params)
+        End If
+        doc.SentVersion = doc.Version
+        Me.Flush()
+    End Sub
+
+    Private Function DocumentLines(doc As StudioLspDocument) As Array Of String
+        If Not doc.LinesValid Then
+            doc.Lines = LspLines(doc.Text)
+            doc.LinesValid = True
+        End If
+        Return doc.Lines
+    End Function
+
+    ''' Lines of a result file: the synced buffer when known, else the file on disk.
+    Private Function LinesFor(localPath As String) As Array Of String
+        Dim key As String = Me.DocumentKey(localPath)
+        Dim found As Optional Of StudioLspDocument = Me.Documents.Get(key)
+        If found.HasValue Then Return Me.DocumentLines(found.Value)
+        Dim cached As Optional Of Array Of String = Me.FileLines.Get(key)
+        If cached.HasValue Then Return cached.Value
+        Dim lines As Array Of String = []
+        Try
+            Dim file As New FileSystemItem(localPath)
+            If file.IsFile() And file.Length() <= 16777216 Then
+                Dim loaded As Result Of String, String = file.ReadAllText()
+                If loaded.IsOk Then
+                    If Bytes.FromString(loaded.Value, Text.Encodings.UTF8).Count = file.Length() Then lines = LspLines(loaded.Value)
+                End If
+            End If
+        Catch e As Exception
+            ' No source means no valid coordinate range; MakeLocation rejects it.
+        End Try
+        Me.FileLines.Set(key, lines)
+        Return lines
+    End Function
+
+    ' ---- Requests ------------------------------------------------------------------------
+
+    Private Function AllocateId() As Integer
+        Dim id As Integer = Me.NextId
+        Me.NextId += 1
+        Return id
+    End Function
+
+    ''' Common path for position requests. Returns 0 (and queues nothing) when the server
+    ''' is unavailable; LastError says why.
+    Private Function Queue(kind As String, method As String, localPath As String, content As String, line As Integer, column As Integer, extra As JSONItem, positioned As Boolean) As Integer
+        ' Process = Nil / Stopping: a listener re-issuing a request from inside the error
+        ' callbacks of Stop or GiveUp must not queue work nothing will ever answer.
+        If Me.State = "failed" Or Me.State = "stopped" Or Me.Process = Nil Or Me.Stopping Then
+            If Me.LastError = "" Then Me.LastError = "The language server is not running."
+            Return 0
+        End If
+        If localPath = "" Then
+            Me.LastError = "Save the buffer before requesting language services."
+            Return 0
+        End If
+        Me.Sync(localPath, content)
+        Dim key As String = Me.DocumentKey(localPath)
+        Dim doc As StudioLspDocument = Me.Documents.Get(key).Value
+        Dim request As New StudioLspRequest()
+        request.Id = Me.AllocateId()
+        request.Kind = kind
+        request.Method = method
+        request.DocumentKey = key
+        request.Path = doc.Path
+        If kind = "format" Or kind = "formatSelection" Then
+            request.SourceText = doc.Text
+            request.Version = doc.Version
+        End If
+        request.Line = line
+        request.Column = column
+        request.QueuedAt = System.Microseconds()
+        Dim params As JSONItem = extra
+        If params = Nil Then params = JSONItem.NewObject()
+        params.Value("textDocument") = Me.Identifier(doc)
+        If positioned Then
+            Dim position As JSONItem = JSONItem.NewObject()
+            position.Value("line") = Math.Max(line, 0)
+            position.Value("character") = StudioLanguageUtf16Column(LspLineAt(Me.DocumentLines(doc), line), column)
+            params.Value("position") = position
+        End If
+        request.Params = params
+        Me.Requests.Append(request)
+        Return request.Id
+    End Function
+
+    ''' Go to Definition at a 0-based line and codepoint column. Returns the request id.
+    Public Function RequestDefinition(localPath As String, content As String, line As Integer, column As Integer) As Integer
+        Return Me.Queue("definition", "textDocument/definition", localPath, content, line, column, Nil, True)
+    End Function
+
+    Public Function RequestHover(localPath As String, content As String, line As Integer, column As Integer) As Integer
+        Return Me.Queue("hover", "textDocument/hover", localPath, content, line, column, Nil, True)
+    End Function
+
+    Public Function RequestReferences(localPath As String, content As String, line As Integer, column As Integer, includeDeclaration As Boolean = True) As Integer
+        Dim params As JSONItem = JSONItem.NewObject()
+        Dim context As JSONItem = JSONItem.NewObject()
+        context.Value("includeDeclaration") = includeDeclaration
+        params.Value("context") = context
+        Return Me.Queue("references", "textDocument/references", localPath, content, line, column, params, True)
+    End Function
+
+    ''' The document outline, flattened depth-first (Depth and Container give the nesting).
+    Public Function RequestDocumentSymbols(localPath As String, content As String) As Integer
+        Return Me.Queue("symbols", "textDocument/documentSymbol", localPath, content, 0, 0, Nil, False)
+    End Function
+
+    ''' The renameable range at a position (and the server's placeholder, when sent).
+    Public Function PrepareRename(localPath As String, content As String, line As Integer, column As Integer) As Integer
+        Return Me.Queue("prepareRename", "textDocument/prepareRename", localPath, content, line, column, Nil, True)
+    End Function
+
+    ''' Workspace edits for renaming the symbol at a position: one location per edit, with
+    ''' NewText. Nothing is applied; the host applies the edits.
+    Public Function RequestRename(localPath As String, content As String, line As Integer, column As Integer, newName As String) As Integer
+        Dim params As JSONItem = JSONItem.NewObject()
+        params.Value("newName") = newName
+        Return Me.Queue("rename", "textDocument/rename", localPath, content, line, column, params, True)
+    End Function
+
+    Public Function Supports(provider As String) As Boolean
+        Dim value As JSONItem = Me.Capabilities.Value(provider)
+        Return value.IsObject() Or value.AsBoolean().Or(False)
+    End Function
+
+    Private Function Provider(kind As String) As String
+        Select Case kind
+            Case "completion"
+                Return "completionProvider"
+            Case "signature"
+                Return "signatureHelpProvider"
+            Case "format"
+                Return "documentFormattingProvider"
+            Case "formatSelection"
+                Return "documentRangeFormattingProvider"
+            Case "quickfix"
+                Return "codeActionProvider"
+            Case "workspaceSymbols"
+                Return "workspaceSymbolProvider"
+        End Select
+        Return ""
+    End Function
+
+    Public Function RequestFeature(kind As String, localPath As String, content As String, line As Integer, column As Integer, endLine As Integer = 0, endColumn As Integer = 0, query As String = "") As Integer
+        Dim params As JSONItem = JSONItem.NewObject()
+        Dim method As String = ""
+        Dim positioned As Boolean = False
+        Select Case kind
+            Case "completion"
+                method = "textDocument/completion"
+                positioned = True
+            Case "signature"
+                method = "textDocument/signatureHelp"
+                positioned = True
+            Case "format", "formatSelection"
+                method = "textDocument/formatting"
+                Dim options As JSONItem = JSONItem.NewObject()
+                options.Value("tabSize") = 4
+                options.Value("insertSpaces") = True
+                params.Value("options") = options
+                If kind = "formatSelection" Then method = "textDocument/rangeFormatting"
+            Case "quickfix"
+                method = "textDocument/codeAction"
+                Dim context As JSONItem = JSONItem.NewObject()
+                Dim diagnostics As JSONItem = JSONItem.NewArray()
+                Dim found As Optional Of StudioLspDocument = Me.Documents.Get(Me.DocumentKey(localPath))
+                If found.HasValue Then diagnostics = found.Value.Diagnostics
+                Dim only As JSONItem = JSONItem.NewArray()
+                only.Add("quickfix")
+                context.Value("diagnostics") = diagnostics
+                context.Value("only") = only
+                params.Value("context") = context
+            Case "workspaceSymbols"
+                method = "workspace/symbol"
+                params.Value("query") = query
+                If Me.State = "stopped" Or Me.State = "failed" Then Return 0
+                Dim request As New StudioLspRequest()
+                request.Id = Me.AllocateId()
+                request.Kind = kind
+                request.Method = method
+                request.Params = params
+                request.QueuedAt = System.Microseconds()
+                Me.Requests.Append(request)
+                Return request.Id
+            Case Else
+                Me.LastError = "Unknown language feature: " + kind
+                Return 0
+        End Select
+        If kind = "formatSelection" Or kind = "quickfix" Then
+            Dim lines As Array Of String = String.Split(content, "\n")
+            Dim first As JSONItem = JSONItem.NewObject()
+            first.Value("line") = line
+            first.Value("character") = StudioLanguageUtf16Column(LspLineAt(lines, line), column)
+            Dim last As JSONItem = JSONItem.NewObject()
+            last.Value("line") = endLine
+            last.Value("character") = StudioLanguageUtf16Column(LspLineAt(lines, endLine), endColumn)
+            Dim range As JSONItem = JSONItem.NewObject()
+            range.Value("start") = first
+            range.Value("end") = last
+            params.Value("range") = range
+        End If
+        Return Me.Queue(kind, method, localPath, content, line, column, params, positioned)
+    End Function
+
+    ' Decode edits against synchronized buffers; rejects resource operations.
+    Public Function DecodeWorkspaceEdit(value As JSONItem) As StudioLanguageResult
+        Dim answer As New StudioLanguageResult()
+        Me.FileLines = New Map Of String, Array Of String()
+        Try
+            Me.ReadWorkspaceEdit(answer, value)
+        Catch e As Exception
+            answer.Error = e.Message
+        End Try
+        If answer.Error <> "" Then answer.Locations = []
+        Return answer
+    End Function
+
+    Public Function DecodeTextEdits(localPath As String, value As JSONItem) As StudioLanguageResult
+        Dim answer As New StudioLanguageResult()
+        Me.FileLines = New Map Of String, Array Of String()
+        Try
+            Me.AddEdits(answer, StudioLanguagePathToUri(localPath), value)
+        Catch e As Exception
+            answer.Error = e.Message
+        End Try
+        If answer.Error <> "" Then answer.Locations = []
+        Return answer
+    End Function
+
+    ''' Decode only a full-document formatting response against its captured request.
+    ''' The single (lineCount, 0) EOF sentinel is compatible with LSP Position
+    ''' defaulting; generic/partial edit decoding deliberately remains strict.
+    Public Function DecodeDocumentFormatting(localPath As String, source As String, version As Integer, value As JSONItem) As StudioLanguageResult
+        Dim answer As New StudioLanguageResult()
+        answer.Path = localPath
+        answer.SourceText = source
+        answer.Version = version
+        answer.Raw = value
+        Try
+            Dim found As Optional Of StudioLspDocument = Me.Documents.Get(Me.DocumentKey(localPath))
+            If Not found.HasValue Then Throw New InvalidArgumentException("Formatting requires a synchronized document")
+            If found.Value.Version <> version Or String.Compare(found.Value.Text, source, True) <> 0 Then Throw New InvalidArgumentException("Obsolete formatting source/version")
+            Dim edits As JSONItem = value
+            If value.IsArray() And value.Count() = 1 Then
+                Dim edit As JSONItem = value.ValueAt(0)
+                Dim range As JSONItem = edit.Value("range")
+                Dim first As JSONItem = range.Value("start")
+                Dim last As JSONItem = range.Value("end")
+                Dim lines As Array Of String = LspLines(source)
+                If edit.IsObject() And range.IsObject() And first.IsObject() And last.IsObject() Then
+                    ' Check all four coordinates without coercion, even for a sentinel.
+                    Dim firstLine As Integer = Me.EditInteger(first.Value("line"))
+                    Dim firstColumn As Integer = Me.EditInteger(first.Value("character"))
+                    Dim lastLine As Integer = Me.EditInteger(last.Value("line"))
+                    Dim lastColumn As Integer = Me.EditInteger(last.Value("character"))
+                    If firstLine = 0 And firstColumn = 0 And lastLine = Array.Count(lines) And lastColumn = 0 Then
+                        If edit.Count() <> 2 Or range.Count() <> 2 Or first.Count() <> 2 Or last.Count() <> 2 Or Not edit.Value("newText").IsString() Then Throw New InvalidArgumentException("Malformed whole-document replacement")
+                        ' LspLines strips CR for CRLF; a terminal bare CR has no
+                        ' lossless EOF coordinate in the existing strict decoder.
+                        If String.Right(source, 1) = "\r" Then Throw New InvalidArgumentException("Formatting EOF cannot preserve a terminal bare CR")
+                        ' Copy so Raw remains the exact server response for evidence.
+                        edits = Json.Parse(value.ToString())
+                        Dim finish As JSONItem = edits.ValueAt(0).Value("range").Value("end")
+                        Dim finalLine As Integer = Array.Count(lines) - 1
+                        finish.Value("line") = finalLine
+                        finish.Value("character") = StudioLanguageUtf16Column(lines(finalLine), String.Len(lines(finalLine)))
+                    End If
+                End If
+            End If
+            If Not edits.IsNull() Then
+                Dim decoded As StudioLanguageResult = Me.DecodeTextEdits(localPath, edits)
+                answer.Error = decoded.Error
+                answer.Locations = decoded.Locations
+                For Each location As StudioLanguageLocation In answer.Locations
+                    location.DocumentVersion = version
+                Next
+            End If
+        Catch e As Exception
+            answer.Error = e.Message
+        End Try
+        If answer.Error <> "" Then answer.Locations = []
+        Return answer
+    End Function
+
+    ' buoy-lsp formats complete selected lines (including the request's end line).
+    ' Captured native responses end an unterminated final line at (lineCount, 0).
+    ' Permit only that single selected-line replacement; other edits remain strict
+    ' and must stay within those lines. A server cannot turn a partial selection
+    ' into an unrelated whole-document edit. The host still previews before Accept.
+    Public Function DecodeRangeFormatting(localPath As String, source As String, version As Integer, requestedRange As JSONItem, value As JSONItem) As StudioLanguageResult
+        Dim answer As New StudioLanguageResult()
+        answer.Path = localPath
+        answer.SourceText = source
+        answer.Version = version
+        answer.Raw = value
+        Me.FileLines = New Map Of String, Array Of String()
+        Try
+            Dim found As Optional Of StudioLspDocument = Me.Documents.Get(Me.DocumentKey(localPath))
+            If Not found.HasValue Then Throw New InvalidArgumentException("Formatting requires a synchronized document")
+            If found.Value.Version <> version Or String.Compare(found.Value.Text, source, True) <> 0 Then Throw New InvalidArgumentException("Obsolete formatting source/version")
+            Dim selected As StudioLanguageLocation = Me.MakeLocation(StudioLanguagePathToUri(localPath), requestedRange)
+            Dim lines As Array Of String = LspLines(source)
+            Dim finalLine As Integer = Array.Count(lines) - 1
+            Dim edits As JSONItem = value
+            If value.IsArray() And value.Count() = 1 Then
+                Dim edit As JSONItem = value.ValueAt(0)
+                Dim range As JSONItem = edit.Value("range")
+                Dim first As JSONItem = range.Value("start")
+                Dim last As JSONItem = range.Value("end")
+                If edit.IsObject() And range.IsObject() And first.IsObject() And last.IsObject() Then
+                    Dim firstLine As Integer = Me.EditInteger(first.Value("line"))
+                    Dim firstColumn As Integer = Me.EditInteger(first.Value("character"))
+                    Dim lastLine As Integer = Me.EditInteger(last.Value("line"))
+                    Dim lastColumn As Integer = Me.EditInteger(last.Value("character"))
+                    If firstLine = selected.Line And firstColumn = 0 And lastLine = Array.Count(lines) And lastColumn = 0 And selected.EndLine = finalLine Then
+                        If edit.Count() <> 2 Or range.Count() <> 2 Or first.Count() <> 2 Or last.Count() <> 2 Or Not edit.Value("newText").IsString() Then Throw New InvalidArgumentException("Malformed selected-line replacement")
+                        If String.Right(source, 1) = "\r" Then Throw New InvalidArgumentException("Formatting EOF cannot preserve a terminal bare CR")
+                        edits = Json.Parse(value.ToString())
+                        Dim finish As JSONItem = edits.ValueAt(0).Value("range").Value("end")
+                        finish.Value("line") = finalLine
+                        finish.Value("character") = StudioLanguageUtf16Column(lines(finalLine), String.Len(lines(finalLine)))
+                    End If
+                End If
+            End If
+            If Not edits.IsNull() Then
+                Dim decoded As StudioLanguageResult = Me.DecodeTextEdits(localPath, edits)
+                answer.Error = decoded.Error
+                answer.Locations = decoded.Locations
+                Dim limitLine As Integer = Math.Min(selected.EndLine + 1, finalLine)
+                Dim limitColumn As Integer = 0
+                If selected.EndLine = finalLine Then limitColumn = String.Len(lines(finalLine))
+                For Each location As StudioLanguageLocation In answer.Locations
+                    ' The next line's column zero is an exclusive end only.
+                    ' Even an empty insertion must start on a selected line.
+                    If location.Line < selected.Line Or location.Line > selected.EndLine Or location.EndLine > limitLine Or (location.EndLine = limitLine And location.EndColumn > limitColumn) Then Throw New InvalidArgumentException("Range formatting edits outside requested lines")
+                    location.DocumentVersion = version
+                Next
+            End If
+        Catch e As Exception
+            answer.Error = e.Message
+        End Try
+        If answer.Error <> "" Then answer.Locations = []
+        Return answer
+    End Function
+
+    ''' Drops a request; no callback is delivered for it.
+    Public Sub Cancel(requestId As Integer)
+        For i As Integer = Array.Count(Me.Requests) - 1 To 0 Step -1
+            Dim request As StudioLspRequest = Me.Requests(i)
+            If request.Id <> requestId Then Continue For
+            If request.SentAt <> 0 And Me.State = "ready" Then
+                Dim params As JSONItem = JSONItem.NewObject()
+                params.Value("id") = requestId
+                Me.SendNotification("$/cancelRequest", params)
+                Me.Flush()
+            End If
+            Array.RemoveAt(Me.Requests, i)
+        Next
+    End Sub
+
+    Private Sub SendDue()
+        If Me.State <> "ready" Then Return
+        Dim now As Integer = System.Microseconds()
+        For Each request As StudioLspRequest In Me.Requests
+            If request.SentAt <> 0 Then Continue For
+            Dim found As Optional Of StudioLspDocument = Me.Documents.Get(request.DocumentKey)
+            If found.HasValue Then
+                Dim doc As StudioLspDocument = found.Value
+                Me.SendDocument(doc)
+                Dim analysed As Boolean = doc.AnalyzedVersion >= doc.Version
+                If Not analysed And now - request.QueuedAt < Me.AnalysisTimeoutMilliseconds * 1000 Then Continue For
+            End If
+            Dim capability As String = Me.Provider(request.Kind)
+            If capability <> "" And Not Me.Supports(capability) Then
+                request.SentAt = now
+                Dim unsupported As JSONItem = JSONItem.NewObject()
+                Dim failure As JSONItem = JSONItem.NewObject()
+                failure.Value("message") = "Language server does not support " + request.Kind + "."
+                unsupported.Value("error") = failure
+                Me.Complete(request, unsupported)
+                request.SentAt = -1
+                Continue For
+            End If
+            request.SentAt = now
+            Me.SendRequest(request.Id, request.Method, request.Params)
+        Next
+        For i As Integer = Array.Count(Me.Requests) - 1 To 0 Step -1
+            If Me.Requests(i).SentAt = -1 Then Array.RemoveAt(Me.Requests, i)
+        Next
+        Me.Flush()
+    End Sub
+
+    Private Sub ExpireRequests()
+        Dim now As Integer = System.Microseconds()
+        Dim expired As Array Of StudioLspRequest = []
+        For i As Integer = Array.Count(Me.Requests) - 1 To 0 Step -1
+            Dim request As StudioLspRequest = Me.Requests(i)
+            If request.SentAt <> 0 And now - request.SentAt > Me.RequestTimeoutMilliseconds * 1000 Then
+                expired.Append(request)
+                Array.RemoveAt(Me.Requests, i)
+            End If
+        Next
+        For Each request As StudioLspRequest In expired
+            Dim answer As StudioLanguageResult = Me.NewResult(request)
+            answer.Error = "The language server did not answer in time."
+            Me.Deliver(answer)
+        Next
+    End Sub
+
+    Private Sub FailRequests(message As String)
+        Dim pending As Array Of StudioLspRequest = Me.Requests
+        Me.Requests = []
+        For Each request As StudioLspRequest In pending
+            Dim answer As StudioLanguageResult = Me.NewResult(request)
+            answer.Error = message
+            Me.Deliver(answer)
+        Next
+    End Sub
+
+    ' ---- Wire ----------------------------------------------------------------------------
+
+    Private Sub Enqueue(message As JSONItem)
+        Dim serialized As String = message.ToString()
+        If Me.Trace Then Print "lsp> " + String.Left(serialized, 400)
+        Dim body As Bytes = Bytes.FromString(serialized, Text.Encodings.UTF8)
+        If Me.Outgoing.Count - Me.OutgoingOffset + body.Count > StudioLanguageServer.MessageLimit Then Throw New InvalidArgumentException("The language server is not reading its input.")
+        Me.Outgoing.Append(Bytes.FromString("Content-Length: " + String.From(body.Count) + "\r\n\r\n", Text.Encodings.UTF8))
+        Me.Outgoing.Append(body)
+    End Sub
+
+    Private Sub SendRequest(id As Integer, method As String, params As JSONItem)
+        Dim message As JSONItem = JSONItem.NewObject()
+        message.Value("jsonrpc") = "2.0"
+        message.Value("id") = id
+        message.Value("method") = method
+        If Not params.IsNull() Then message.Value("params") = params
+        Me.Enqueue(message)
+    End Sub
+
+    Private Sub SendNotification(method As String, params As JSONItem)
+        Dim message As JSONItem = JSONItem.NewObject()
+        message.Value("jsonrpc") = "2.0"
+        message.Value("method") = method
+        If Not params.IsNull() Then message.Value("params") = params
+        Me.Enqueue(message)
+    End Sub
+
+    ''' Never throws: a broken pipe (the server died between ticks) drops the unsent bytes
+    ''' and terminates the child so the next Poll observes the exit and applies the restart
+    ''' policy. Public entry points (Sync, Close, Cancel) therefore cannot raise
+    ''' ProcessException into the editor.
+    Private Sub Flush()
+        If Me.Process = Nil Then Return
+        Try
+            While Me.OutgoingOffset < Me.Outgoing.Count
+                Dim accepted As Integer = Me.Process.WriteInput(Me.Outgoing, Me.OutgoingOffset)
+                If accepted <= 0 Then Exit While
+                Me.OutgoingOffset += accepted
+            End While
+        Catch e As Exception
+            Me.ErrorTail = "Cannot write to buoy-lsp: " + e.Message
+            Me.Outgoing = New Bytes()
+            Me.OutgoingOffset = 0
+            Try
+                Me.Process.Terminate()
+            Catch ignored As Exception
+                ' Already exited.
+            End Try
+            Return
+        End Try
+        If Me.OutgoingOffset >= Me.Outgoing.Count And Me.OutgoingOffset > 0 Then
+            Me.Outgoing = New Bytes()
+            Me.OutgoingOffset = 0
+        End If
+    End Sub
+
+    Private Sub ReadAvailable()
+        If Me.Process = Nil Then Return
+        For i As Integer = 1 To 64
+            Dim read As Boolean = False
+            Dim chunk As Bytes = Me.Process.ReadOutput(65536)
+            If chunk <> Nil Then
+                If chunk.Count > 0 Then
+                    read = True
+                    Me.Inbox.Append(chunk)
+                    If Me.Inbox.Count > StudioLanguageServer.MessageLimit Then Throw New InvalidArgumentException("The language server sent an oversized message.")
+                End If
+            End If
+            Dim errors As Bytes = Me.Process.ReadError(8192)
+            If errors <> Nil Then
+                If errors.Count > 0 Then
+                    read = True
+                    Try
+                        Me.ErrorTail += errors.ToString(Text.Encodings.UTF8)
+                    Catch e As Exception
+                        Me.ErrorTail += errors.ToString(Text.Encodings.Latin1)
+                    End Try
+                    If String.Len(Me.ErrorTail) > 4096 Then Me.ErrorTail = String.Right(Me.ErrorTail, 4096)
+                End If
+            End If
+            If Not read Then Exit For
+        Next
+        Me.ParseInbox()
+    End Sub
+
+    ''' Content-Length framing: partial reads, several messages per chunk, byte lengths.
+    Private Sub ParseInbox()
+        Dim start As Integer = 0
+        Dim total As Integer = Me.Inbox.Count
+        While start < total
+            Dim headerEnd As Integer = -1
+            For i As Integer = start To total - 4
+                If Me.Inbox.Item(i) = 13 And Me.Inbox.Item(i + 1) = 10 And Me.Inbox.Item(i + 2) = 13 And Me.Inbox.Item(i + 3) = 10 Then
+                    headerEnd = i
+                    Exit For
+                End If
+            Next
+            If headerEnd < 0 Then
+                If total - start > 8192 Then Throw New InvalidArgumentException("The language server sent an invalid message header.")
+                Exit While
+            End If
+            Dim header As String = ""
+            For i As Integer = start To headerEnd - 1
+                Dim b As Integer = Me.Inbox.Item(i)
+                If b >= 128 Then Throw New InvalidArgumentException("The language server sent an invalid message header.")
+                header += String.Chr(b)
+            Next
+            Dim length As Integer = -1
+            For Each field As String In String.Split(header, "\r\n")
+                Dim colon As Integer = String.IndexOf(field, ":")
+                If colon <= 0 Then Continue For
+                If String.Trim(String.Left(field, colon)) = "Content-Length" Then length = Integer.Parse(String.Mid(field, colon + 2)).Or(-1)
+            Next
+            If length < 0 Or length > StudioLanguageServer.MessageLimit Then Throw New InvalidArgumentException("The language server sent a message without a valid Content-Length.")
+            Dim bodyStart As Integer = headerEnd + 4
+            If total - bodyStart < length Then Exit While
+            Dim body As New Bytes(length)
+            For i As Integer = bodyStart To bodyStart + length - 1
+                body.Append(Me.Inbox.Item(i))
+            Next
+            start = bodyStart + length
+            Dim decoded As String = ""
+            Try
+                decoded = body.ToString(Text.Encodings.UTF8)
+            Catch e As Exception
+                Continue While
+            End Try
+            If Me.Trace Then Print "lsp< " + String.Left(decoded, 400)
+            Dim parsed As Optional Of JSONItem = Json.TryParse(decoded)
+            If parsed.HasValue Then
+                If parsed.Value.IsObject() Then Me.Dispatch(parsed.Value)
+            End If
+        End While
+        If start > 0 Then
+            Dim rest As New Bytes(Math.Max(total - start, 0))
+            For i As Integer = start To total - 1
+                rest.Append(Me.Inbox.Item(i))
+            Next
+            Me.Inbox = rest
+        End If
+    End Sub
+
+    Private Sub Dispatch(message As JSONItem)
+        Dim method As String = message.Value("method").AsString().Or("")
+        Dim hasId As Boolean = message.HasKey("id")
+        If method <> "" And hasId Then
+            Me.AnswerServerRequest(message, method)
+            Return
+        End If
+        If method <> "" Then
+            If method = "textDocument/publishDiagnostics" Then Me.DiagnosticsPublished(message.Value("params"))
+            Return
+        End If
+        If Not hasId Then Return
+        Dim id As Integer = LspInteger(message.Value("id"), -1)
+        If id = Me.InitializeId And Me.InitializeId <> 0 Then
+            Me.InitializeId = 0
+            If message.HasKey("error") Then
+                Me.GiveUp("buoy-lsp refused to initialize: " + message.Value("error").Value("message").AsString().Or("unknown error"))
+                Return
+            End If
+            Me.Capabilities = message.Value("result").Value("capabilities")
+            If Me.Capabilities.Value("positionEncoding").AsString().Or("utf-16") <> "utf-16" Then
+                Me.GiveUp("The language server selected an unsupported position encoding.")
+                Return
+            End If
+            Me.SendNotification("initialized", JSONItem.NewObject())
+            Me.SetState("ready", "")
+            For Each doc As StudioLspDocument In Me.Documents.Values()
+                Me.SendDocument(doc)
+            Next
+            Me.SendDue()
+            Return
+        End If
+        If id = Me.ShutdownId And Me.ShutdownId <> 0 Then
+            Me.ShutdownAnswered = True
+            Me.ShutdownId = 0
+            Return
+        End If
+        For i As Integer = 0 To Array.Count(Me.Requests) - 1
+            Dim request As StudioLspRequest = Me.Requests(i)
+            If request.Id = id And request.SentAt <> 0 Then
+                Array.RemoveAt(Me.Requests, i)
+                Me.Complete(request, message)
+                Return
+            End If
+        Next
+    End Sub
+
+    ''' Server-to-client requests get a harmless answer so the server never waits on us.
+    Private Sub AnswerServerRequest(message As JSONItem, method As String)
+        Dim reply As JSONItem = JSONItem.NewObject()
+        reply.Value("jsonrpc") = "2.0"
+        reply.Value("id") = message.Value("id")
+        If method = "workspace/configuration" Then
+            Dim values As JSONItem = JSONItem.NewArray()
+            Dim items As JSONItem = message.Value("params").Value("items")
+            For i As Integer = 0 To items.Count() - 1
+                values.Add(JSONItem.Null())
+            Next
+            reply.Value("result") = values
+        ElseIf method = "workspace/workspaceFolders" And Me.ProjectRoot <> "" Then
+            Dim folder As JSONItem = JSONItem.NewObject()
+            folder.Value("uri") = StudioLanguagePathToUri(Me.ProjectRoot)
+            folder.Value("name") = New FileSystemItem(Me.ProjectRoot).Name()
+            Dim folders As JSONItem = JSONItem.NewArray()
+            folders.Add(folder)
+            reply.Value("result") = folders
+        ElseIf method = "workspace/applyEdit" Then
+            Dim applied As JSONItem = JSONItem.NewObject()
+            applied.Value("applied") = False
+            reply.Value("result") = applied
+        Else
+            reply.Value("result") = JSONItem.Null()
+        End If
+        Me.Enqueue(reply)
+        Me.Flush()
+    End Sub
+
+    Private Sub DiagnosticsPublished(params As JSONItem)
+        Try
+        Dim uri As String = params.Value("uri").AsString().Or("")
+        If uri = "" Then Return
+        Dim found As Optional Of StudioLspDocument = Me.Documents.Get(Me.UriKey(uri))
+        If Not found.HasValue Then Return
+        Dim doc As StudioLspDocument = found.Value
+        doc.AnalyzedVersion = LspInteger(params.Value("version"), doc.SentVersion)
+        If doc.AnalyzedVersion <> doc.Version Then Return
+        doc.Diagnostics = params.Value("diagnostics")
+        Dim link As StudioLanguageServerLink = Me.Link
+        If link = Nil Then Return
+        Dim features As StudioLanguageFeatureListener = TryCast(link.Listener, StudioLanguageFeatureListener)
+        If features = Nil Then Return
+        Dim answer As New StudioLanguageResult()
+        answer.Kind = "diagnostics"
+        answer.Path = doc.Path
+        answer.Version = doc.AnalyzedVersion
+        answer.SourceText = doc.Text
+        answer.Raw = params.Value("diagnostics")
+        If Not answer.Raw.IsArray() Then Return
+        For i As Integer = 0 To answer.Raw.Count() - 1
+            Dim diagnostic As JSONItem = answer.Raw.ValueAt(i)
+            Dim location As StudioLanguageLocation = Me.MakeLocation(uri, diagnostic.Value("range"))
+            location.Detail = diagnostic.Value("message").AsString().Or("")
+            location.Kind = LspInteger(diagnostic.Value("severity"), 1)
+            answer.AddLocation(location)
+        Next
+        features.LanguageDiagnosticsReady(answer)
+        Catch e As Exception
+            Me.ErrorTail = "Invalid diagnostics notification: " + e.Message
+        End Try
+    End Sub
+
+    ' ---- Results -------------------------------------------------------------------------
+
+    Private Function NewResult(request As StudioLspRequest) As StudioLanguageResult
+        Dim answer As New StudioLanguageResult()
+        answer.RequestId = request.Id
+        answer.Kind = request.Kind
+        answer.Path = request.Path
+        answer.Line = request.Line
+        answer.Column = request.Column
+        Return answer
+    End Function
+
+    Private Sub Complete(request As StudioLspRequest, message As JSONItem)
+        Dim answer As StudioLanguageResult = Me.NewResult(request)
+        Me.FileLines = New Map Of String, Array Of String()
+        Try
+            If message.HasKey("error") Then
+                answer.Error = message.Value("error").Value("message").AsString().Or("The language server reported an error.")
+            Else
+                Dim value As JSONItem = message.Value("result")
+                answer.Raw = value
+                Select Case request.Kind
+                    Case "definition", "references"
+                        Me.AddLocations(answer, value)
+                    Case "hover"
+                        Me.ReadHover(answer, value)
+                    Case "workspaceSymbols", "symbols"
+                        Me.AddSymbols(answer, value, 0, "", request.Path)
+                    Case "prepareRename"
+                        Me.ReadPrepareRename(answer, value, request)
+                    Case "rename"
+                        If Not value.IsNull() Then Me.ReadWorkspaceEdit(answer, value)
+                    Case "format"
+                        Dim decoded As StudioLanguageResult = Me.DecodeDocumentFormatting(request.Path, request.SourceText, request.Version, value)
+                        answer.Error = decoded.Error
+                        answer.Locations = decoded.Locations
+                        answer.SourceText = request.SourceText
+                        answer.Version = request.Version
+                    Case "formatSelection"
+                        Dim decoded As StudioLanguageResult = Me.DecodeRangeFormatting(request.Path, request.SourceText, request.Version, request.Params.Value("range"), value)
+                        answer.Error = decoded.Error
+                        answer.Locations = decoded.Locations
+                        answer.SourceText = request.SourceText
+                        answer.Version = request.Version
+                End Select
+            End If
+        Catch e As Exception
+            answer.Error = "Unexpected language server answer: " + e.Message
+        End Try
+        Me.FileLines = New Map Of String, Array Of String()
+        If answer.Error <> "" Then answer.Locations = []
+        Me.Deliver(answer)
+    End Sub
+
+    Private Sub Deliver(answer As StudioLanguageResult)
+        Dim link As StudioLanguageServerLink = Me.Link
+        If link = Nil Then Return
+        Dim listener As StudioLanguageServerListener = link.Listener
+        If listener = Nil Then Return
+        Try
+            Select Case answer.Kind
+                Case "definition"
+                    listener.DefinitionReady(answer)
+                Case "references"
+                    listener.ReferencesReady(answer)
+                Case "hover"
+                    listener.HoverReady(answer)
+                Case "symbols"
+                    listener.DocumentSymbolsReady(answer)
+                Case "rename", "prepareRename"
+                    listener.RenameReady(answer)
+                Case Else
+                    Dim features As StudioLanguageFeatureListener = TryCast(listener, StudioLanguageFeatureListener)
+                    If features <> Nil Then features.LanguageFeatureReady(answer)
+            End Select
+        Catch e As Exception
+            Print "Language server result listener failed: " + e.Message
+        End Try
+    End Sub
+
+    ' LSP uinteger values are bounded, finite and integral before conversion.
+    Private Function EditInteger(value As JSONItem) As Integer
+        If Not value.IsNumber() Then Throw New InvalidArgumentException("Missing or nonnumeric language coordinate/version")
+        Dim number As Double = value.AsNumber().Or(-1.0)
+        If Not (number >= 0.0 And number <= 2147483647.0) Then Throw New InvalidArgumentException("Language coordinate/version outside uinteger bounds")
+        If number <> Math.Floor(number) Then Throw New InvalidArgumentException("Nonintegral language coordinate/version")
+        Return Math.Floor(number)
+    End Function
+
+    Private Function MakeLocation(uri As String, range As JSONItem) As StudioLanguageLocation
+        If Not range.IsObject() Then Throw New InvalidArgumentException("Missing language range")
+        Dim start As JSONItem = range.Value("start")
+        Dim finish As JSONItem = range.Value("end")
+        If Not start.IsObject() Or Not finish.IsObject() Then Throw New InvalidArgumentException("Missing language range endpoints")
+        Dim location As New StudioLanguageLocation()
+        location.Uri = uri
+        location.Path = StudioLanguageUriToPath(uri)
+        If location.Path = "" Then Throw New InvalidArgumentException("Language range requires a local file URI")
+        location.RelativePath = Me.Relative(location.Path)
+        Dim lines As Array Of String = Me.LinesFor(location.Path)
+        location.Line = Me.EditInteger(start.Value("line"))
+        location.EndLine = Me.EditInteger(finish.Value("line"))
+        Dim first As Integer = Me.EditInteger(start.Value("character"))
+        Dim last As Integer = Me.EditInteger(finish.Value("character"))
+        If location.Line >= Array.Count(lines) Or location.EndLine >= Array.Count(lines) Then Throw New InvalidArgumentException("Language line outside available source")
+        Dim firstText As String = lines(location.Line)
+        Dim lastText As String = lines(location.EndLine)
+        If first > StudioLanguageUtf16Column(firstText, String.Len(firstText)) Or last > StudioLanguageUtf16Column(lastText, String.Len(lastText)) Then Throw New InvalidArgumentException("Language column past line end")
+        If location.EndLine < location.Line Or (location.EndLine = location.Line And last < first) Then Throw New InvalidArgumentException("Reversed language range")
+        location.Column = StudioLanguageCodepointColumn(firstText, first)
+        location.EndColumn = StudioLanguageCodepointColumn(lastText, last)
+        If StudioLanguageUtf16Column(firstText, location.Column) <> first Or StudioLanguageUtf16Column(lastText, location.EndColumn) <> last Then Throw New InvalidArgumentException("Language range splits a UTF16 surrogate pair")
+        Return location
+    End Function
+
+    Private Function Relative(localPath As String) As String
+        If Me.ProjectRoot = "" Then Return ""
+        Dim root As String = String.Replace(Me.ProjectRoot, "\\", "/")
+        If String.Right(root, 1) <> "/" Then root += "/"
+        Dim candidate As String = String.Replace(localPath, "\\", "/")
+        If String.Len(candidate) <= String.Len(root) Then Return ""
+        Dim prefix As String = String.Left(candidate, String.Len(root))
+        Dim matches As Boolean = String.Compare(prefix, root, True) = 0
+        #If TargetWindows Then
+            matches = prefix = root
+        #End If
+        If Not matches Then Return ""
+        Return String.Mid(candidate, String.Len(root) + 1)
+    End Function
+
+    ''' Location, Location[], LocationLink[] or null.
+    Private Sub AddLocations(answer As StudioLanguageResult, value As JSONItem)
+        If value.IsArray() Then
+            For i As Integer = 0 To value.Count() - 1
+                Me.AddLocations(answer, value.ValueAt(i))
+            Next
+            Return
+        End If
+        If Not value.IsObject() Then Return
+        If value.HasKey("targetUri") Then
+            Dim range As JSONItem = value.Value("targetSelectionRange")
+            If Not range.IsObject() Then range = value.Value("targetRange")
+            If range.IsObject() Then answer.AddLocation(Me.MakeLocation(value.Value("targetUri").AsString().Or(""), range))
+        ElseIf value.HasKey("uri") And value.Value("range").IsObject() Then
+            answer.AddLocation(Me.MakeLocation(value.Value("uri").AsString().Or(""), value.Value("range")))
+        End If
+    End Sub
+
+    Private Function MarkedText(value As JSONItem) As String
+        If value.IsString() Then Return value.AsString().Or("")
+        If value.IsArray() Then
+            Dim joined As String = ""
+            For i As Integer = 0 To value.Count() - 1
+                Dim part As String = Me.MarkedText(value.ValueAt(i))
+                If part = "" Then Continue For
+                If joined <> "" Then joined += "\n\n"
+                joined += part
+            Next
+            Return joined
+        End If
+        If Not value.IsObject() Then Return ""
+        Dim marked As String = value.Value("value").AsString().Or("")
+        If value.HasKey("language") Then Return "```" + value.Value("language").AsString().Or("") + "\n" + marked + "\n```"
+        Return marked
+    End Function
+
+    Private Sub ReadHover(answer As StudioLanguageResult, value As JSONItem)
+        If Not value.IsObject() Then Return
+        answer.Hover = Me.MarkedText(value.Value("contents"))
+        If value.Value("range").IsObject() Then answer.AddLocation(Me.MakeLocation(StudioLanguagePathToUri(answer.Path), value.Value("range")))
+        Dim fence As Integer = String.IndexOf(answer.Hover, "```")
+        If fence < 0 Then
+            answer.HoverSignature = String.Trim(answer.Hover)
+            Return
+        End If
+        Dim afterFence As String = String.Mid(answer.Hover, fence + 4)
+        Dim newline As Integer = String.IndexOf(afterFence, "\n")
+        If newline < 0 Then Return
+        Dim code As String = String.Mid(afterFence, newline + 2)
+        Dim closing As Integer = String.IndexOf(code, "```")
+        If closing >= 0 Then code = String.Left(code, closing)
+        answer.HoverSignature = String.Trim(code)
+    End Sub
+
+    ''' DocumentSymbol[] (hierarchical) or SymbolInformation[], flattened depth-first.
+    Private Sub AddSymbols(answer As StudioLanguageResult, value As JSONItem, depth As Integer, container As String, documentPath As String)
+        If Not value.IsArray() Or depth > 32 Then Return
+        For i As Integer = 0 To value.Count() - 1
+            Dim item As JSONItem = value.ValueAt(i)
+            If Not item.IsObject() Then Continue For
+            Dim location As StudioLanguageLocation = Nil
+            If item.Value("location").IsObject() Then
+                Dim place As JSONItem = item.Value("location")
+                location = Me.MakeLocation(place.Value("uri").AsString().Or(""), place.Value("range"))
+                location.Container = item.Value("containerName").AsString().Or(container)
+            Else
+                Dim range As JSONItem = item.Value("selectionRange")
+                If Not range.IsObject() Then range = item.Value("range")
+                If Not range.IsObject() Then Continue For
+                location = Me.MakeLocation(StudioLanguagePathToUri(documentPath), range)
+                location.Container = container
+            End If
+            location.Name = item.Value("name").AsString().Or("")
+            location.Detail = item.Value("detail").AsString().Or("")
+            location.Kind = LspInteger(item.Value("kind"), 0)
+            location.Depth = depth
+            answer.AddLocation(location)
+            If item.Value("children").IsArray() Then Me.AddSymbols(answer, item.Value("children"), depth + 1, location.Name, documentPath)
+        Next
+    End Sub
+
+    Private Sub ReadPrepareRename(answer As StudioLanguageResult, value As JSONItem, request As StudioLspRequest)
+        If Not value.IsObject() Then Return
+        Dim uri As String = StudioLanguagePathToUri(request.Path)
+        If value.Value("start").IsObject() Then
+            answer.AddLocation(Me.MakeLocation(uri, value))
+        ElseIf value.Value("range").IsObject() Then
+            answer.AddLocation(Me.MakeLocation(uri, value.Value("range")))
+            answer.Placeholder = value.Value("placeholder").AsString().Or("")
+        ElseIf value.Value("defaultBehavior").AsBoolean().Or(False) Then
+            Dim location As New StudioLanguageLocation()
+            location.Uri = uri
+            location.Path = request.Path
+            location.RelativePath = Me.Relative(request.Path)
+            location.Line = request.Line
+            location.Column = request.Column
+            location.EndLine = request.Line
+            location.EndColumn = request.Column
+            answer.AddLocation(location)
+        End If
+    End Sub
+
+    Private Sub AddEdits(answer As StudioLanguageResult, uri As String, edits As JSONItem)
+        If Not edits.IsArray() Then Throw New InvalidArgumentException("Text edits must be an array")
+        If StudioLanguageUriToPath(uri) = "" Then
+            answer.Error = "Text edits require a local file URI."
+            Return
+        End If
+        If Array.Count(Me.LinesFor(StudioLanguageUriToPath(uri))) = 0 Then Throw New InvalidArgumentException("Text edit source unavailable")
+        For i As Integer = 0 To edits.Count() - 1
+            Dim edit As JSONItem = edits.ValueAt(i)
+            If Not edit.IsObject() Or Not edit.Value("range").IsObject() Or Not edit.Value("newText").IsString() Or edit.HasKey("annotationId") Then
+                answer.Error = "Malformed or annotated text edits cannot be applied safely."
+                Return
+            End If
+            Dim location As StudioLanguageLocation = Me.MakeLocation(uri, edit.Value("range"))
+            location.NewText = edit.Value("newText").AsString().Or("")
+            answer.AddLocation(location)
+        Next
+    End Sub
+
+    ' Validate every member before exposing a workspace edit plan.
+    Private Sub ReadWorkspaceEdit(answer As StudioLanguageResult, value As JSONItem)
+        If Not value.IsObject() Then Throw New InvalidArgumentException("Workspace edit must be an object")
+        If value.HasKey("documentChanges") Then
+            Dim documentChanges As JSONItem = value.Value("documentChanges")
+            If Not documentChanges.IsArray() Then Throw New InvalidArgumentException("documentChanges must be an array")
+            For i As Integer = 0 To documentChanges.Count() - 1
+                Dim change As JSONItem = documentChanges.ValueAt(i)
+                If Not change.IsObject() Or change.HasKey("kind") Then Throw New InvalidArgumentException("Malformed or unsupported workspace operation")
+                Dim document As JSONItem = change.Value("textDocument")
+                If Not document.IsObject() Or Not document.Value("uri").IsString() Then Throw New InvalidArgumentException("Missing text document identity")
+                Dim uri As String = document.Value("uri").AsString().Or("")
+                Dim version As Integer = -1
+                If document.HasKey("version") And Not document.Value("version").IsNull() Then version = Me.EditInteger(document.Value("version"))
+                Dim doc As Optional Of StudioLspDocument = Me.Documents.Get(Me.UriKey(uri))
+                If version >= 0 Then
+                    If Not doc.HasValue Then Throw New InvalidArgumentException("Versioned edits require a synchronized document")
+                    If version <> doc.Value.Version Then Throw New InvalidArgumentException("The server returned edits for an obsolete document version")
+                End If
+                Dim before As Integer = Array.Count(answer.Locations)
+                Me.AddEdits(answer, uri, change.Value("edits"))
+                For j As Integer = before To Array.Count(answer.Locations) - 1
+                    answer.Locations(j).DocumentVersion = version
+                Next
+                If answer.Error <> "" Then Return
+            Next
+            ' LSP WorkspaceEdit: versioned documentChanges take precedence, even
+            ' when empty. Never fall back to changes for malformed present data.
+            Return
+        End If
+        If value.HasKey("changes") Then
+            Dim changes As JSONItem = value.Value("changes")
+            If Not changes.IsObject() Then Throw New InvalidArgumentException("changes must be an object")
+            For Each uri As String In changes.Keys()
+                Me.AddEdits(answer, uri, changes.Value(uri))
+                If answer.Error <> "" Then Return
+            Next
+        End If
+    End Sub
+
+    ' ---- Polling -------------------------------------------------------------------------
+
+    ''' Reads, dispatches, sends queued requests and detects crashes. Driven by the
+    ''' internal timer; safe to call directly.
+    Public Sub Poll()
+        If Me.Process = Nil Then Return
+        Dim failure As String = ""
+        Try
+            Me.Flush()
+            Me.ReadAvailable()
+            If Me.Process = Nil Then Return
+            If Not Me.Process.Poll() Then
+                Me.ReadAvailable()
+                If Me.Process <> Nil Then Me.HandleExit()
+                Return
+            End If
+            Me.SendDue()
+            Me.ExpireRequests()
+        Catch e As Exception
+            failure = e.Message
+        End Try
+        ' Protocol or pipe failure: treat like a crash so the restart policy applies. This
+        ' runs outside the Try above so nothing escapes into the Timer tick.
+        If failure = "" Or Me.Process = Nil Or Me.Stopping Then Return
+        Me.ErrorTail = failure
+        Try
+            Me.HandleExit()
+        Catch e As Exception
+            Me.GiveUp("The language server failed: " + e.Message)
+        End Try
+    End Sub
+End Class

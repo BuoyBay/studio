@@ -1,0 +1,190 @@
+Import StudioCodeEditor
+
+' Studio's Messages pane: a read-only, gutterless plain-text StudioCodeEditor, so the
+' log gets real selection, Primary+C / Primary+A, the editor's context menu and native
+' wheel scrolling. Each message keeps the time it arrived. Two presentations:
+'   "breaks" (default) — a "— 14:32:05 —" divider whenever a quiet gap (BreakSeconds)
+'                        separates messages, so a burst reads as one group;
+'   "lines"            — every message is prefixed with HH:MM:SS, like a console with
+'                        timestamps shown.
+' Run output (a terminal screen) can temporarily replace the log; the next message
+' brings the log back.
+
+''' One Messages entry: the text and when it arrived.
+Public Class StudioMessageEntry
+    Public Property Time As DateTime
+    Public Property Text As String = ""
+End Class
+
+''' Two-digit zero padding for clock fields.
+Private Function StudioMessagesPad(value As Integer) As String
+    If value < 10 Then Return "0" + String.From(value)
+    Return String.From(value)
+End Function
+
+''' Local wall-clock HH:MM:SS for a message time.
+Public Function StudioMessagesClock(time As DateTime) As String
+    Return StudioMessagesPad(time.Hour) + ":" + StudioMessagesPad(time.Minute) + ":" + StudioMessagesPad(time.Second)
+End Function
+
+Public Class StudioMessagesView Inherits StudioCodeEditor
+    ''' A gap at least this long (seconds) starts a new time group in "breaks" mode.
+    Public Const BreakSeconds As Double = 30.0
+    ''' Messages kept; older ones are dropped.
+    Public Const Capacity As Integer = 200
+
+    Private Property mEntries As Array Of StudioMessageEntry = []
+    Private Property mStampMode As String = "breaks"
+    Private Property mRendering As Boolean = False
+    Private Property mUserEngaged As Boolean = False
+
+    ''' The user moved the caret or selected text here (not our own re-rendering).
+    Handle SelectionChanged()
+        If Not Me.mRendering Then Me.mUserEngaged = True
+    End Handle
+
+    ''' True when Edit menu Copy / Select All should act on the log: it holds keyboard
+    ''' focus and the user has interacted with it. A window can hand the log initial
+    ''' focus on its own, which must not divert designer or source commands.
+    Public Function OwnsEditCommands() As Boolean
+        Return Me.mUserEngaged And Me.HasFocus()
+    End Function
+
+    ''' Read-only plain text without gutter, folding, minimap or Buoy-specific helpers.
+    Public Sub Configure(fontSize As Double)
+        Me.AllowsSpellCheck = False
+        Me.IsReadOnly = True
+        Me.LanguageMode = "plain"
+        Me.ShowsLineNumbers = False
+        Me.ShowsFolding = False
+        Me.ShowsMinimap = False
+        Me.ShowsStickyScopes = False
+        Me.ShowsIndentGuides = False
+        Me.ShowsBreakpoints = False
+        Me.HighlightsWordOccurrences = False
+        Me.WordWrap = True
+        Me.FontSize = fontSize
+    End Sub
+
+    ''' "breaks" or "lines" (anything else is treated as "breaks").
+    Public Property StampMode As String
+        Get
+            Return Me.mStampMode
+        End Get
+        Set
+            Dim mode As String = "breaks"
+            If value = "lines" Then mode = "lines"
+            If mode = Me.mStampMode Then Return
+            Me.mStampMode = mode
+            Me.Render()
+        End Set
+    End Property
+
+    Public Property EntryCount As Integer
+        Get
+            Return Array.Count(Me.mEntries)
+        End Get
+    End Property
+
+    Public Function EntryAt(index As Integer) As StudioMessageEntry
+        Return Me.mEntries(index)
+    End Function
+
+    ''' Appends a message stamped with the current time.
+    Public Sub Append(message As String)
+        Me.AppendAt(message, DateTime.Now())
+    End Sub
+
+    ''' Appends a message with an explicit time (tests, replayed logs).
+    Public Sub AppendAt(message As String, time As DateTime)
+        If message = "" Then Return
+        Dim entry As New StudioMessageEntry()
+        entry.Time = time
+        entry.Text = message
+        Me.mEntries.Append(entry)
+        If Array.Count(Me.mEntries) > StudioMessagesView.Capacity Then
+            Dim kept As Array Of StudioMessageEntry = []
+            For i As Integer = Array.Count(Me.mEntries) - StudioMessagesView.Capacity To Array.LastIndex(Me.mEntries)
+                kept.Append(Me.mEntries(i))
+            Next
+            Me.mEntries = kept
+        End If
+        Me.Render()
+    End Sub
+
+    Public Sub Clear()
+        Me.mEntries = []
+        Me.Render()
+    End Sub
+
+    ''' Replaces the visible text without touching the log (run output screens).
+    Public Sub ShowTranscript(text As String)
+        Me.mRendering = True
+        Try
+            Me.Text = text
+            Me.FollowTail()
+        Finally
+            Me.mRendering = False
+        End Try
+    End Sub
+
+    ''' The log as displayed for the current StampMode.
+    Public Function Formatted() As String
+        Dim lines As Array Of String = []
+        Dim previous As DateTime = Nil
+        For Each entry As StudioMessageEntry In Me.mEntries
+            Dim clock As String = StudioMessagesClock(entry.Time)
+            Dim parts As Array Of String = String.Split(entry.Text, "\n")
+            If Me.mStampMode = "lines" Then
+                Dim indent As String = "          "  ' HH:MM:SS plus two spaces
+                For i As Integer = 0 To Array.LastIndex(parts)
+                    If i = 0 Then
+                        lines.Append(clock + "  " + parts(i))
+                    Else
+                        lines.Append(indent + parts(i))
+                    End If
+                Next
+            Else
+                Dim gap As Boolean = previous Is Nil
+                If Not gap Then gap = (entry.Time - previous).TotalSeconds >= StudioMessagesView.BreakSeconds
+                If gap Then
+                    If Array.Count(lines) > 0 Then lines.Append("")
+                    lines.Append("— " + clock + " —")
+                End If
+                For Each part As String In parts
+                    lines.Append(part)
+                Next
+            End If
+            previous = entry.Time
+        Next
+        Return String.Join(lines, "\n")
+    End Function
+
+    Private Sub Render()
+        Dim rendered As String = Me.Formatted()
+        Dim previous As String = Me.Text
+        If String.Compare(rendered, previous, True) = 0 Then Return
+        Dim start As Integer = Me.SelectionStart
+        Dim length As Integer = Me.SelectionLength
+        Me.mRendering = True
+        Try
+            Me.Text = rendered
+            If length = 0 Then
+                ' New output follows the tail.
+                Me.FollowTail()
+            Else
+                ' Keep the user's selection: messages are only appended at the end and
+                ' trimmed from the head, so the text from the selection on survives.
+                Dim moved As Integer = String.IndexOf(rendered, String.Substring(previous, start))
+                If moved >= 0 Then Me.SelectRange(moved, length)
+            End If
+        Finally
+            Me.mRendering = False
+        End Try
+    End Sub
+
+    Private Sub FollowTail()
+        Dim last As Integer = Math.Max(0, Me.LineCount - 1)
+        Me.GoToLocation(last, 0)
+    End Sub
+End Class

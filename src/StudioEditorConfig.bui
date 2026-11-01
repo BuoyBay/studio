@@ -1,0 +1,251 @@
+Import StudioDocumentIO
+
+Public Class StudioEditorConfigOptions
+    Public Property IndentStyle As String = ""
+    ' When tab_width is omitted, the host resolves this using its current tab size.
+    Public Property IndentSizeUsesTab As Boolean = False
+    Public Property IndentSize As Integer = 0
+    Public Property TabWidth As Integer = 0
+    Public Property EndOfLine As String = ""
+    Public Property Charset As String = ""
+    Public Property TrimTrailingWhitespace As String = ""
+    Public Property InsertFinalNewline As String = ""
+    Public Property Diagnostics As Array Of String = []
+
+    ''' Explicit save preparation. Snapshot first to make all policies undoable.
+    ''' Unset values leave the buffer alone. No silent encoding conversion.
+    Public Sub Prepare(buffer As StudioDocumentBuffer, expectedRevision As Integer)
+        If buffer = Nil Then Throw New InvalidArgumentException("Missing document")
+        If buffer.Revision <> expectedRevision Then Throw New InvalidArgumentException("Document revision changed")
+        If Me.Charset <> "" And Me.Charset <> "utf-8" And Me.Charset <> "utf-8-bom" Then Throw New InvalidArgumentException("Studio supports UTF-8 only; EditorConfig requested " + Me.Charset)
+        If Me.Charset = "utf-8" Then buffer.SetUTF8BOM(False, buffer.Revision)
+        If Me.Charset = "utf-8-bom" Then buffer.SetUTF8BOM(True, buffer.Revision)
+        If Me.TrimTrailingWhitespace = "true" Then buffer.CleanupWhitespace(buffer.Revision)
+        If Me.EndOfLine <> "" Then buffer.ConvertEndings(Me.EndOfLine, buffer.Revision)
+        If Me.InsertFinalNewline = "true" And buffer.Text <> "" And Not buffer.HasFinalNewline Then buffer.ApplyEdit(String.Len(buffer.Text), 0, "\n", buffer.Revision)
+    End Sub
+End Class
+
+Private Function SECExact(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+' Bounded glob matcher, case sensitive on every host per EditorConfig.
+' *, **, ?, [abc], [!abc], [a-z], and {a,b} are supported.
+Private Function SECMatch(pattern As String, text As String, ByRef budget As Integer) As Boolean
+    budget -= 1
+    If budget < 0 Then Throw New InvalidArgumentException("EditorConfig glob complexity exceeded")
+    Dim brace As Integer = String.IndexOf(pattern, "{", 0, True)
+    If brace >= 0 Then
+        Dim closing As Integer = String.IndexOf(pattern, "}", brace + 1, True)
+        If closing < 0 Then Throw New InvalidArgumentException("Unclosed EditorConfig brace")
+        Dim body As String = String.Substring(pattern, brace + 1, closing - brace - 1)
+        If String.Contains(body, "{", True) Or String.Contains(body, "..", True) Then Throw New InvalidArgumentException("Nested/numeric EditorConfig braces are unsupported")
+        For Each choice As String In String.Split(body, ",")
+            If SECMatch(String.Left(pattern, brace) + choice + String.Substring(pattern, closing + 1), text, budget) Then Return True
+        Next
+        Return False
+    End If
+    Dim p As Array Of String = String.Chars(pattern)
+    Dim t As Array Of String = String.Chars(text)
+    Dim pi As Integer = 0
+    Dim ti As Integer = 0
+    While pi < Array.Count(p)
+        Dim token As String = p(pi)
+        If token = "*" Then
+            Dim crossSlash As Boolean = False
+            pi += 1
+            If pi < Array.Count(p) Then
+                If p(pi) = "*" Then
+                    crossSlash = True
+                    pi += 1
+                End If
+            End If
+            ' **/ also matches no directory components.
+            If crossSlash And pi < Array.Count(p) Then
+                If p(pi) = "/" Then
+                    If SECMatch(String.Substring(pattern, pi + 1), String.Substring(text, ti), budget) Then Return True
+                End If
+            End If
+            Dim rest As String = String.Substring(pattern, pi)
+            For take As Integer = ti To Array.Count(t)
+                If SECMatch(rest, String.Substring(text, take), budget) Then Return True
+                If take < Array.Count(t) Then
+                    If Not crossSlash And t(take) = "/" Then Exit For
+                End If
+            Next
+            Return False
+        End If
+        If ti >= Array.Count(t) Then Return False
+        If token = "?" Then
+            If t(ti) = "/" Then Return False
+        ElseIf token = "[" Then
+            Dim closeIndex As Integer = pi + 1
+            While closeIndex < Array.Count(p)
+                If p(closeIndex) = "]" Then Exit While
+                closeIndex += 1
+            End While
+            If closeIndex >= Array.Count(p) Then Throw New InvalidArgumentException("Unclosed EditorConfig character class")
+            Dim j As Integer = pi + 1
+            Dim negate As Boolean = False
+            If p(j) = "!" Then
+                negate = True
+                j += 1
+            End If
+            Dim matched As Boolean = False
+            While j < closeIndex
+                If j + 2 < closeIndex Then
+                    If p(j + 1) = "-" Then
+                        If String.Compare(t(ti), p(j), True) >= 0 And String.Compare(t(ti), p(j + 2), True) <= 0 Then matched = True
+                        j += 3
+                        Continue While
+                    End If
+                End If
+                If SECExact(t(ti), p(j)) Then matched = True
+                j += 1
+            End While
+            If t(ti) = "/" Or matched = negate Then Return False
+            pi = closeIndex
+        ElseIf token = "\\" Then
+            pi += 1
+            If pi >= Array.Count(p) Then Throw New InvalidArgumentException("Trailing EditorConfig escape")
+            If Not SECExact(p(pi), t(ti)) Then Return False
+        Else
+            If Not SECExact(token, t(ti)) Then Return False
+        End If
+        pi += 1
+        ti += 1
+    End While
+    Return ti = Array.Count(t)
+End Function
+
+Private Function SECSectionMatches(pattern As String, relative As String) As Boolean
+    Dim candidate As String = relative
+    Dim anchored As Boolean = String.StartsWith(pattern, "/", True)
+    If anchored Then pattern = String.Substring(pattern, 1)
+    If Not anchored And Not String.Contains(pattern, "/", True) Then
+        Dim components As Array Of String = String.Split(relative, "/")
+        candidate = components(Array.Count(components) - 1)
+    End If
+    Dim budget As Integer = 20000
+    Return SECMatch(pattern, candidate, budget)
+End Function
+
+Private Function SECPositive(value As String) As Integer
+    If value = "" Or String.Len(value) > 4 Then Return 0
+    Dim n As Integer = 0
+    For Each c As String In String.Chars(value)
+        If String.Asc(c) < 48 Or String.Asc(c) > 57 Then Return 0
+        n = n * 10 + String.Asc(c) - 48
+    Next
+    If n < 1 Or n > 256 Then Return 0
+    Return n
+End Function
+
+Public Class StudioEditorConfig
+    ''' Traverses nearest-to-root, applies root-to-nearest, last matching section
+    ''' wins. root=true stops traversal; properties may explicitly use unset.
+    Public Shared Function Resolve(filePath As String) As StudioEditorConfigOptions
+        Dim options As New StudioEditorConfigOptions()
+        Dim file As New FileSystemItem(StudioDocumentStablePath(filePath))
+        Dim directory As FileSystemItem = file.Parent
+        Dim configs As Array Of String = []
+        Dim relatives As Array Of String = []
+        Dim relative As String = file.Name()
+        Dim depth As Integer = 0
+        While directory <> Nil And depth < 128
+            Dim config As FileSystemItem = directory.Child(".editorconfig")
+            If config.Exists() Then
+                Dim read As Result Of String, String = config.ReadAllText()
+                If read.IsErr Then
+                    Array.Append(options.Diagnostics, config.FullPath() + ": " + read.Error)
+                ElseIf String.LenBytes(read.Value) > 262144 Then
+                    Array.Append(options.Diagnostics, config.FullPath() + ": exceeds 256 KiB")
+                Else
+                    Array.Append(configs, read.Value)
+                    Array.Append(relatives, relative)
+                    Dim header As Boolean = True
+                    Dim stopAtRoot As Boolean = False
+                    For Each raw As String In String.Split(StudioDocumentBuffer.FromText(read.Value).Text, "\n")
+                        Dim line As String = String.Trim(raw)
+                        If String.StartsWith(line, "[", True) Then header = False
+                        If header Then
+                            Dim split As Integer = String.IndexOf(line, "=", 0, True)
+                            If split >= 0 Then
+                                If String.LCase(String.Trim(String.Left(line, split))) = "root" And String.LCase(String.Trim(String.Substring(line, split + 1))) = "true" Then stopAtRoot = True
+                            End If
+                        End If
+                    Next
+                    If stopAtRoot Then Exit While
+                End If
+            End If
+            Dim parent As FileSystemItem = directory.Parent
+            If parent = Nil Then Exit While
+            If SECExact(parent.FullPath(), directory.FullPath()) Then Exit While
+            relative = directory.Name() + "/" + relative
+            directory = parent
+            depth += 1
+        End While
+        Dim values As New Map Of String, String()
+        For i As Integer = Array.Count(configs) - 1 To 0 Step -1
+            Dim active As Boolean = False
+            For Each raw As String In String.Split(StudioDocumentBuffer.FromText(configs(i)).Text, "\n")
+                Dim line As String = String.Trim(raw)
+                If line = "" Or String.StartsWith(line, "#", True) Or String.StartsWith(line, ";", True) Then Continue For
+                If String.StartsWith(line, "[", True) And String.EndsWith(line, "]", True) Then
+                    Try
+                        active = SECSectionMatches(String.Substring(line, 1, String.Len(line) - 2), relatives(i))
+                    Catch e As Exception
+                        active = False
+                        Array.Append(options.Diagnostics, e.Message)
+                    End Try
+                    Continue For
+                End If
+                If Not active Then Continue For
+                Dim split As Integer = String.IndexOf(line, "=", 0, True)
+                If split < 0 Then Continue For
+                Dim key As String = String.LCase(String.Trim(String.Left(line, split)))
+                Dim value As String = String.LCase(String.Trim(String.Substring(line, split + 1)))
+                values.Set(key, value)
+            Next
+        Next
+        For Each key As String In ["indent_style", "indent_size", "tab_width", "end_of_line", "charset", "trim_trailing_whitespace", "insert_final_newline"]
+            If Not values.ContainsKey(key) Then Continue For
+            Dim value As String = values.Get(key).Value
+            If value = "unset" Then Continue For
+            Dim valid As Boolean = True
+            Select Case key
+                Case "indent_style"
+                    valid = value = "tab" Or value = "space"
+                    If valid Then options.IndentStyle = value
+                Case "indent_size"
+                    If value = "tab" Then
+                        options.IndentSizeUsesTab = True
+                        options.IndentSize = -1
+                    Else
+                        options.IndentSize = SECPositive(value)
+                        valid = options.IndentSize > 0
+                    End If
+                Case "tab_width"
+                    options.TabWidth = SECPositive(value)
+                    valid = options.TabWidth > 0
+                Case "end_of_line"
+                    valid = value = "lf" Or value = "cr" Or value = "crlf"
+                    If valid Then options.EndOfLine = String.UCase(value)
+                Case "charset"
+                    options.Charset = value
+                    valid = value = "utf-8" Or value = "utf-8-bom"
+                Case "trim_trailing_whitespace"
+                    valid = value = "true" Or value = "false"
+                    If valid Then options.TrimTrailingWhitespace = value
+                Case "insert_final_newline"
+                    valid = value = "true" Or value = "false"
+                    If valid Then options.InsertFinalNewline = value
+            End Select
+            If Not valid Then Array.Append(options.Diagnostics, "Unsupported/invalid " + key + "=" + value)
+        Next
+        If options.IndentSize = -1 Then options.IndentSize = options.TabWidth
+        If options.TabWidth = 0 And options.IndentSize > 0 Then options.TabWidth = options.IndentSize
+        Return options
+    End Function
+End Class

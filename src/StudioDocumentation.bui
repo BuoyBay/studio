@@ -1,0 +1,738 @@
+Import desktopmenus
+Import processkit
+Import StudioDiscovery
+
+''' Unified offline documentation for Studio: Buoy's bundled documentation plus the
+''' documentation shipped inside the project's installed packages.
+'''
+''' The trusted helper shipped with Studio (or an explicitly configured path) rebuilds the
+''' unified snapshot as data; nothing inside the project or its packages is executed.
+''' The snapshot reaches the viewer only as JSON text inside JavaScript string literals
+''' and is parsed there with JSON.parse, so package content is never evaluated as code.
+Public Class StudioDocumentationJob
+    Public Const OutputLimit As Integer = 1048576
+    Public Const ErrorLimit As Integer = 16384
+    Public Const TimeoutTicks As Integer = 2400
+    Private Property mProcess As PipeProcess
+    Private Property mOutput As String
+    Private Property mErrors As String
+    Private Property mTicks As Integer = 0
+    Public Property OutputPath As String
+    Public Property IsComplete As Boolean = False
+    Public Property Succeeded As Boolean = False
+    Public Property Summary As String
+    Public Property Pages As Integer = 0
+    Public Property Sources As Integer = 0
+    Public Property Problems As Integer = 0
+
+    ''' Starts the helper. Missing requirements fail immediately with readable text.
+    Public Sub Constructor(pythonPath As String, helperPath As String, projectRoot As String, snapshotPath As String, outputPath As String)
+        Me.OutputPath = outputPath
+        If projectRoot = "" Then
+            Me.Fail("Open Studio with --project FOLDER to include package documentation.")
+            Return
+        End If
+        If Not New FileSystemItem(projectRoot).IsFolder() Then
+            Me.Fail("Project folder not found: " + projectRoot)
+            Return
+        End If
+        If pythonPath = "" Or Not New FileSystemItem(pythonPath).IsFile() Then
+            Me.Fail("Package documentation needs Python 3. Install it or set BUOY_STUDIO_PYTHON to its full path.")
+            Return
+        End If
+        If helperPath = "" Or Not New FileSystemItem(helperPath).IsFile() Then
+            Me.Fail("The documentation helper is missing from this build. Set BUOY_STUDIO_DOCUMENTATION_HELPER to discover_documentation.py.")
+            Return
+        End If
+        If snapshotPath = "" Or Not New FileSystemItem(snapshotPath).IsFile() Then
+            Me.Fail("The bundled Buoy documentation is missing from this build.")
+            Return
+        End If
+        Dim folder As FileSystemItem = New FileSystemItem(outputPath).Parent
+        If folder = Nil Then
+            Me.Fail("The documentation cache folder is not valid: " + outputPath)
+            Return
+        End If
+        If Not folder.CreateFolder(True) Then
+            Me.Fail("Could not create the documentation cache folder " + folder.FullPath())
+            Return
+        End If
+        Try
+            Dim arguments As Array Of String = [helperPath, "--project", projectRoot, "--snapshot", snapshotPath, "--output", outputPath]
+            Me.mProcess = New PipeProcess(pythonPath, arguments, projectRoot)
+            Me.mProcess.CloseInput()
+        Catch e As Exception
+            Me.Fail("Could not start the documentation helper: " + e.Message)
+        End Try
+    End Sub
+
+    Private Sub Fail(message As String)
+        Me.IsComplete = True
+        Me.Succeeded = False
+        Me.Summary = message
+        If Me.mProcess <> Nil Then
+            Try
+                Me.mProcess.Terminate()
+            Catch e As Exception
+                ' The process may already have exited.
+            End Try
+            Me.mProcess.Close()
+            Me.mProcess = Nil
+        End If
+    End Sub
+
+    ''' Reads everything currently buffered; bytes beyond the limits are drained and dropped
+    ''' so a chatty helper can never block on a full pipe.
+    Private Sub Drain()
+        For i As Integer = 1 To 64
+            Dim read As Boolean = False
+            Dim chunk As Bytes = Me.mProcess.ReadOutput(65536)
+            If chunk <> Nil Then
+                If chunk.Count > 0 Then
+                    read = True
+                    If String.LenBytes(Me.mOutput) < StudioDocumentationJob.OutputLimit Then Me.mOutput += chunk.ToString(Text.Encodings.UTF8)
+                End If
+            End If
+            Dim errorChunk As Bytes = Me.mProcess.ReadError(16384)
+            If errorChunk <> Nil Then
+                If errorChunk.Count > 0 Then
+                    read = True
+                    If String.LenBytes(Me.mErrors) < StudioDocumentationJob.ErrorLimit Then Me.mErrors += errorChunk.ToString(Text.Encodings.UTF8)
+                End If
+            End If
+            If Not read Then Exit For
+        Next
+    End Sub
+
+    ''' Advances the job; call from a UI timer until IsComplete.
+    Public Sub Poll()
+        If Me.IsComplete Or Me.mProcess = Nil Then Return
+        Try
+            Me.mTicks += 1
+            Me.Drain()
+            If Me.mProcess.Poll() Then
+                If Me.mTicks > StudioDocumentationJob.TimeoutTicks Then Me.Fail("Indexing package documentation timed out and was stopped.")
+                Return
+            End If
+            Me.Drain()
+            If Not Me.mProcess.OutputClosed Or Not Me.mProcess.ErrorClosed Then Return
+            Dim code As Integer = Me.mProcess.ExitCode
+            Me.mProcess.Close()
+            Me.mProcess = Nil
+            If code <> 0 Then
+                Dim detail As String = String.Trim(Me.mErrors)
+                Dim reported As Optional Of JSONItem = Json.TryParse(detail)
+                If reported.HasValue Then
+                    If reported.Value.Value("error").IsString() Then detail = reported.Value.Value("error").AsString().Or(detail)
+                End If
+                If detail = "" Then detail = "exit status " + String.From(code)
+                Me.Fail("Package documentation could not be indexed: " + detail)
+                Return
+            End If
+            Me.Finish()
+        Catch e As Exception
+            Me.Fail("Package documentation could not be indexed: " + e.Message)
+        End Try
+    End Sub
+
+    ''' Success requires this run's own report naming the snapshot it wrote, so a stale
+    ''' snapshot from an earlier run is never presented as fresh.
+    Private Sub Finish()
+        Dim reported As Optional Of JSONItem = Json.TryParse(String.Trim(Me.mOutput))
+        If Not reported.HasValue Then
+            Me.Fail("The documentation helper returned no report; the previous library was kept.")
+            Return
+        End If
+        Dim report As JSONItem = reported.Value
+        If Not report.IsObject() Or Not report.Value("output").IsString() Then
+            Me.Fail("The documentation helper returned an unexpected report; the previous library was kept.")
+            Return
+        End If
+        If report.Value("output").AsString().Or("") <> Me.OutputPath Then
+            Me.Fail("The documentation helper wrote an unexpected file: " + report.Value("output").AsString().Or(""))
+            Return
+        End If
+        If Not New FileSystemItem(Me.OutputPath).IsFile() Then
+            Me.Fail("The documentation helper did not write " + Me.OutputPath)
+            Return
+        End If
+        Me.Pages = Math.Round(report.Value("pages").AsNumber().Or(0.0))
+        Me.Sources = Math.Round(report.Value("sources").AsNumber().Or(0.0))
+        Me.Problems = report.Value("diagnostics").Count()
+        Me.IsComplete = True
+        Me.Succeeded = True
+        Dim packages As Integer = Me.Sources - 1
+        If packages < 0 Then packages = 0
+        If packages = 0 Then
+            Me.Summary = "No installed packages include documentation."
+        ElseIf packages = 1 Then
+            Me.Summary = "Indexed documentation from 1 package."
+        Else
+            Me.Summary = "Indexed documentation from " + String.From(packages) + " packages."
+        End If
+    End Sub
+
+    Public Sub Cancel()
+        If Not Me.IsComplete Then Me.Fail("Indexing package documentation was cancelled.")
+    End Sub
+End Class
+
+''' The helper ships as an app resource; an explicit path overrides it for development.
+Public Function StudioDocumentationHelperPath() As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_DOCUMENTATION_HELPER").Or("")
+    If configured <> "" Then Return configured
+    Dim bundled As FileSystemItem = FileSystemItem.AppResource("discover_documentation.py")
+    If bundled = Nil Then Return ""
+    Return bundled.FullPath()
+End Function
+
+''' Buoy's own documentation snapshot, bundled with Studio.
+Public Function StudioDocumentationSnapshotPath() As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_DOCUMENTATION_SNAPSHOT").Or("")
+    If configured <> "" Then Return configured
+    Dim bundled As FileSystemItem = FileSystemItem.AppResource("documentation-upstream.json")
+    If bundled = Nil Then Return ""
+    Return bundled.FullPath()
+End Function
+
+''' The per-project unified snapshot sits beside Studio's other project indexes.
+Public Function StudioDocumentationCachePath(projectRoot As String) As String
+    If projectRoot = "" Then Return ""
+    Return Path.Join(projectRoot, ".buoy/documentation/index-v1.json")
+End Function
+
+''' A minimal page shown when the bundled viewer itself cannot be loaded.
+Private Function StudioDocumentationErrorPage(heading As String, detail As String) As String
+    Dim style As String = "<style>:root{color-scheme:light dark}body{margin:0;height:100vh;display:grid;place-items:center;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:#fff;color:#1b2129}main{max-width:480px;padding:32px;text-align:center}h1{font-size:22px;line-height:30px;margin:0 0 8px}p{margin:0;color:#5b6573}@media(prefers-color-scheme:dark){body{background:#1b2026;color:#e4e8ed}p{color:#a2acb8}}</style>"
+    Return "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\">" + style + "</head><body><main><h1>" + heading + "</h1><p>" + detail + "</p></main></body></html>"
+End Function
+
+Private Class StudioDocumentationBrowser Inherits HTMLView
+    Public Property Owner As Weak StudioDocumentationWindow
+    Handle JavaScriptRequest()
+        ' An exception escaping an event handler would terminate the app.
+        Try
+            Dim message As String = Me.Message
+            Dim target As StudioDocumentationWindow = Me.Owner
+            If target <> Nil Then target.AcceptMessage(message)
+        Catch e As Exception
+            Print "Documentation viewer message ignored: " + e.Message
+        End Try
+    End Handle
+    ''' Only the in-memory document may load: no remote pages, files or package links.
+    Handle CancelLoad(url As String) As Boolean
+        Return Not (String.Left(url, 6) = "about:")
+    End Handle
+End Class
+
+Private Class StudioDocumentationPoller Inherits Timer
+    Public Property Owner As Weak StudioDocumentationWindow
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioDocumentationWindow = Me.Owner
+        If target <> Nil Then target.Poll()
+    End Sub
+End Class
+
+''' Fails a documentation test that never reaches a verdict.
+Private Class StudioDocumentationWatchdog Inherits Timer
+    Public Overrides Sub NotifyTick()
+        Print "BUOY STUDIO DOCUMENTATION TEST FAILED: timed out"
+        Application.Quit()
+    End Sub
+End Class
+
+''' Studio's documentation reader: a separate, reusable window with its own menu bar.
+''' Studio keeps one instance; Help > Documentation shows it or brings it to the front.
+Public Class StudioDocumentationWindow Inherits Window
+    Public Const ChunkCharacters As Integer = 524288
+    Public Const SnapshotLimit As Integer = 134217728
+    Public Property Browser As StudioDocumentationBrowser = New StudioDocumentationBrowser()
+    Public Property ProjectRoot As String
+    Public Property IsClosed As Boolean = False
+    Public Property IsReady As Boolean = False
+    Public Property Job As StudioDocumentationJob
+    Public Property Status As String
+    ''' Test mode: "" (off), a package name expected in the refreshed library, or "fail".
+    Public Property TestExpect As String
+    Public Property TestQuery As String
+    Public Property TestCopied As Boolean = False
+    Private Property Poller As StudioDocumentationPoller = New StudioDocumentationPoller()
+    Private Property Watchdog As StudioDocumentationWatchdog
+    Private Property Menus As MenuBar = New MenuBar()
+    Private Property Token As Integer = 0
+    Private Property BookmarkFile As FileSystemItem
+    Private Property LoadedOrigin As String
+    Private Property PendingToken As Integer = 0
+    Private Property RefreshPending As Boolean = False
+    Private Property TestStarted As Boolean = False
+    Private Property PendingPage As String
+    Private Property PendingTopicQuery As String
+    Private Property PendingTopicKind As String
+
+    Public Sub Constructor(projectRoot As String, testExpect As String)
+        Super.Constructor()
+        Me.ProjectRoot = projectRoot
+        Me.TestExpect = testExpect
+        Me.Title = "Buoy Documentation"
+        Me.Move(120, 80, 1220, 800)
+        Me.SetMinSize(560.0, 420.0)
+        Me.BuildMenus()
+        Me.Browser.Owner = Me
+        Me.Browser.Move(0, 0, 1220, 800)
+        Me.AddSubview(Me.Browser)
+        If testExpect = "" Then
+            Dim data As FileSystemItem = System.Folders.ApplicationData()
+            If data <> Nil Then
+                Dim folder As FileSystemItem = data.Child("BuoyStudio")
+                If folder.CreateFolder(True) Then Me.BookmarkFile = folder.Child("documentation-bookmarks.json")
+            End If
+        Else
+            Me.Watchdog = New StudioDocumentationWatchdog()
+            Me.Watchdog.Period = 60000
+            Me.Watchdog.Count = 1
+            Me.Watchdog.Start()
+        End If
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 50
+        Me.Poller.Start()
+        Me.LoadViewer()
+    End Sub
+
+    Private Function MenuEntry(menu As Menu, caption As String, tag As String, shortcut As String) As MenuItem
+        Dim item As New MenuItem()
+        item.Caption = caption
+        item.Tag = tag
+        If shortcut <> "" Then item.Shortcut = shortcut
+        menu.AddItem(item)
+        Return item
+    End Function
+
+    Private Function Shortcut(key As String) As String
+        #If TargetMac Then
+            Return "Cmd+" + key
+        #Else
+            Return "Ctrl+" + key
+        #End If
+    End Function
+
+    ''' Its own MenuBar instance (required on Linux for per-window dispatch).
+    Private Sub BuildMenus()
+        Dim fileMenu As New Menu()
+        Me.MenuEntry(fileMenu, "Close Documentation", "close", Me.Shortcut("W"))
+        Dim editMenu As New Menu()
+        Me.MenuEntry(editMenu, "Copy", "copy", Me.Shortcut("C"))
+        Me.MenuEntry(editMenu, "Paste", "paste", Me.Shortcut("V"))
+        Me.MenuEntry(editMenu, "Select All", "select-all", Me.Shortcut("A"))
+        editMenu.AddSeparator()
+        Me.MenuEntry(editMenu, "Find on Page", "find-page", Me.Shortcut("F"))
+        Me.MenuEntry(editMenu, "Search Documentation", "search", Me.Shortcut("Shift+F"))
+        Me.MenuEntry(editMenu, "Find Next", "find-next", Me.Shortcut("G"))
+        Me.MenuEntry(editMenu, "Find Previous", "find-previous", Me.Shortcut("Shift+G"))
+        Dim viewMenu As New Menu()
+        Me.MenuEntry(viewMenu, "Bigger Text", "text-bigger", Me.Shortcut("="))
+        Me.MenuEntry(viewMenu, "Smaller Text", "text-smaller", Me.Shortcut("-"))
+        Me.MenuEntry(viewMenu, "Actual Text Size", "text-actual", Me.Shortcut("0"))
+        Dim goMenu As New Menu()
+        #If TargetMac Then
+            Me.MenuEntry(goMenu, "Back", "back", "Cmd+[")
+            Me.MenuEntry(goMenu, "Forward", "forward", "Cmd+]")
+        #Else
+            Me.MenuEntry(goMenu, "Back", "back", "Alt+Left")
+            Me.MenuEntry(goMenu, "Forward", "forward", "Alt+Right")
+        #End If
+        Me.MenuEntry(goMenu, "Buoy Documentation Home", "home", Me.Shortcut("Shift+H"))
+        goMenu.AddSeparator()
+        Me.MenuEntry(goMenu, "Save or Remove Bookmark", "bookmark", Me.Shortcut("D"))
+        Dim helpMenu As New Menu()
+        Me.MenuEntry(helpMenu, "Refresh Project Documentation", "refresh", Me.Shortcut("Shift+R"))
+        Me.MenuEntry(helpMenu, "Reserved Words", "keywords", "")
+        Me.MenuEntry(helpMenu, "Keyboard Shortcuts", "shortcuts", "")
+        Me.Menus.AddMenu(fileMenu, "File")
+        Me.Menus.AddMenu(editMenu, "Edit")
+        Me.Menus.AddMenu(viewMenu, "View")
+        Me.Menus.AddMenu(goMenu, "Go")
+        Me.Menus.AddMenu(helpMenu, "Help")
+        Me.MenuBar = Me.Menus
+        RegisterSystemMenus()
+    End Sub
+
+    ''' Loads the bundled reader, or a readable error page instead of failing.
+    Public Sub LoadViewer()
+        Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_DOCUMENTATION_VIEWER").Or("")
+        Dim resource As FileSystemItem = Nil
+        If configured <> "" Then
+            resource = New FileSystemItem(configured)
+        Else
+            resource = FileSystemItem.AppResource("documentation.html")
+        End If
+        If resource = Nil Then
+            Me.Browser.LoadHTML(StudioDocumentationErrorPage("Documentation is not bundled", "This Studio build is missing its documentation reader. Rebuild Studio with tools/build_studio.py."))
+            Me.TestFinished(False, "documentation.html is not bundled")
+            Return
+        End If
+        Dim loaded As Result Of String, String = resource.ReadAllText()
+        If Not loaded.IsOk Then
+            Me.Browser.LoadHTML(StudioDocumentationErrorPage("Documentation could not be opened", "The documentation reader could not be read. Rebuild Studio with tools/build_studio.py."))
+            Me.TestFinished(False, "documentation.html could not be read: " + loaded.Error)
+            Return
+        End If
+        Me.Browser.LoadHTML(loaded.Value)
+    End Sub
+
+    ' ---- Native -> page --------------------------------------------------------------------
+
+    ''' Every value crosses as a JSON string literal produced by the serializer.
+    Private Sub Send(message As JSONItem)
+        If Me.IsClosed Then Return
+        Me.Browser.ExecuteJavaScript("window.documentationNative&&window.documentationNative.receive(" + JSONItem.From(message.ToString()).ToString() + ")")
+    End Sub
+
+    Public Sub SendStatus(state As String, message As String, detail As String)
+        Me.Status = message
+        Dim status As JSONItem = JSONItem.NewObject()
+        status.Value("state") = state
+        status.Value("message") = message
+        status.Value("detail") = detail
+        status.Value("canRefresh") = Me.ProjectRoot <> ""
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "status"
+        envelope.Value("status") = status
+        Me.Send(envelope)
+    End Sub
+
+    Public Sub Command(name As String)
+        If Not Me.IsReady Then Return
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "command"
+        envelope.Value("name") = name
+        Me.Send(envelope)
+    End Sub
+
+    ''' Opens the best page for an editor word: kind is "keyword", "symbol" or "".
+    ''' Resolution (in the reader): definition anchor, type index, keyword page, then a
+    ''' sidebar search for the word. Queued until the reader is ready; the reader itself
+    ''' queues it again until a library has loaded. Does not show the window.
+    Public Sub ShowPage(pagePath As String)
+        If Me.IsClosed Then Return
+        If Not String.StartsWith(pagePath, "/", True) Or String.Len(pagePath) > 500 Then Throw New InvalidArgumentException("Documentation page must be an internal path")
+        If Not Me.IsReady Then
+            Me.PendingPage = pagePath
+            Return
+        End If
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "page"
+        envelope.Value("path") = pagePath
+        Me.Send(envelope)
+    End Sub
+
+    Public Sub ShowTopic(query As String, kind As String)
+        If Me.IsClosed Then Return
+        Dim word As String = String.Trim(query)
+        If word = "" Then Return
+        If String.Len(word) > 200 Then word = String.Left(word, 200)
+        ' Buoy's <> is case-insensitive; the reader's check is not, so fold first.
+        kind = String.LCase(kind)
+        If kind <> "keyword" And kind <> "symbol" Then kind = ""
+        If Not Me.IsReady Then
+            Me.PendingTopicQuery = word
+            Me.PendingTopicKind = kind
+            Return
+        End If
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "topic"
+        envelope.Value("query") = word
+        envelope.Value("kind") = kind
+        Me.Send(envelope)
+    End Sub
+
+    ''' Streams a snapshot file to the reader in bounded chunks; the reader parses it as
+    ''' data and keeps its current library if the text is not a valid snapshot.
+    Private Function SendSnapshot(file As FileSystemItem, origin As String, preserve As Boolean) As Boolean
+        If file = Nil Then Return False
+        If Not file.IsFile() Then Return False
+        Dim size As Integer = file.Length()
+        If size <= 0 Or size > StudioDocumentationWindow.SnapshotLimit Then Return False
+        Dim loaded As Result Of String, String = file.ReadAllText()
+        If Not loaded.IsOk Then Return False
+        Dim text As String = loaded.Value
+        Me.Token += 1
+        Me.PendingToken = Me.Token
+        Dim token As String = String.From(Me.Token)
+        Me.Browser.ExecuteJavaScript("window.documentationNative.begin(" + token + ")")
+        Dim total As Integer = String.Len(text)
+        Dim count As Integer = 0
+        Dim start As Integer = 1
+        While start <= total
+            Dim part As String = String.Mid(text, start, StudioDocumentationWindow.ChunkCharacters)
+            Me.Browser.ExecuteJavaScript("window.documentationNative.chunk(" + token + "," + String.From(count) + "," + JSONItem.From(part).ToString() + ")")
+            count += 1
+            start += StudioDocumentationWindow.ChunkCharacters
+        End While
+        Dim options As JSONItem = JSONItem.NewObject()
+        options.Value("origin") = origin
+        options.Value("preserve") = preserve
+        options.Value("transferToken") = Me.Token
+        Me.Browser.ExecuteJavaScript("window.documentationNative.commit(" + token + "," + String.From(count) + "," + options.ToString() + ")")
+        Return True
+    End Function
+
+    ''' Shows the best library available immediately, then refreshes package docs.
+    Private Sub ShowInitialLibrary()
+        Dim cache As String = StudioDocumentationCachePath(Me.ProjectRoot)
+        Dim shown As Boolean = False
+        ' Most tests start bundled; the corrupt-cache regression opts into the
+        ' production cache path explicitly.
+        If cache <> "" And (Me.TestExpect = "" Or System.EnvironmentVariable("BUOY_STUDIO_DOCUMENTATION_TEST_CACHE").Or("") = "1") Then
+            shown = Me.SendSnapshot(New FileSystemItem(cache), "cache", False)
+        End If
+        If Not shown Then
+            Dim bundled As String = StudioDocumentationSnapshotPath()
+            If bundled <> "" Then shown = Me.SendSnapshot(New FileSystemItem(bundled), "bundled", False)
+        End If
+        If Not shown Then
+            Me.SendStatus("error", "Buoy documentation is missing from this build.", "documentation-upstream.json is not bundled. Rebuild Studio with tools/build_studio.py.")
+            Me.TestFinished(False, "bundled documentation could not be sent")
+            Return
+        End If
+        If Me.ProjectRoot = "" Then
+            Me.SendStatus("unavailable", "Open Studio with --project FOLDER to include package documentation.", "")
+        Else
+            Me.Refresh()
+        End If
+    End Sub
+
+    ''' Re-indexes the project's package documentation without blocking the UI.
+    Public Sub Refresh()
+        If Me.Job <> Nil Then
+            If Not Me.Job.IsComplete Then Return
+        End If
+        If Not Me.IsReady Then
+            Me.RefreshPending = True
+            Return
+        End If
+        Me.Job = New StudioDocumentationJob(StudioPythonPath(), StudioDocumentationHelperPath(), Me.ProjectRoot, StudioDocumentationSnapshotPath(), StudioDocumentationCachePath(Me.ProjectRoot))
+        If Me.Job.IsComplete Then
+            Me.FinishRefresh()
+        Else
+            Dim message As String = "Indexing project package documentation…"
+            If Me.LoadedOrigin = "cache" Then message = "Showing the last index. Checking installed packages…"
+            Me.SendStatus("indexing", message, "")
+        End If
+    End Sub
+
+    Public Sub Poll()
+        If Me.Job = Nil Then Return
+        If Me.Job.IsComplete Then Return
+        Try
+            Me.Job.Poll()
+            If Me.Job.IsComplete Then Me.FinishRefresh()
+        Catch e As Exception
+            Me.SendStatus("error", "Package documentation could not be refreshed.", e.Message)
+        End Try
+    End Sub
+
+    Private Sub FinishRefresh()
+        If Not Me.Job.Succeeded Then
+            Me.SendStatus("error", "Package documentation could not be refreshed. Showing the previous library.", Me.Job.Summary)
+            If Me.TestExpect = "fail" And Me.LoadedOrigin <> "" Then Me.StartPageTest()
+            If Me.TestExpect <> "" And Me.TestExpect <> "fail" Then Me.TestFinished(False, "refresh failed: " + Me.Job.Summary)
+            Return
+        End If
+        If Not Me.SendSnapshot(New FileSystemItem(Me.Job.OutputPath), "project", True) Then
+            Me.SendStatus("error", "The refreshed documentation could not be read. Showing the previous library.", Me.Job.OutputPath)
+            Me.TestFinished(False, "refreshed snapshot could not be sent")
+            Return
+        End If
+        Me.SendStatus("indexing", "Loading refreshed documentation…", "")
+        If Me.TestExpect = "fail" Then Me.TestFinished(False, "refresh unexpectedly succeeded")
+    End Sub
+
+    ' ---- Page -> native --------------------------------------------------------------------
+
+    Public Sub AcceptMessage(message As String)
+        If String.LenBytes(message) > 8388608 Then Return
+        Dim parsed As Optional Of JSONItem = Json.TryParse(message)
+        If Not parsed.HasValue Then Return
+        Dim request As JSONItem = parsed.Value
+        If Not request.IsObject() Then Return
+        Select Case request.Value("type").AsString().Or("")
+            Case "ready"
+                Me.IsReady = True
+                Me.RestoreBookmarks()
+                Me.ShowInitialLibrary()
+                If Me.RefreshPending Then
+                    Me.RefreshPending = False
+                    Me.Refresh()
+                End If
+                If Me.PendingPage <> "" Then
+                    Dim pendingPage As String = Me.PendingPage
+                    Me.PendingPage = ""
+                    Me.ShowPage(pendingPage)
+                End If
+                If Me.PendingTopicQuery <> "" Then
+                    Dim pendingQuery As String = Me.PendingTopicQuery
+                    Me.PendingTopicQuery = ""
+                    Me.ShowTopic(pendingQuery, Me.PendingTopicKind)
+                End If
+            Case "copy"
+                Me.CopyText(request.Value("id"), request.Value("text").AsString().Or(""))
+            Case "bookmarks"
+                Me.SaveBookmarks(request.Value("paths"))
+            Case "reindex"
+                Me.Refresh()
+            Case "loaded"
+                If Math.Round(request.Value("transferToken").AsNumber().Or(-1.0)) <> Me.PendingToken Then Return
+                Dim origin As String = request.Value("origin").AsString().Or("")
+                If Not request.Value("ok").AsBoolean().Or(False) Then
+                    Print "Documentation library rejected (" + origin + "): " + request.Value("error").AsString().Or("unknown")
+                    If origin = "cache" Then
+                        Dim bundled As String = StudioDocumentationSnapshotPath()
+                        If bundled <> "" Then
+                            If Me.SendSnapshot(New FileSystemItem(bundled), "bundled", False) Then Return
+                        End If
+                    End If
+                    Me.SendStatus("error", "Documentation could not be loaded. Showing the previous library.", request.Value("error").AsString().Or("unknown"))
+                    If Me.TestExpect <> "" Then Me.TestFinished(False, "library rejected: " + request.Value("error").AsString().Or("unknown"))
+                Else
+                    Me.LoadedOrigin = origin
+                    If origin = "project" And Me.Job <> Nil Then
+                        Dim summary As String = Me.Job.Summary
+                        If Me.Job.Problems > 0 Then summary += " Some documentation could not be imported."
+                        Me.SendStatus("ready", summary, "")
+                    End If
+                    If Me.TestExpect <> "" And Me.TestExpect <> "fail" And origin = "project" Then Me.StartPageTest()
+                    If Me.TestExpect = "fail" And origin = "bundled" And Me.Job <> Nil Then
+                        If Me.Job.IsComplete And Not Me.Job.Succeeded Then Me.StartPageTest()
+                    End If
+                End If
+            Case "topic"
+                ' Resolution report from ShowTopic; informational only.
+            Case "error"
+                Print "Documentation viewer error: " + request.Value("message").AsString().Or("unknown")
+            Case "selftest"
+                If Me.TestExpect <> "" Then
+                    Dim passed As Boolean = request.Value("ok").AsBoolean().Or(False)
+                    Dim detail As String = request.Value("error").AsString().Or("")
+                    If passed Then detail = String.From(Math.Round(request.Value("pages").AsNumber().Or(0.0))) + " pages, " + String.From(Math.Round(request.Value("sources").AsNumber().Or(0.0))) + " sources; " + Json.Stringify(request.Value("checks"))
+                    Me.TestFinished(passed And Me.TestCopied, detail)
+                End If
+        End Select
+    End Sub
+
+    ''' Copies text and reports whether the clipboard accepted it.
+    Private Sub CopyText(id As JSONItem, text As String)
+        Dim passed As Boolean = False
+        If String.LenBytes(text) <= 4194304 Then
+            Try
+                Dim writer As New Clipboard()
+                writer.Text = text
+                writer.Close()
+                passed = True
+                If Me.TestExpect <> "" Then
+                    Dim reader As New Clipboard()
+                    Me.TestCopied = reader.Text = text
+                End If
+            Catch e As Exception
+                Print "Documentation copy failed: " + e.Message
+            End Try
+        End If
+        Dim reply As JSONItem = JSONItem.NewObject()
+        reply.Value("type") = "copied"
+        reply.Value("id") = id
+        reply.Value("ok") = passed
+        Me.Send(reply)
+    End Sub
+
+    Private Sub PasteIntoSearch()
+        Dim reader As New Clipboard()
+        If Not reader.HasText Then Return
+        Dim text As String = reader.Text
+        If String.LenBytes(text) > 4096 Then text = String.Left(text, 1024)
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "paste"
+        envelope.Value("text") = text
+        Me.Send(envelope)
+    End Sub
+
+    Private Sub RestoreBookmarks()
+        If Me.BookmarkFile = Nil Then Return
+        If Not Me.BookmarkFile.Exists() Then Return
+        Dim loaded As Result Of String, String = Me.BookmarkFile.ReadAllText()
+        If Not loaded.IsOk Then Return
+        Dim parsed As Optional Of JSONItem = Json.TryParse(loaded.Value)
+        If Not parsed.HasValue Then Return
+        If Not parsed.Value.IsArray() Then Return
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "bookmarks"
+        envelope.Value("paths") = parsed.Value
+        Me.Send(envelope)
+    End Sub
+
+    Private Sub SaveBookmarks(paths As JSONItem)
+        If Me.BookmarkFile = Nil Or Not paths.IsArray() Then Return
+        Dim saved As Result Of Integer, String = Me.BookmarkFile.WriteAllText(paths.ToString())
+        If Not saved.IsOk Then Print "Documentation bookmarks could not be saved: " + saved.Error
+    End Sub
+
+    ' ---- Native smoke test -----------------------------------------------------------------
+
+    Private Sub StartPageTest()
+        If Me.TestStarted Then Return
+        Me.TestStarted = True
+        Dim options As JSONItem = JSONItem.NewObject()
+        If Me.TestExpect = "fail" Then
+            options.Value("expectNoPackages") = True
+        Else
+            options.Value("package") = Me.TestExpect
+            If Me.TestQuery <> "" Then options.Value("query") = Me.TestQuery
+        End If
+        Dim envelope As JSONItem = JSONItem.NewObject()
+        envelope.Value("type") = "selftest"
+        envelope.Value("options") = options
+        Me.Send(envelope)
+    End Sub
+
+    Private Sub TestFinished(passed As Boolean, detail As String)
+        If Me.TestExpect = "" Then Return
+        If passed Then
+            Print "BUOY STUDIO DOCUMENTATION TEST PASSED: " + Me.TestExpect + " · " + detail
+        Else
+            If Not Me.TestCopied And detail <> "" And Not String.Contains(detail, "FAILED") Then detail += " (native clipboard confirmed: " + String.From(Me.TestCopied) + ")"
+            Print "BUOY STUDIO DOCUMENTATION TEST FAILED: " + detail
+        End If
+        Me.TestExpect = ""
+        Application.Quit()
+    End Sub
+
+    ' ---- Window events ---------------------------------------------------------------------
+
+    Handle MenuSelected(item As MenuItem) As Boolean
+        Select Case item.Tag
+            Case "close"
+                Me.Close()
+            Case "refresh"
+                Me.Refresh()
+            Case "paste"
+                Me.PasteIntoSearch()
+            Case Else
+                Me.Command(item.Tag)
+        End Select
+        Return True
+    End Handle
+
+    Handle Activated()
+        RegisterSystemMenus()
+    End Handle
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.Browser.Move(0, 0, width, height)
+    End Handle
+
+    Handle Closed()
+        Me.IsClosed = True
+        Me.Poller.Stop()
+        If Me.Watchdog <> Nil Then Me.Watchdog.Stop()
+        If Me.Job <> Nil Then Me.Job.Cancel()
+        Me.Browser.Owner = Nil
+    End Handle
+End Class

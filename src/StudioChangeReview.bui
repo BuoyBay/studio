@@ -1,0 +1,279 @@
+Import diffkit
+Import StudioDiff
+
+''' One reviewable change: a file to save, or a file whose references a refactor rewrites.
+''' Left/right texts drive the per-entry diff; Included is the user's approval.
+Public Class StudioReviewEntry
+    Public Property Key As String = ""
+    Public Property Title As String = ""
+    Public Property Detail As String = ""
+    Public Property LeftLabel As String = ""
+    Public Property LeftText As String = ""
+    Public Property RightLabel As String = ""
+    Public Property RightText As String = ""
+    Public Property Included As Boolean = True
+    ''' Locked entries are part of the operation itself (e.g. the rename) and cannot be excluded.
+    Public Property Locked As Boolean = False
+    ''' Optional free-form text shown instead of a computed diff (e.g. a move summary).
+    Public Property Note As String = ""
+    ''' Workspace version the entry was built from; stale entries are refused.
+    Public Property Revision As Integer = 0
+End Class
+
+''' Unified diff for one entry, bounded like the Compare window.
+Public Function StudioReviewDiff(entry As StudioReviewEntry) As String
+    If entry = Nil Then Return ""
+    Dim header As String = ""
+    If entry.Note <> "" Then header = entry.Note + "\n\n"
+    If String.Compare(entry.LeftText, entry.RightText, True) = 0 Then
+        If entry.Note <> "" Then Return entry.Note
+        Return header + "No text changes."
+    End If
+    Dim left As New StudioDiffSnapshot(entry.Key, entry.LeftLabel, entry.LeftText, 0)
+    Dim right As New StudioDiffSnapshot(entry.Key, entry.RightLabel, entry.RightText, 0)
+    Return header + New StudioDiffSession(left, right).Patch()
+End Function
+
+''' Count of +/- lines, for the list's one-line summaries.
+Public Function StudioReviewStat(entry As StudioReviewEntry) As String
+    If String.Compare(entry.LeftText, entry.RightText, True) = 0 Then Return ""
+    Dim left As New StudioDiffSnapshot(entry.Key, "a", entry.LeftText, 0)
+    Dim right As New StudioDiffSnapshot(entry.Key, "b", entry.RightText, 0)
+    Dim session As New StudioDiffSession(left, right)
+    If session.ErrorText <> "" Then Return "large change"
+    Dim added As Integer = 0
+    Dim removed As Integer = 0
+    For Each hunk As LineHunk In session.Hunks
+        added += hunk.NewCount
+        removed += hunk.OldCount
+    Next
+    Return "+" + String.From(added) + " −" + String.From(removed)
+End Function
+
+Private Class ReviewCheck Inherits Checkbox
+    Public Property Owner As Weak StudioChangeReviewWindow
+    Public Property Row As Integer = -1
+    Handle ValueChanged()
+        Dim owner As StudioChangeReviewWindow = Me.Owner
+        If owner <> Nil Then owner.SetIncluded(Me.Row, Me.Value = Checkbox.CheckState.True)
+    End Handle
+End Class
+
+Private Class ReviewRows Inherits ListBoxDataSource
+    Public Property Owner As Weak StudioChangeReviewWindow
+    Public Overrides Function RowCount() As Integer
+        Dim owner As StudioChangeReviewWindow = Me.Owner
+        If owner = Nil Then Return 0
+        Return owner.EntryCount()
+    End Function
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        If column = 0 Then
+            Dim check As New ReviewCheck()
+            check.Owner = Me.Owner
+            check.Move(6, 3, 22, 20)
+            cell.AddSubview(check)
+        Else
+            Dim title As New Label()
+            title.Move(4, 2, 600, 20)
+            title.FontSize = 12.0
+            cell.AddSubview(title)
+        End If
+    End Sub
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        Try
+            Dim owner As StudioChangeReviewWindow = Me.Owner
+            If owner = Nil Or cell.SubviewCount() < 1 Then Return
+            If row < 0 Or row >= owner.EntryCount() Then Return
+            Dim entry As StudioReviewEntry = owner.EntryAt(row)
+            If column = 0 Then
+                Dim check As ReviewCheck = TryCast(cell.Subview(0), ReviewCheck)
+                If check = Nil Then Return
+                check.Row = row
+                If entry.Included Then
+                    check.Value = Checkbox.CheckState.True
+                Else
+                    check.Value = Checkbox.CheckState.False
+                End If
+                check.Enabled = Not entry.Locked
+            Else
+                Dim title As Label = TryCast(cell.Subview(0), Label)
+                If title = Nil Then Return
+                Dim text As String = entry.Title
+                If entry.Detail <> "" Then text += "  —  " + entry.Detail
+                title.Text = text
+            End If
+        Catch e As Exception
+            StdErr.WriteLine("Review list cell: " + e.Message)
+        End Try
+    End Sub
+End Class
+
+Private Class ReviewList Inherits ListBox
+    Public Property Owner As Weak StudioChangeReviewWindow
+    Handle SelectionChanged()
+        Dim owner As StudioChangeReviewWindow = Me.Owner
+        If owner <> Nil Then owner.ShowEntry(Me.SelectedRow)
+    End Handle
+End Class
+
+Private Class ReviewButton Inherits Button
+    Public Property Owner As Weak StudioChangeReviewWindow
+    Public Property ActionName As String = ""
+    Handle Action()
+        Dim owner As StudioChangeReviewWindow = Me.Owner
+        If owner <> Nil Then owner.Command(Me.ActionName)
+    End Handle
+End Class
+
+''' One modal review for a batch of file changes: check the ones to approve, inspect
+''' each diff, then choose the primary action (Save Selected / Apply Selected), the
+''' optional secondary action (Don't Save), or Cancel. Result is "primary",
+''' "secondary" or "cancel"; Included flags on the entries carry the selection.
+Public Class StudioChangeReviewWindow Inherits Window
+    Private Property Entries As Array Of StudioReviewEntry = []
+    Private Property Rows As ReviewRows = New ReviewRows()
+    Public Property List As ReviewList = New ReviewList()
+    Public Property Diff As TextArea = New TextArea()
+    Public Property Heading As Label = New Label()
+    Public Property Summary As Label = New Label()
+    Private Property AllButton As ReviewButton = New ReviewButton()
+    Private Property NoneButton As ReviewButton = New ReviewButton()
+    Private Property PrimaryButton As ReviewButton = New ReviewButton()
+    Private Property SecondaryButton As ReviewButton = New ReviewButton()
+    Private Property CancelButton As ReviewButton = New ReviewButton()
+    Private Property PrimaryVerb As String = "Apply"
+    Public Property Result As String = "cancel"
+
+    Public Sub Constructor(title As String, heading As String, primaryCaption As String, secondaryCaption As String)
+        Super.Constructor()
+        Me.Title = title
+        Me.Move(160, 100, 980, 680)
+        Me.SetMinSize(720.0, 460.0)
+        Me.Heading.Text = heading
+        Me.Heading.Bold = True
+        Me.Heading.FontSize = 13.0
+        Me.PrimaryVerb = primaryCaption
+        Me.Rows.Owner = Me
+        Me.List.Owner = Me
+        Me.List.DefaultRowHeight = 26.0
+        Me.List.AddColumn("", 34.0)
+        Me.List.AddColumn("Change", 900.0)
+        Me.List.DataSource = Me.Rows
+        Me.Diff.IsReadOnly = True
+        Me.Diff.FontSize = 11.0
+        #If TargetMac Then
+            Me.Diff.FontName = "Menlo"
+        #ElseIf TargetWindows Then
+            Me.Diff.FontName = "Consolas"
+        #Else
+            Me.Diff.FontName = "monospace"
+        #End If
+        Me.Diff.AccessibleLabel = "Diff of the selected change"
+        Me.ConfigureButton(Me.AllButton, "Select All", "all")
+        Me.ConfigureButton(Me.NoneButton, "Select None", "none")
+        Me.ConfigureButton(Me.PrimaryButton, primaryCaption, "primary")
+        Me.ConfigureButton(Me.SecondaryButton, secondaryCaption, "secondary")
+        Me.ConfigureButton(Me.CancelButton, "Cancel", "cancel")
+        Me.SecondaryButton.Visible = secondaryCaption <> ""
+        Me.AddSubview(Me.Heading)
+        Me.AddSubview(Me.List)
+        Me.AddSubview(Me.Diff)
+        Me.AddSubview(Me.Summary)
+        Me.LayoutControls(980, 680)
+    End Sub
+
+    Private Sub ConfigureButton(button As ReviewButton, caption As String, action As String)
+        button.Owner = Me
+        button.Caption = caption
+        button.ActionName = action
+        Me.AddSubview(button)
+    End Sub
+
+    Public Sub SetEntries(entries As Array Of StudioReviewEntry)
+        Me.Entries = entries
+        Me.List.ReloadData()
+        If Array.Count(entries) > 0 Then
+            Me.List.SelectedRow = 0
+            Me.ShowEntry(0)
+        Else
+            Me.Diff.Text = ""
+        End If
+        Me.UpdateSummary()
+    End Sub
+
+    Public Function EntryCount() As Integer
+        Return Array.Count(Me.Entries)
+    End Function
+
+    Public Function EntryAt(row As Integer) As StudioReviewEntry
+        Return Me.Entries(row)
+    End Function
+
+    Public Sub SetIncluded(row As Integer, included As Boolean)
+        If row < 0 Or row >= Array.Count(Me.Entries) Then Return
+        If Me.Entries(row).Locked Then Return
+        Me.Entries(row).Included = included
+        Me.UpdateSummary()
+    End Sub
+
+    Public Sub ShowEntry(row As Integer)
+        If row < 0 Or row >= Array.Count(Me.Entries) Then Return
+        Try
+            Me.Diff.Text = StudioDiffDisplay(StudioReviewDiff(Me.Entries(row)))
+        Catch e As Exception
+            Me.Diff.Text = "Diff unavailable: " + e.Message
+        End Try
+    End Sub
+
+    Public Function IncludedCount() As Integer
+        Dim count As Integer = 0
+        For Each entry As StudioReviewEntry In Me.Entries
+            If entry.Included Then count += 1
+        Next
+        Return count
+    End Function
+
+    Private Sub UpdateSummary()
+        Dim count As Integer = Me.IncludedCount()
+        Me.Summary.Text = String.From(count) + " of " + String.From(Array.Count(Me.Entries)) + " selected"
+        Me.PrimaryButton.Caption = Me.PrimaryVerb + " (" + String.From(count) + ")"
+    End Sub
+
+    Public Sub Command(action As String)
+        Select Case action
+        Case "all", "none"
+            For Each entry As StudioReviewEntry In Me.Entries
+                If Not entry.Locked Then entry.Included = action = "all"
+            Next
+            Me.List.ReloadData()
+            Me.UpdateSummary()
+        Case "primary", "secondary", "cancel"
+            Me.Result = action
+            Me.Close()
+        End Select
+    End Sub
+
+    ''' Blocks until the user picks an action; returns "primary", "secondary" or "cancel".
+    Public Function Run(parent As Window) As String
+        Me.Result = "cancel"
+        Me.ShowModally(parent)
+        Return Me.Result
+    End Function
+
+    Private Sub LayoutControls(width As Integer, height As Integer)
+        Dim listHeight As Integer = Math.Max(120, (height - 120) * 2 \ 5)
+        Me.Heading.Move(16, 12, width - 32, 22)
+        Me.AllButton.Move(16, 40, 110, 26)
+        Me.NoneButton.Move(132, 40, 110, 26)
+        Me.Summary.Move(256, 44, width - 272, 20)
+        Me.List.Move(16, 74, width - 32, listHeight)
+        Me.Diff.Move(16, 82 + listHeight, width - 32, height - listHeight - 138)
+        Me.CancelButton.Move(16, height - 44, 100, 30)
+        Me.SecondaryButton.Move(width - 352, height - 44, 150, 30)
+        Me.PrimaryButton.Move(width - 196, height - 44, 180, 30)
+    End Sub
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutControls(Math.Round(width), Math.Round(height))
+    End Handle
+End Class

@@ -1,0 +1,261 @@
+Import processkit
+Import StudioDiagnostics
+
+''' The host retains its link and checks the entire captured project revision.
+''' Terminal methods must be nonblocking and own/reap a process tree, not a shell.
+Public Interface StudioRunHost
+    Function RunSnapshotCurrent(revision As String) As Boolean
+    Sub RunChanged()
+    Sub RunOutput(data As Bytes, isError As Boolean)
+    Function StartTerminalRun(executable As String, argv As Array Of String, workingDirectory As String) As Boolean
+    Function TerminalRunActive() As Boolean
+    Function TerminalRunExitCode() As Integer
+    Sub StopTerminalRun()
+End Interface
+
+Public Interface StudioRunBuildEvents
+    ' "pending" delays launch, "ok" permits it; any other value fails the run.
+    Function RunBuildEventGate() As String
+End Interface
+
+Public Class StudioRunLink
+    Public Property Host As StudioRunHost
+End Class
+
+''' Compiles registered in-memory source and imports in a private directory. This
+''' job never saves workspace text. Only the native host target may be executed.
+Public Class StudioRunJob
+    Public Property Diagnostics As StudioDiagnosticsJob = New StudioDiagnosticsJob()
+    Public Property Link As Weak StudioRunLink
+    Public Property State As String = "idle"
+    Public Property Summary As String = "No program has run."
+    Public Property ExitCode As Integer = -1
+    Private Property Process As PipeProcess
+    Private Property Poller As StudioRunTimer = New StudioRunTimer()
+    Private Property Arguments As Array Of String = []
+    Private Property Revision As String
+    Private Property UseTerminal As Boolean = False
+    Private Property TerminalHost As StudioRunHost
+    Private Property Exited As Integer = 0
+    Private Property Failure As String
+
+    Public Sub Constructor()
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 40
+    End Sub
+
+    Public Function IsActive() As Boolean
+        Return Me.State = "compiling" Or Me.State = "after-build" Or Me.State = "running" Or Me.State = "terminal" Or Me.State = "stopping"
+    End Function
+
+    Private Function Host() As StudioRunHost
+        Dim link As StudioRunLink = Me.Link
+        If link = Nil Then Return Nil
+        Return link.Host
+    End Function
+
+    Private Sub Changed()
+        Dim host As StudioRunHost = Me.Host()
+        Try
+            If host <> Nil Then host.RunChanged()
+        Catch e As Exception
+            Print "Run view refresh failed: " + e.Message
+        End Try
+    End Sub
+
+    ''' Revision is an opaque token supplied by the host for the captured snapshot.
+    ''' argv is passed literally; Studio supplies no shell interpolation or parsing.
+    Public Sub Start(compiler As String, projectRoot As String, sources As Array Of StudioDiagnosticSource, activeRelativePath As String, argv As Array Of String, revision As String, terminal As Boolean = False)
+        If Me.IsActive() Then Throw New InvalidArgumentException("A program is already active.")
+        If Me.Host() = Nil Or revision = "" Then Throw New InvalidArgumentException("Run requires a revision-checking host and snapshot token.")
+        Me.Arguments = []
+        For Each argument As String In argv
+            Me.Arguments.Append(argument)
+        Next
+        Me.Revision = revision
+        Me.UseTerminal = terminal
+        Me.TerminalHost = Nil
+        Me.Failure = ""
+        Me.ExitCode = -1
+        Me.Exited = 0
+        Me.State = "compiling"
+        Me.Summary = "Compiling active source " + activeRelativePath
+        Try
+            Me.Diagnostics.StartCompile(compiler, projectRoot, sources, activeRelativePath)
+            Me.Poller.Start()
+            Me.Changed()
+        Catch e As Exception
+            Me.Finish("failed", e.Message)
+        End Try
+    End Sub
+
+    Private Sub Launch()
+        If Me.Diagnostics.State <> "finished" Or Me.Diagnostics.ErrorCount > 0 Then
+            Me.Finish("failed", "Compilation failed: " + Me.Diagnostics.Summary)
+            Return
+        End If
+        Dim host As StudioRunHost = Me.Host()
+        If host = Nil Then Throw New InvalidArgumentException("Run host disconnected before launch.")
+        If Not host.RunSnapshotCurrent(Me.Revision) Then Throw New InvalidArgumentException("Project changed during compilation; compile and run again.")
+        Dim executable As String = Me.Diagnostics.ExecutablePath
+        ' macOS console builds are plain binaries; GUI builds can be .app bundles.
+        #If TargetMac Then
+            If Not New FileSystemItem(executable).IsFile() Then
+                Dim bundle As FileSystemItem = New FileSystemItem(executable)
+                If Not bundle.IsFolder() Then bundle = New FileSystemItem(executable + ".app")
+                Dim candidate As FileSystemItem = bundle.Child("Contents/MacOS/studio-active")
+                If candidate.IsFile() Then executable = candidate.FullPath()
+            End If
+        #End If
+        If Not New FileSystemItem(executable).IsFile() Then Throw New InvalidArgumentException("Compiler did not produce a runnable host executable.")
+        If Me.UseTerminal Then
+            Me.TerminalHost = host
+            If Not host.StartTerminalRun(executable, Me.Arguments, Me.Diagnostics.Folder) Then
+                Me.TerminalHost = Nil
+                Throw New InvalidArgumentException("Interactive terminal execution is unavailable in this host.")
+            End If
+            Me.State = "terminal"
+            Me.Summary = "Running active source in terminal"
+        Else
+            Me.Process = New PipeProcess(executable, Me.Arguments, Me.Diagnostics.Folder, True)
+            Me.Process.CloseInput()
+            Me.State = "running"
+            Me.Summary = "Running active source"
+        End If
+        Me.Changed()
+    End Sub
+
+    Private Sub Drain(deliver As Boolean = True)
+        Dim output As Bytes = Me.Process.ReadOutput(16384)
+        Dim errors As Bytes = Me.Process.ReadError(16384)
+        Dim host As StudioRunHost = Me.Host()
+        If host <> Nil And deliver Then
+            If output.Count > 0 Then host.RunOutput(output, False)
+            If errors.Count > 0 Then host.RunOutput(errors, True)
+        End If
+    End Sub
+
+    Public Sub Poll()
+        If Not Me.IsActive() Then Return
+        Try
+            If Me.State = "compiling" Then
+                Me.Diagnostics.Poll()
+                If Not Me.Diagnostics.IsActive() Then
+                    If Me.Diagnostics.State = "cancelled" Then
+                        Me.Finish("cancelled", "Compilation cancelled; program was not launched.")
+                    ElseIf Me.Diagnostics.State = "finished" And Me.Diagnostics.ErrorCount = 0 Then
+                        Me.State = "after-build"
+                    Else
+                        Me.Finish("failed", "Compilation failed: " + Me.Diagnostics.Summary)
+                    End If
+                End If
+                Return
+            End If
+            If Me.State = "after-build" Then
+                Dim events As StudioRunBuildEvents = TryCast(Me.Host(), StudioRunBuildEvents)
+                Dim gate As String = "ok"
+                If events <> Nil Then gate = events.RunBuildEventGate()
+                If gate = "pending" Then Return
+                If gate <> "ok" Then
+                    Me.Finish("failed", gate)
+                Else
+                    Me.Launch()
+                End If
+                Return
+            End If
+            If Me.State = "stopping" Then
+                If Me.Diagnostics.IsActive() Then
+                    Me.Diagnostics.Poll()
+                    Return
+                End If
+                If Me.TerminalHost <> Nil Then
+                    If Me.TerminalHost.TerminalRunActive() Then Return
+                    Me.ExitCode = Me.TerminalHost.TerminalRunExitCode()
+                    Me.TerminalHost = Nil
+                End If
+                If Me.Process <> Nil Then
+                    Me.Drain(False)
+                    If Me.Process.Poll() Then Return
+                    Me.Process.Close()
+                    Me.Process = Nil
+                End If
+                If Me.Failure <> "" Then
+                    Me.Finish("failed", Me.Failure)
+                Else
+                    Me.Finish("cancelled", "Program stopped; owned process-tree termination requested.")
+                End If
+                Return
+            End If
+            If Me.State = "terminal" Then
+                If Me.TerminalHost.TerminalRunActive() Then Return
+                Me.ExitCode = Me.TerminalHost.TerminalRunExitCode()
+                Me.TerminalHost = Nil
+                Me.Completed()
+                Return
+            End If
+            Me.Drain()
+            If Me.Process.Poll() Then Return
+            If Me.Exited = 0 Then Me.Exited = System.Microseconds()
+            If Not Me.Process.OutputClosed Or Not Me.Process.ErrorClosed Then
+                If System.Microseconds() - Me.Exited > 2000000 Then Throw New InvalidArgumentException("Program output pipes did not close.")
+                Return
+            End If
+            Me.ExitCode = Me.Process.ExitCode
+            ' Also terminate descendants that survived the entry process.
+            Me.Process.TerminateTree()
+            Me.Process.Close()
+            Me.Process = Nil
+            Me.Completed()
+        Catch e As Exception
+            Me.Failure = e.Message
+            Me.Stop()
+        End Try
+    End Sub
+
+    Private Sub Completed()
+        If Me.ExitCode = 0 Then
+            Me.Finish("finished", "Program exited with status 0.")
+        Else
+            Me.Finish("failed", "Program exited with status " + String.From(Me.ExitCode) + ".")
+        End If
+    End Sub
+
+    ''' Kill without waiting on the UI thread. Timer/manual Poll reaps and cleans.
+    Public Sub Stop()
+        If Not Me.IsActive() Or Me.State = "stopping" Then Return
+        Me.State = "stopping"
+        Me.Summary = "Stopping program process tree…"
+        Me.Diagnostics.Cancel()
+        If Me.TerminalHost <> Nil Then Me.TerminalHost.StopTerminalRun()
+        If Me.Process <> Nil Then Me.Process.TerminateTree()
+        Me.Poller.Start()
+        Me.Changed()
+    End Sub
+
+    Private Sub Finish(state As String, message As String)
+        Me.State = state
+        Me.Summary = message
+        Me.Poller.Stop()
+        Try
+            Me.Diagnostics.ReleaseSnapshot()
+        Catch e As Exception
+            Me.State = "failed"
+            Me.Summary += "; " + e.Message
+        End Try
+        Me.Changed()
+    End Sub
+
+    ''' Retain this job and its host until IsActive is false. Shutdown is asynchronous.
+    Public Sub Shutdown()
+        Me.Stop()
+        If Not Me.IsActive() Then Me.Diagnostics.ReleaseSnapshot()
+    End Sub
+End Class
+
+Private Class StudioRunTimer Inherits Timer
+    Public Property Owner As Weak StudioRunJob
+    Public Overrides Sub NotifyTick()
+        Dim job As StudioRunJob = Me.Owner
+        If job <> Nil Then job.Poll()
+    End Sub
+End Class

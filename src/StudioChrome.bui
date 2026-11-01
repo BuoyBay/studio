@@ -1,0 +1,380 @@
+Import treeview
+Import searchfield
+Import segmentedbutton
+#If TargetLinux Then
+    Import gtkcontextmenu
+#End If
+
+''' Window-side callbacks for the Studio shell's native chrome. Every control holds
+''' a weak owner, so closing the window cannot be kept alive by a native callback.
+Public Interface StudioChromeHost
+    Sub ChromePaneResized(splitterName As String, paneIndex As Integer)
+    Sub ChromeDividerMoved(splitterName As String)
+    Sub ChromePaneCollapsedChanged(splitterName As String, paneIndex As Integer, collapsed As Boolean)
+    Sub ChromeNavigatorSelected(node As TreeNode)
+    Sub ChromeNavigatorMenu(base As ContextMenu, node As TreeNode)
+    Sub ChromeNavigatorAction(action As String)
+    Sub ChromeModeSelected(segmentIndex As Integer)
+    Sub ChromeFilterChanged(query As String)
+End Interface
+
+''' Holder for a weak host reference; Buoy interfaces cannot be declared Weak directly.
+Public Class StudioChromeLink
+    Public Property Host As StudioChromeHost
+End Class
+
+''' A real native Splitter. Pane content is laid out by the host after the pane's
+''' own NotifyPaneResized, so contents follow divider drags and window resizes.
+Public Class StudioSplitter Inherits Splitter
+    Public Property PaneSetName As String
+    Public Property Link As Weak StudioChromeLink
+    Public Sub Constructor(orientation As Orientation, paneSetName As String)
+        Super.Constructor(orientation)
+        ' AddPane negotiates native frames immediately, before host allocation.
+        Me.Move(0, 0, 1200, 700)
+        Me.PaneSetName = paneSetName
+    End Sub
+    Public Overrides Sub NotifyPaneResized(paneIndex As Integer)
+        Super.NotifyPaneResized(paneIndex)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromePaneResized(Me.PaneSetName, paneIndex)
+        End If
+    End Sub
+    Handle DividerMoved(dividerIndex As Integer, position As Double)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromeDividerMoved(Me.PaneSetName)
+        End If
+    End Handle
+    Handle PaneCollapsed(paneIndex As Integer)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromePaneCollapsedChanged(Me.PaneSetName, paneIndex, True)
+        End If
+    End Handle
+    Handle PaneExpanded(paneIndex As Integer)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromePaneCollapsedChanged(Me.PaneSetName, paneIndex, False)
+        End If
+    End Handle
+End Class
+
+#If TargetLinux Then
+Private Class StudioNavigatorGTKMenu Inherits GTKContextMenu
+    Public Property Link As Weak StudioChromeLink
+    Public Property OwnerTree As Weak StudioNavigatorTree
+    Handle Dismissed(restoreFocus As Boolean)
+        Dim owner As StudioNavigatorTree = Me.OwnerTree
+        If owner <> Nil And restoreFocus Then owner.RestoreKeyboardFocus()
+    End Handle
+    Handle Selected(item As PopupItem)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromeNavigatorAction(item.Tag)
+        End If
+    End Handle
+End Class
+#End If
+
+Public Class StudioNavigatorTree Inherits TreeView
+    Public Property Link As Weak StudioChromeLink
+    Private Property Popup As ContextMenu
+    #If TargetLinux Then
+        Private Property GTKPopup As StudioNavigatorGTKMenu = New StudioNavigatorGTKMenu()
+    #End If
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.NavigatorShortcuts = True
+    End Sub
+    Handle KeyboardCommand(node As TreeNode, command As String)
+        If node = Nil Then Return
+        Dim target As StudioChromeLink = Me.Link
+        If target = Nil Then Return
+        If target.Host = Nil Then Return
+        Dim action As String = ""
+        If String.StartsWith(node.Tag, "item:") Then
+            If command = "rename" Then action = "rename-file"
+            If command = "duplicate" Then action = "duplicate-file"
+        ElseIf String.StartsWith(node.Tag, "folder:") Then
+            If command = "rename" Then action = "rename-folder"
+        ElseIf String.StartsWith(node.Tag, "node:") Then
+            action = "navigator:" + command
+        End If
+        If action = "" Then Return
+        target.Host.ChromeNavigatorSelected(node)
+        target.Host.ChromeNavigatorAction(action)
+    End Handle
+    Handle ContextRequested(node As TreeNode, location As Point)
+        Dim target As StudioChromeLink = Me.Link
+        If target = Nil Then Return
+        If target.Host = Nil Then Return
+        Me.Popup = New ContextMenu()
+        target.Host.ChromeNavigatorMenu(Me.Popup, node)
+        #If TargetLinux Then
+            Dim root As New PopupItem()
+            For i As Integer = 0 To Me.Popup.Count() - 1
+                Dim entry As MenuItem = Me.Popup.Item(i)
+                If entry.Caption = "" Or entry.Caption = "-" Then
+                    root.AddSeparator()
+                Else
+                    Dim child As New PopupItem(entry.Caption, entry.Tag)
+                    child.Enabled = entry.Enabled
+                    root.AddItem(child)
+                End If
+            Next
+            Me.GTKPopup.Link = Me.Link
+            Me.GTKPopup.OwnerTree = Me
+            Me.GTKPopup.Show(Me, location, root)
+        #ElseIf TargetWindows Then
+            Dim action As String = StudioNavigatorWindowsPopup(Me, location, Me.Popup)
+            Me.FocusKeyboard()
+            If action <> "" Then target.Host.ChromeNavigatorAction(action)
+        #ElseIf TargetMac Then
+            Dim action As String = StudioNavigatorMacPopup(Me, location, Me.Popup)
+            If action <> "" Then target.Host.ChromeNavigatorAction(action)
+        #End If
+    End Handle
+    Handle ContextualMenuAction(item As MenuItem)
+        Dim target As StudioChromeLink = Me.Link
+        If target = Nil Or item = Nil Then Return
+        If target.Host <> Nil Then target.Host.ChromeNavigatorAction(item.Tag)
+    End Handle
+    Handle SelectionChanged(node As TreeNode)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromeNavigatorSelected(node)
+        End If
+    End Handle
+End Class
+
+Public Class StudioModeSwitch Inherits SegmentedButton
+    Public Property Link As Weak StudioChromeLink
+    Handle Pressed(segmentIndex As Integer)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromeModeSelected(segmentIndex)
+        End If
+    End Handle
+End Class
+
+Public Class StudioFilterField Inherits SearchField
+    Public Property Link As Weak StudioChromeLink
+    Handle SearchChanged(query As String)
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromeFilterChanged(query)
+        End If
+    End Handle
+    Handle SearchCancelled()
+        Dim target As StudioChromeLink = Me.Link
+        If target <> Nil Then
+            If target.Host <> Nil Then target.Host.ChromeFilterChanged("")
+        End If
+    End Handle
+End Class
+
+''' Persistent workspace proportions. Values are clamped so a stale preference from a
+''' larger display can never push a pane below its minimum or hide the editor.
+Public Class StudioPaneLayout
+    Public Const NavigatorMin As Integer = 180
+    Public Const NavigatorMax As Integer = 420
+    Public Const EditorMin As Integer = 440
+    Public Const AgentMin As Integer = 300
+    Public Const AgentMax As Integer = 640
+    Public Const MessagesMin As Integer = 64
+    Public Const CanvasMin As Integer = 220
+    Public Property NavigatorWidth As Integer = 232
+    Public Property AgentWidth As Integer = 360
+    Public Property MessagesHeight As Integer = 112
+    Public Property NavigatorCollapsed As Boolean = False
+    Public Property AgentCollapsed As Boolean = False
+    Public Property MessagesCollapsed As Boolean = False
+
+    ''' Fit the side panes into a window width, shrinking the agent first and then
+    ''' the navigator, never below their minimums.
+    Public Sub FitWidth(totalWidth As Integer)
+        Me.NavigatorWidth = Math.Min(Math.Max(Me.NavigatorWidth, StudioPaneLayout.NavigatorMin), StudioPaneLayout.NavigatorMax)
+        Me.AgentWidth = Math.Min(Math.Max(Me.AgentWidth, StudioPaneLayout.AgentMin), StudioPaneLayout.AgentMax)
+        Dim sides As Integer = 0
+        If Not Me.NavigatorCollapsed Then sides += Me.NavigatorWidth
+        If Not Me.AgentCollapsed Then sides += Me.AgentWidth
+        Dim excess As Integer = sides + StudioPaneLayout.EditorMin - totalWidth
+        If excess > 0 And Not Me.AgentCollapsed Then
+            Dim give As Integer = Math.Min(excess, Me.AgentWidth - StudioPaneLayout.AgentMin)
+            Me.AgentWidth -= give
+            excess -= give
+        End If
+        If excess > 0 And Not Me.NavigatorCollapsed Then
+            Dim give As Integer = Math.Min(excess, Me.NavigatorWidth - StudioPaneLayout.NavigatorMin)
+            Me.NavigatorWidth -= give
+        End If
+    End Sub
+
+    Public Sub FitHeight(totalHeight As Integer)
+        Dim maximum As Integer = Math.Max(StudioPaneLayout.MessagesMin, totalHeight - StudioPaneLayout.CanvasMin)
+        Me.MessagesHeight = Math.Min(Math.Max(Me.MessagesHeight, StudioPaneLayout.MessagesMin), maximum)
+    End Sub
+
+    Public Sub Load(domain As String)
+        Me.NavigatorWidth = Prefs.Get(domain, "studio.navigatorWidth", Me.NavigatorWidth)
+        Me.AgentWidth = Prefs.Get(domain, "studio.agentWidth", Me.AgentWidth)
+        Me.MessagesHeight = Prefs.Get(domain, "studio.messagesHeight", Me.MessagesHeight)
+        Me.NavigatorCollapsed = Prefs.Get(domain, "studio.navigatorCollapsed", Me.NavigatorCollapsed)
+        Me.AgentCollapsed = Prefs.Get(domain, "studio.agentCollapsed", Me.AgentCollapsed)
+        Me.MessagesCollapsed = Prefs.Get(domain, "studio.messagesCollapsed", Me.MessagesCollapsed)
+    End Sub
+
+    Public Sub Save(domain As String)
+        Prefs.Set(domain, "studio.navigatorWidth", Me.NavigatorWidth)
+        Prefs.Set(domain, "studio.agentWidth", Me.AgentWidth)
+        Prefs.Set(domain, "studio.messagesHeight", Me.MessagesHeight)
+        Prefs.Set(domain, "studio.navigatorCollapsed", Me.NavigatorCollapsed)
+        Prefs.Set(domain, "studio.agentCollapsed", Me.AgentCollapsed)
+        Prefs.Set(domain, "studio.messagesCollapsed", Me.MessagesCollapsed)
+    End Sub
+End Class
+
+''' Case-insensitive substring filter for navigator captions.
+Public Function StudioMatches(caption As String, query As String) As Boolean
+    Dim trimmed As String = String.Trim(query)
+    If trimmed = "" Then Return True
+    Return String.Contains(String.LCase(caption), String.LCase(trimmed))
+End Function
+
+#If TargetWindows Then
+Private Optional Declare Function SNPCreate Lib "user32" Alias "CreatePopupMenu" () As Ptr
+Private Optional Declare Function SNPAppend Lib "user32" Alias "AppendMenuW" (menu As Ptr, menuFlags As UInt32, id As UInt64, caption As Ptr) As Int32
+Private Optional Declare Function SNPTrack Lib "user32" Alias "TrackPopupMenuEx" (menu As Ptr, menuFlags As UInt32, x As Int32, y As Int32, owner As Ptr, params As Ptr) As UInt32
+Private Optional Declare Function SNPDestroy Lib "user32" Alias "DestroyMenu" (menu As Ptr) As Int32
+Private Optional Declare Function SNPToScreen Lib "user32" Alias "ClientToScreen" (window As Ptr, ByRef point As SNPPoint) As Int32
+Private Optional Declare Function SNPDPI Lib "user32" Alias "GetDpiForWindow" (window As Ptr) As UInt32
+Private Optional Declare Function SNPRoot Lib "user32" Alias "GetAncestor" (window As Ptr, kind As UInt32) As Ptr
+Private Optional Declare Function SNPForeground Lib "user32" Alias "SetForegroundWindow" (window As Ptr) As Int32
+Private Optional Declare Function SNPPost Lib "user32" Alias "PostMessageW" (window As Ptr, message As UInt32, word As UInt64, parameter As Int64) As Int32
+Sequential Structure SNPPoint
+    X As Int32
+    Y As Int32
+End Structure
+Private Function StudioNavigatorWindowsPopup(owner As UIControl, location As Point, entries As ContextMenu) As String
+    Dim menu As Ptr = SNPCreate()
+    If menu = Nil Then Return ""
+    Try
+        For i As Integer = 0 To entries.Count() - 1
+            Dim entry As MenuItem = entries.Item(i)
+            Dim menuFlags As UInt32 = 0
+            If Not entry.Enabled Then menuFlags = 3
+            If entry.Caption = "" Or entry.Caption = "-" Then menuFlags = 2048
+            Dim wide As Bytes = entry.Caption.AsUTF16LE()
+            wide.Append(0)
+            wide.Append(0)
+            If SNPAppend(menu, menuFlags, i + 1, wide.DataPtr()) = 0 Then Throw New RuntimeException("Could not append navigator menu item")
+        Next
+        Dim point As SNPPoint
+        Dim scale As Double = SNPDPI(owner.NativeWidget) / 96.0
+        point.X = location.X * scale
+        point.Y = location.Y * scale
+        If SNPToScreen(owner.NativeWidget, point) = 0 Then Return ""
+        Dim window As Ptr = SNPRoot(owner.NativeWidget, 2) ' GA_ROOT
+        If window = Nil Then Return ""
+        SNPForeground(window)
+        Dim selected As UInt32 = SNPTrack(menu, 258, point.X, point.Y, window, Nil)
+        SNPPost(window, 0, 0, 0) ' WM_NULL completes native popup dismissal bookkeeping.
+        If selected > 0 And selected <= entries.Count() Then Return entries.Item(selected - 1).Tag
+    Finally
+        SNPDestroy(menu)
+    End Try
+    Return ""
+End Function
+#End If
+
+#If TargetMac Then
+Private Class StudioNavigatorMacChoice
+    Public Property Bridge As Ptr
+    Public Property Selection As Integer
+End Class
+Private Class StudioNavigatorMacRegistry
+    Public Shared Property Choices As Array Of StudioNavigatorMacChoice = []
+End Class
+Sequential Structure StudioNavigatorMacPoint
+    X As Double
+    Y As Double
+End Structure
+Private Delegate Sub SNMActionCallback(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+Private Declare Function SNMClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function SNMAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Function SNMAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, implementation As Ptr, encoding As String) As UInt8
+Private Declare Sub SNMRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function SNMSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function SNMAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function SNMInit Lib "AppKit" Selector "init" (object As Ptr) As Ptr
+Private Declare Sub SNMRelease Lib "AppKit" Selector "release" (object As Ptr)
+Private Declare Function SNMString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, text As String) As Ptr
+Private Declare Function SNMMenuInit Lib "AppKit" Selector "initWithTitle:" (menu As Ptr, title As Ptr) As Ptr
+Private Declare Sub SNMAutoEnable Lib "AppKit" Selector "setAutoenablesItems:" (menu As Ptr, enabled As Boolean)
+Private Declare Function SNMItemInit Lib "AppKit" Selector "initWithTitle:action:keyEquivalent:" (item As Ptr, title As Ptr, action As Ptr, key As Ptr) As Ptr
+Private Declare Sub SNMTarget Lib "AppKit" Selector "setTarget:" (item As Ptr, target As Ptr)
+Private Declare Sub SNMTag Lib "AppKit" Selector "setTag:" (item As Ptr, tag As Integer)
+Private Declare Function SNMReadTag Lib "AppKit" Selector "tag" (item As Ptr) As Integer
+Private Declare Sub SNMEnabled Lib "AppKit" Selector "setEnabled:" (item As Ptr, enabled As Boolean)
+Private Declare Sub SNMAddItem Lib "AppKit" Selector "addItem:" (menu As Ptr, item As Ptr)
+Private Declare Function SNMSeparator Lib "AppKit" Selector "separatorItem" (cls As Ptr) As Ptr
+Private Declare Function SNMPopup Lib "AppKit" Selector "popUpMenuPositioningItem:atLocation:inView:" (menu As Ptr, item As Ptr, location As StudioNavigatorMacPoint, view As Ptr) As Boolean
+Private Sub StudioNavigatorMacSelected(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    For Each choice As StudioNavigatorMacChoice In StudioNavigatorMacRegistry.Choices
+        If choice.Bridge = receiver Then
+            choice.Selection = SNMReadTag(sender)
+            Return
+        End If
+    Next
+End Sub
+Private Function StudioNavigatorMacBridge() As Ptr
+    Dim cls As Ptr = SNMClass("BuoyStudioNavigatorMenuTarget")
+    If cls = Nil Then
+        cls = SNMAllocateClass(SNMClass("NSObject"), "BuoyStudioNavigatorMenuTarget", 0)
+        If cls = Nil Then Throw New RuntimeException("Could not create navigator menu target")
+        Dim action As SNMActionCallback = AddressOf StudioNavigatorMacSelected
+        If SNMAddMethod(cls, SNMSelector("studioNavigatorAction:"), CType(action, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not register navigator menu action")
+        SNMRegisterClass(cls)
+    End If
+    Return SNMInit(SNMAlloc(cls))
+End Function
+Private Function StudioNavigatorMacPopup(owner As UIControl, location As Point, entries As ContextMenu) As String
+    Dim choice As New StudioNavigatorMacChoice()
+    Dim menu As Ptr = Nil
+    choice.Bridge = StudioNavigatorMacBridge()
+    Array.Append(StudioNavigatorMacRegistry.Choices, choice)
+    Try
+        Dim empty As Ptr = SNMString(SNMClass("NSString"), "")
+        menu = SNMMenuInit(SNMAlloc(SNMClass("NSMenu")), empty)
+        SNMAutoEnable(menu, False)
+        For i As Integer = 0 To entries.Count() - 1
+            Dim entry As MenuItem = entries.Item(i)
+            If entry.Caption = "" Or entry.Caption = "-" Then
+                SNMAddItem(menu, SNMSeparator(SNMClass("NSMenuItem")))
+            Else
+                Dim caption As Ptr = SNMString(SNMClass("NSString"), entry.Caption)
+                Dim item As Ptr = SNMItemInit(SNMAlloc(SNMClass("NSMenuItem")), caption, SNMSelector("studioNavigatorAction:"), empty)
+                SNMTarget(item, choice.Bridge)
+                SNMTag(item, i + 1)
+                SNMEnabled(item, entry.Enabled)
+                SNMAddItem(menu, item)
+                SNMRelease(item)
+            End If
+        Next
+        Dim point As StudioNavigatorMacPoint
+        point.X = location.X
+        point.Y = location.Y
+        SNMPopup(menu, Nil, point, owner.NativeWidget)
+        If choice.Selection > 0 And choice.Selection <= entries.Count() Then Return entries.Item(choice.Selection - 1).Tag
+    Finally
+        If menu <> Nil Then SNMRelease(menu)
+        For i As Integer = Array.Count(StudioNavigatorMacRegistry.Choices) - 1 To 0 Step -1
+            If StudioNavigatorMacRegistry.Choices(i) Is choice Then Array.RemoveAt(StudioNavigatorMacRegistry.Choices, i)
+        Next
+        SNMRelease(choice.Bridge)
+    End Try
+    Return ""
+End Function
+#End If

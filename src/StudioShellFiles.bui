@@ -1,0 +1,26 @@
+' Exclusive creation reserves a new name without truncating a racing destination.
+' Subsequent AtomicWriteText compares the empty reservation before publication.
+#If TargetWindows Then
+    Private Declare Function SSCreate Lib "kernel32" Alias "CreateFileW" (filePath As Ptr, access As UInt32, share As UInt32, security As Ptr, creation As UInt32, openFlags As UInt32, templateFile As Ptr) As Ptr
+    Private Declare Function SSClose Lib "kernel32" Alias "CloseHandle" (handle As Ptr) As Int32
+#Else
+    Private Declare Function SSCreate Lib "c" Alias "open" (filePath As String, openFlags As Int32, ...) As Int32
+    Private Declare Function SSClose Lib "c" Alias "close" (handle As Int32) As Int32
+#End If
+
+Public Sub StudioShellReserveFile(filePath As String)
+    #If TargetWindows Then
+        Dim file As New FileSystemItem(filePath)
+        Dim handle As Ptr = SSCreate(file.Handle, &h40000000, 0, Nil, 1, &h80, Nil)
+        If handle = CType(-1, Ptr) Then Throw New InvalidArgumentException("Cannot create new file; choose a missing writable destination")
+        If SSClose(handle) = 0 Then Throw New InvalidArgumentException("New file close failed; empty reservation may remain")
+    #Else
+        Dim openFlags As Int32 = 193
+        #If TargetMac Then
+            openFlags = 2561
+        #End If
+        Dim handle As Int32 = SSCreate(filePath, openFlags, 384)
+        If handle < 0 Then Throw New InvalidArgumentException("Cannot create new file; choose a missing writable destination")
+        If SSClose(handle) <> 0 Then Throw New InvalidArgumentException("New file close failed; empty reservation may remain")
+    #End If
+End Sub

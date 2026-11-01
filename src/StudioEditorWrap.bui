@@ -1,0 +1,105 @@
+' Soft-wrap layout for Studio's source editor. View only: a line is split into visual
+' segments without changing the text. Breaks fall on caret stops (never inside a
+' character cluster), preferably after a run of spaces, and continuation segments are
+' indented by the line's own leading indentation (when that leaves room). Pure; no GUI
+' dependency.
+Import StudioSyntax
+
+''' The visual segments of one wrapped line: segment k covers codepoint columns
+''' [Starts(k), Starts(k+1)) (the last one runs to the line end). Continuation
+''' segments (k >= 1) are drawn `Indent` cells in.
+Public Class StudioWrapLine
+    Public Property Starts As Array Of Integer = []
+    Public Property Indent As Integer = 0
+    Public Property Source As String = ""
+    Public Property Width As Integer = 0
+    Public Property Tab As Integer = 0
+
+    Public Sub Constructor()
+        Array.Append(Me.Starts, 0)
+    End Sub
+
+    Public Property Count As Integer
+        Get
+            Return Array.Count(Me.Starts)
+        End Get
+    End Property
+
+    ''' Segment holding codepoint `column`: a column on a break belongs to the segment it
+    ''' starts (the caret after a break is drawn at the next row's start).
+    Public Function SegmentOf(column As Integer) As Integer
+        Dim lo As Integer = 0
+        Dim hi As Integer = Array.LastIndex(Me.Starts)
+        While lo < hi
+            Dim middle As Integer = (lo + hi + 1) \ 2
+            If Me.Starts(middle) <= column Then
+                lo = middle
+            Else
+                hi = middle - 1
+            End If
+        Wend
+        Return lo
+    End Function
+
+    ''' First column after segment `k` (the line length for the last segment).
+    Public Function SegmentEnd(k As Integer, lineLength As Integer) As Integer
+        If k + 1 < Array.Count(Me.Starts) Then Return Me.Starts(k + 1)
+        Return lineLength
+    End Function
+
+    ''' Cells a segment is shifted right by (continuation indent).
+    Public Function SegmentIndent(k As Integer) As Integer
+        If k = 0 Then Return 0
+        Return Me.Indent
+    End Function
+End Class
+
+''' Wraps a line to `width` cells (tabs to `tab` stops). Lines that fit return one
+''' segment. Every segment holds at least one cluster, so progress is guaranteed even
+''' when one character is wider than the width.
+Public Function StudioWrapLayout(line As String, width As Integer, tab As Integer) As StudioWrapLine
+    Dim wrap As New StudioWrapLine()
+    wrap.Source = line
+    wrap.Width = width
+    wrap.Tab = tab
+    Dim limit As Integer = Math.Max(2, width)
+    Dim simple As Boolean = String.LenBytes(line) = String.Len(line) And Not String.Contains(line, "\t")
+    Dim total As Integer = String.Len(line)
+    If simple And total <= limit Then Return wrap
+    Dim layout As StudioLineLayout = New StudioLineLayout(line, tab)
+    If layout.Width <= limit Then Return wrap
+    Dim chars As Array Of String = String.Chars(line)
+    ' Continuation indent: the line's leading whitespace, unless it eats most of the row.
+    Dim leadColumns As Integer = 0
+    While leadColumns < total
+        If chars(leadColumns) <> " " And chars(leadColumns) <> "\t" Then Exit While
+        leadColumns += 1
+    Wend
+    Dim indent As Integer = layout.CellOf(leadColumns)
+    If indent * 2 > limit Or leadColumns = total Then indent = 0
+    wrap.Indent = indent
+    Dim segmentStart As Integer = 0
+    Dim available As Integer = limit
+    Dim lastSpaceBreak As Integer = -1
+    Dim column As Integer = 0
+    While column < total
+        Dim nextStop As Integer = layout.NextStop(column)
+        Dim used As Integer = layout.CellOf(nextStop) - layout.CellOf(segmentStart)
+        If used > available And column > segmentStart Then
+            Dim breakAt As Integer = column
+            If lastSpaceBreak > segmentStart Then breakAt = lastSpaceBreak
+            Array.Append(wrap.Starts, breakAt)
+            segmentStart = breakAt
+            available = limit - indent
+            lastSpaceBreak = -1
+            column = breakAt
+            Continue While
+        End If
+        ' A break after a space run (and not inside the leading indentation).
+        If (chars(column) = " " Or chars(column) = "\t") And nextStop < total And column >= leadColumns Then
+            If chars(nextStop) <> " " And chars(nextStop) <> "\t" Then lastSpaceBreak = nextStop
+        End If
+        column = nextStop
+    Wend
+    Return wrap
+End Function

@@ -1,0 +1,149 @@
+Import projectkit
+Import StudioAgentScript
+Import StudioScripts
+Import StudioScriptSettings
+
+''' One execution slot shared by the playground, library and build events.
+Private Function ScriptConsoleError(message As String) As String
+    Dim parts As Array Of String = String.Split(message, "studio-agent-script:")
+    Dim output As String = parts(0)
+    For i As Integer = 1 To Array.LastIndex(parts)
+        Dim part As String = parts(i)
+        Dim digits As Integer = 0
+        For Each character As String In String.Chars(part)
+            If Not String.Contains("0123456789", character, True) Then Exit For
+            digits += 1
+        Next
+        Dim lineNumber As Integer = Integer.Parse(String.Left(part, digits)).Or(0)
+        If digits > 0 And lineNumber > 4 Then
+            output += "script:" + String.From(lineNumber - 4) + String.Substring(part, digits)
+        Else
+            output += "studio-agent-script:" + part
+        End If
+    Next
+    Return output
+End Function
+
+Public Class StudioScriptSession
+    Public Property Workspace As ProjectWorkspace
+    Public Property ProjectRoot As String
+    Public Property ProjectLibrary As StudioScriptLibrary
+    Public Property UserLibrary As StudioScriptLibrary
+    Public Property Job As StudioAgentScript
+    Public Property RunTimeoutMs As Integer = 30000
+    Public Property BuildTimeoutMs As Integer = 60000
+    Public Property LibraryRevision As Integer = 0
+    Public Property BuildBusy As Boolean = False
+    Public Property BuildEventsEnabled As Boolean = False
+    Public Property LastLabel As String
+    Public Property Transcript As String
+    Public Property History As Array Of String = []
+    Public Property HistoryModes As Array Of Boolean = []
+    Private Property Recorded As Boolean = True
+    Private Property ConsoleOffset As Integer = 0
+    Private Property ProbePending As Boolean = False
+    Private Property VerifiedRunner As String
+    Private Property ProbeRunner As String
+
+    Public Sub Constructor(workspace As ProjectWorkspace, projectRoot As String, userRoot As String)
+        Me.Workspace = workspace
+        Me.ProjectRoot = projectRoot
+        Dim root As String = ""
+        If projectRoot <> "" Then root = projectRoot + "/studio-scripts"
+        Me.ProjectLibrary = New StudioScriptLibrary(root)
+        Me.UserLibrary = New StudioScriptLibrary(userRoot)
+    End Sub
+    Public Function IsActive() As Boolean
+        If Me.Job = Nil Then Return False
+        Return Me.Job.IsActive()
+    End Function
+    Public Function RunnerState() As String
+        If Not StudioScriptSettings.Enabled Then Return "BuoyScript disabled in Settings / Preferences"
+        Try
+            Dim executable As String = Me.Runner()
+            If Me.VerifiedRunner = executable Then Return "Runner probe succeeded · " + executable
+            Return "Runner file found · JIT unverified · use Verify Runner"
+        Catch e As Exception
+            Return "Runner unavailable · " + e.Message
+        End Try
+    End Function
+    Public Sub VerifyRunner()
+        Me.ProbeRunner = Me.Runner()
+        Me.Start("Return \"studio-runner-ok\"", "Verify Runner")
+        Me.ProbePending = True
+    End Sub
+    Public Function Runner() As String
+        If Not StudioScriptSettings.Enabled Then Throw New InvalidArgumentException("Enable BuoyScript in Settings / Preferences")
+        Dim filePath As String = StudioScriptRunnerPath()
+        If Not StudioScriptRunnerAvailable(filePath) Then Throw New InvalidArgumentException("BuoyScript runner unavailable; select a matching helper in Settings / Preferences")
+        Return filePath
+    End Function
+    Public Sub Start(source As String, label As String, expression As Boolean = False, buildEvent As Boolean = False)
+        If Me.BuildBusy And Not buildEvent Then Throw New InvalidArgumentException("Wait for the active build/check to finish before running a script")
+        If Me.IsActive() Then Throw New InvalidArgumentException("Stop the active script first")
+        Dim submitted As String = source
+        If expression Then
+            If String.Contains(source, "\n", True) Or String.Contains(source, "\r", True) Then Throw New InvalidArgumentException("Expression mode accepts one expression on one line")
+            source = "Return String.From(" + source + ")"
+        End If
+        Me.ProbePending = False
+        If String.LenBytes(source) < 1 Or String.LenBytes(source) > 65536 Then Throw New InvalidArgumentException("Source must contain 1..65536 UTF-8 bytes")
+        Dim executable As String = Me.Runner()
+        Dim timeoutMs As Integer = Me.RunTimeoutMs
+        If buildEvent Then timeoutMs = Me.BuildTimeoutMs
+        Me.Job = New StudioAgentScript(Me.Workspace, executable, Me.ProjectRoot, source, timeoutMs, True)
+        Me.LastLabel = label
+        Me.Recorded = False
+        Me.ConsoleOffset = 0
+        Me.History.Append(submitted)
+        Me.HistoryModes.Append(expression)
+        If Array.Count(Me.History) > 30 Then
+            Array.RemoveAt(Me.History, 0)
+            Array.RemoveAt(Me.HistoryModes, 0)
+        End If
+        Me.Append("▶ " + label + " (fresh process)\n")
+    End Sub
+    Public Function StartEvent(name As String) As Boolean
+        If Not Me.BuildEventsEnabled Then Return False
+        Dim source As String = Me.ProjectLibrary.TaskSource(name)
+        If source = "" Then Return False
+        Me.Start(source, "Build event: " + name, False, True)
+        Return True
+    End Function
+    Private Sub Append(text As String)
+        Me.Transcript += text
+        If String.Len(Me.Transcript) > 32768 Then Me.Transcript = String.Right(Me.Transcript, 32768)
+    End Sub
+    Public Sub Poll()
+        If Me.Job = Nil Then Return
+        Me.Job.Poll()
+        Dim console As String = Me.Job.ConsoleText
+        If String.Len(console) > Me.ConsoleOffset Then
+            Me.Append(String.Substring(console, Me.ConsoleOffset))
+            Me.ConsoleOffset = String.Len(console)
+        End If
+        If Me.Recorded Or Me.Job.IsActive() Then Return
+        Dim outcome As JSONItem = Me.Job.Result()
+        If outcome.Value("ok").AsBoolean().Or(False) Then
+            Me.Append(outcome.Value("value").AsString().Or("") + "\n")
+        Else
+            Me.Append("Error: " + ScriptConsoleError(outcome.Value("error").AsString().Or("Script failed")) + "\n")
+        End If
+        Dim cleanup As String = outcome.Value("cleanupWarning").AsString().Or("")
+        If cleanup <> "" Then Me.Append("Cleanup: " + cleanup + "\n")
+        If Me.ProbePending Then
+            If outcome.Value("ok").AsBoolean().Or(False) And outcome.Value("value").AsString().Or("") = "studio-runner-ok" Then Me.VerifiedRunner = Me.ProbeRunner
+            Me.ProbePending = False
+        End If
+        Me.Recorded = True
+    End Sub
+    Public Function Succeeded() As Boolean
+        Me.Poll()
+        If Me.Job = Nil Then Return False
+        If Me.IsActive() Then Return False
+        Return Me.Job.Result().Value("ok").AsBoolean().Or(False)
+    End Function
+    Public Sub Stop()
+        If Me.Job <> Nil Then Me.Job.Cancel()
+    End Sub
+End Class

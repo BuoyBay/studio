@@ -1,0 +1,122 @@
+Import StudioNavigation
+
+''' Stable subsequence rank: exact, basename prefix, contiguous, then scattered.
+Public Function StudioFuzzyRank(query As String, filePath As String) As Integer
+    Dim needle As String = String.LCase(String.Trim(query))
+    Dim haystack As String = String.LCase(filePath)
+    If needle = "" Then Return 0
+    If needle = haystack Then Return 100000
+    Dim names As Array Of String = String.Split(String.Replace(haystack, "\\", "/"), "/")
+    Dim base As String = names(Array.Count(names) - 1)
+    If base = needle Then Return 90000
+    If String.StartsWith(base, needle) Then Return 80000 - String.Len(base)
+    If String.Contains(haystack, needle) Then Return 70000 - String.Len(haystack)
+    Dim cursor As Integer = 0
+    Dim score As Integer = 10000
+    Dim previous As Integer = -2
+    For i As Integer = 0 To String.Len(needle) - 1
+        Dim found As Integer = -1
+        For j As Integer = cursor To String.Len(haystack) - 1
+            If String.Substring(haystack, j, 1) = String.Substring(needle, i, 1) Then
+                found = j
+                Exit For
+            End If
+        Next
+        If found < 0 Then Return -1
+        score -= found - cursor
+        If found = previous + 1 Then score += 20
+        If found = 0 Then
+            score += 30
+        ElseIf String.Substring(haystack, found - 1, 1) = "/" Then
+            score += 30
+        End If
+        previous = found
+        cursor = found + 1
+    Next
+    Return score - String.Len(haystack)
+End Function
+
+Public Class StudioQuickOpenIndex
+    Private Property Files As Array Of StudioLocation = []
+    Private Property Recent As Array Of String = []
+    Public Sub SetFiles(files As Array Of StudioLocation)
+        Me.Files = []
+        For Each file As StudioLocation In files
+            If file <> Nil Then Me.Files.Append(file.Copy())
+        Next
+    End Sub
+    Public Sub Used(documentID As String)
+        Dim values As Array Of String = []
+        values.Append(documentID)
+        For Each old As String In Me.Recent
+            If old <> documentID And Array.Count(values) < 100 Then values.Append(old)
+        Next
+        Me.Recent = values
+    End Sub
+    Public Sub Save(domain As String)
+        Dim values As JSONItem = JSONItem.NewArray()
+        For Each id As String In Me.Recent
+            values.Add(id)
+        Next
+        Prefs.Set(domain, "navigation.mru", Json.Stringify(values))
+    End Sub
+    Public Sub Load(domain As String)
+        Dim parsed As Optional Of JSONItem = Json.TryParse(Prefs.Get(domain, "navigation.mru", "[]"))
+        If Not parsed.HasValue Then Return
+        If Not parsed.Value.IsArray() Then Return
+        Dim values As Array Of String = []
+        For i As Integer = 0 To Math.Min(99, parsed.Value.Count() - 1)
+            Dim id As String = parsed.Value.ValueAt(i).AsString().Or("")
+            If id <> "" Then values.Append(id)
+        Next
+        Me.Recent = values
+    End Sub
+    Public Function Search(text As String) As Array Of StudioLocation
+        Dim query As String = String.Trim(text)
+        Dim suffix As StudioLocation
+        Dim parts As Array Of String = String.Split(query, ":")
+        Dim count As Integer = Array.Count(parts)
+        If count >= 2 Then
+            Dim last As Integer = Integer.Parse(parts(count - 1)).Or(0)
+            If last > 0 Then
+                suffix = New StudioLocation()
+                suffix.Line = last
+                Dim trim As Integer = String.Len(parts(count - 1)) + 1
+                If count >= 3 And Integer.Parse(parts(count - 2)).Or(0) > 0 Then
+                    suffix.Column = last
+                    suffix.Line = Integer.Parse(parts(count - 2)).Or(1)
+                    trim += String.Len(parts(count - 2)) + 1
+                End If
+                query = String.Substring(query, 0, String.Len(query) - trim)
+            End If
+        End If
+        Dim results As Array Of StudioLocation = []
+        Dim ranks As Array Of Integer = []
+        For Each file As StudioLocation In Me.Files
+            Dim score As Integer = StudioFuzzyRank(query, file.Path)
+            If score < 0 Then Continue For
+            For i As Integer = 0 To Array.Count(Me.Recent) - 1
+                If Me.Recent(i) = file.DocumentID Then score += 100 - i
+            Next
+            Dim value As StudioLocation = file.Copy()
+            If suffix <> Nil Then
+                value.Line = suffix.Line
+                value.Column = suffix.Column
+            End If
+            results.Append(value)
+            ranks.Append(score)
+            Dim index As Integer = Array.Count(results) - 1
+            While index > 0
+                If ranks(index) <= ranks(index - 1) Then Exit While
+                Dim rank As Integer = ranks(index - 1)
+                Dim item As StudioLocation = results(index - 1)
+                ranks(index - 1) = ranks(index)
+                results(index - 1) = results(index)
+                ranks(index) = rank
+                results(index) = item
+                index -= 1
+            End While
+        Next
+        Return results
+    End Function
+End Class

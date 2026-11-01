@@ -1,0 +1,414 @@
+' LF editor text and exact disk bytes are deliberately separate.
+Import atomicfilekit
+
+Public Function StudioEndingText(kind As String) As String
+    Select Case kind
+        Case "LF"
+            Return "\n"
+        Case "CR"
+            Return "\r"
+        Case "CRLF"
+            Return "\r\n"
+        Case "NEL"
+            Return String.Chr(133)
+        Case "LS"
+            Return String.Chr(8232)
+        Case "PS"
+            Return String.Chr(8233)
+    End Select
+    Throw New InvalidArgumentException("Unknown line ending: " + kind)
+End Function
+
+Public Function StudioDocumentStablePath(filePath As String) As String
+    Dim normalized As String = String.Replace(filePath, "\\", "/", True)
+    ' BUI-003: Chr(0) becomes empty; never use it as a substring sentinel.
+    Dim pathBytes As Bytes = Bytes.FromString(normalized, Text.Encodings.UTF8)
+    For i As Integer = 0 To pathBytes.Count - 1
+        If pathBytes.Item(i) = 0 Then Throw New InvalidArgumentException("NUL in document path")
+    Next
+    #If TargetWindows Then
+        If String.Len(normalized) < 3 Then Throw New InvalidArgumentException("An absolute local drive path is required")
+        If String.Substring(normalized, 1, 2) <> ":/" Then Throw New InvalidArgumentException("An absolute local drive path is required")
+    #Else
+        If Not String.StartsWith(normalized, "/", True) Then Throw New InvalidArgumentException("An absolute document path is required")
+    #End If
+    For Each component As String In String.Split(normalized, "/")
+        If component = "." Or component = ".." Then Throw New InvalidArgumentException("Document path must not contain . or ..")
+    Next
+    Return normalized
+End Function
+
+Public Function StudioDocumentReadUTF8(filePath As String, maxBytes As Integer = 67108864) As String
+    filePath = StudioDocumentStablePath(filePath)
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filePath), False)
+    If opened.IsErr Then Throw New InvalidArgumentException("Cannot read " + filePath)
+    Dim stream As BinaryStream = opened.Value
+    Dim raw As Bytes
+    Try
+        Dim size As Integer = stream.Length
+        If size < 0 Or size > maxBytes Then Throw New InvalidArgumentException("Document exceeds read limit")
+        raw = stream.Read(size)
+        If raw.Count <> size Or stream.LastError.HasValue Then Throw New InvalidArgumentException("Incomplete document read")
+        For i As Integer = 0 To raw.Count - 1
+            If raw.Item(i) = 0 Then Throw New InvalidArgumentException("Binary NUL input is unsupported (Buoy BUI-003)")
+        Next
+        If stream.Length <> size Then Throw New InvalidArgumentException("Document changed during read")
+    Finally
+        stream.Close()
+    End Try
+    Return raw.ToString(Text.Encodings.UTF8)
+End Function
+
+Private Function SDEqual(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Public Class StudioDocumentBuffer
+    Private Property mText As String = ""
+    Private Property mBaseline As String = ""
+    Private Property mPath As String = ""
+    Private Property mRevision As Integer = 0
+    Private Property mEndings As Array Of String = []
+    Private Property mPreferred As String = "LF"
+    Private Property mUnicode As Boolean = False
+    Private Property mHasBaseline As Boolean = False
+    Private Property mBOM As Boolean = False
+
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+    End Property
+    Public Property Baseline As String
+        Get
+            Return Me.mBaseline
+        End Get
+    End Property
+    Public Property Path As String
+        Get
+            Return Me.mPath
+        End Get
+    End Property
+    Public Property Revision As Integer
+        Get
+            Return Me.mRevision
+        End Get
+    End Property
+    Public Property PreferredEnding As String
+        Get
+            Return Me.mPreferred
+        End Get
+    End Property
+    Public Property UnicodeImport As Boolean
+        Get
+            Return Me.mUnicode
+        End Get
+    End Property
+    Public Property HasBaseline As Boolean
+        Get
+            Return Me.mHasBaseline
+        End Get
+    End Property
+    Public Property Dirty As Boolean
+        Get
+            Return Not Me.mHasBaseline Or Not SDEqual(Me.Serialize(), Me.mBaseline)
+        End Get
+    End Property
+    Public Property HasFinalNewline As Boolean
+        Get
+            Return String.EndsWith(Me.mText, "\n", True)
+        End Get
+    End Property
+    Public Property EndingKind As String
+        Get
+            If Array.Count(Me.mEndings) = 0 Then Return "none"
+            Dim first As String = Me.mEndings(0)
+            For Each ending As String In Me.mEndings
+                If Not SDEqual(first, ending) Then Return "mixed"
+            Next
+            Return first
+        End Get
+    End Property
+
+    Private Sub CheckRevision(expected As Integer)
+        If expected <> Me.mRevision Then Throw New InvalidArgumentException("Document revision changed")
+    End Sub
+
+    Private Sub Parse(raw As String, importUnicode As Boolean)
+        ' Validation also rejects malformed UTF-8 arriving through file I/O/FFI.
+        Dim validated As Bytes = Bytes.FromString(raw, Text.Encodings.UTF8)
+        Me.mText = ""
+        Me.mEndings = []
+        Me.mUnicode = importUnicode
+        Me.mBOM = String.StartsWith(raw, String.Chr(65279), True)
+        If Me.mBOM Then raw = String.Substring(raw, 1)
+        Dim chars As Array Of String = String.Chars(raw)
+        Dim pieces As Array Of String = []
+        Dim i As Integer = 0
+        While i < Array.Count(chars)
+            Dim c As String = chars(i)
+            Dim kind As String = ""
+            If c = "\r" Then
+                kind = "CR"
+                If i + 1 < Array.Count(chars) Then
+                    If chars(i + 1) = "\n" Then
+                        kind = "CRLF"
+                        i += 1
+                    End If
+                End If
+            ElseIf c = "\n" Then
+                kind = "LF"
+            ElseIf importUnicode Then
+                If c = String.Chr(133) Then kind = "NEL"
+                If c = String.Chr(8232) Then kind = "LS"
+                If c = String.Chr(8233) Then kind = "PS"
+            End If
+            If kind <> "" Then
+                Array.Append(pieces, "\n")
+                Array.Append(Me.mEndings, kind)
+            Else
+                Array.Append(pieces, c)
+            End If
+            i += 1
+        End While
+        Me.mText = String.Join(pieces, "")
+        If Array.Count(Me.mEndings) > 0 Then Me.mPreferred = Me.mEndings(0)
+    End Sub
+
+    Public Shared Function FromText(raw As String, importUnicode As Boolean = False) As StudioDocumentBuffer
+        Dim created As New StudioDocumentBuffer()
+        created.Parse(raw, importUnicode)
+        Return created
+    End Function
+
+    Public Shared Function FromDisk(filePath As String, importUnicode As Boolean = False) As StudioDocumentBuffer
+        filePath = StudioDocumentStablePath(filePath)
+        Dim raw As String = StudioDocumentReadUTF8(filePath)
+        Dim created As StudioDocumentBuffer = StudioDocumentBuffer.FromText(raw, importUnicode)
+        created.mBaseline = raw
+        created.mPath = filePath
+        created.mHasBaseline = True
+        Return created
+    End Function
+
+    ''' Counts every encoding in raw text, including Unicode left literal by default.
+    Public Shared Function Detect(raw As String) As JSONItem
+        Dim created As JSONItem = JSONItem.NewObject()
+        For Each kind As String In ["CR", "LF", "CRLF", "NEL", "LS", "PS"]
+            created.Value(kind) = 0.0
+        Next
+        Dim parsed As StudioDocumentBuffer = StudioDocumentBuffer.FromText(raw, True)
+        For Each kind As String In parsed.mEndings
+            created.Value(kind) = created.Value(kind).AsNumber().Or(0.0) + 1.0
+        Next
+        created.Value("kind") = parsed.EndingKind
+        created.Value("finalNewline") = parsed.HasFinalNewline
+        Return created
+    End Function
+
+    Public Function Serialize(trimTrailingSpaces As Boolean = False) As String
+        Dim lines As Array Of String = String.Split(Me.mText, "\n")
+        Dim output As Array Of String = []
+        For i As Integer = 0 To Array.Count(lines) - 1
+            Dim line As String = lines(i)
+            If trimTrailingSpaces Then
+                While String.EndsWith(line, " ", True) Or String.EndsWith(line, "\t", True)
+                    line = String.Left(line, String.Len(line) - 1)
+                End While
+            End If
+            Array.Append(output, line)
+            If i < Array.Count(Me.mEndings) Then Array.Append(output, StudioEndingText(Me.mEndings(i)))
+        Next
+        If Me.mBOM Then Return String.Chr(65279) + String.Join(output, "")
+        Return String.Join(output, "")
+    End Function
+
+    ''' Codepoint offsets, zero based. Inserted LF uses preferred EOL; surviving
+    ''' boundaries retain their exact format. Unicode separators remain literal.
+    Public Sub ApplyEdit(start As Integer, removed As Integer, inserted As String, expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        If start < 0 Or removed < 0 Or start + removed > String.Len(Me.mText) Then Throw New InvalidArgumentException("Invalid edit range")
+        If String.Contains(inserted, "\r", True) Then Throw New InvalidArgumentException("Editor edits must use normalized LF")
+        Dim validated As Bytes = Bytes.FromString(inserted, Text.Encodings.UTF8)
+        Dim endings As Array Of String = []
+        Dim chars As Array Of String = String.Chars(Me.mText)
+        Dim boundary As Integer = 0
+        For i As Integer = 0 To start - 1
+            If chars(i) = "\n" Then
+                Array.Append(endings, Me.mEndings(boundary))
+                boundary += 1
+            End If
+        Next
+        For Each c As String In String.Chars(inserted)
+            If c = "\n" Then Array.Append(endings, Me.mPreferred)
+        Next
+        For i As Integer = start To Array.Count(chars) - 1
+            If chars(i) = "\n" Then
+                If i >= start + removed Then Array.Append(endings, Me.mEndings(boundary))
+                boundary += 1
+            End If
+        Next
+        Me.mText = String.Left(Me.mText, start) + inserted + String.Substring(Me.mText, start + removed)
+        Me.mEndings = endings
+        Me.mRevision += 1
+    End Sub
+
+    ''' Whole-buffer adapter computes a common-prefix/suffix edit. If line count
+    ''' is unchanged, preserves all boundary encodings by ordinal. Prefer ApplyEdit
+    ''' for exact boundary identity when multiple line insertions/deletions occur.
+    Public Sub ReplaceText(text As String, expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        Dim oldChars As Array Of String = String.Chars(Me.mText)
+        Dim newChars As Array Of String = String.Chars(text)
+        Dim prefix As Integer = 0
+        While prefix < Array.Count(oldChars) And prefix < Array.Count(newChars)
+            If Not SDEqual(oldChars(prefix), newChars(prefix)) Then Exit While
+            prefix += 1
+        End While
+        Dim suffix As Integer = 0
+        While suffix < Array.Count(oldChars) - prefix And suffix < Array.Count(newChars) - prefix
+            If Not SDEqual(oldChars(Array.Count(oldChars) - suffix - 1), newChars(Array.Count(newChars) - suffix - 1)) Then Exit While
+            suffix += 1
+        End While
+        Dim oldEndings As Array Of String = Me.mEndings
+        Dim sameLineCount As Boolean = Array.Count(String.Split(text, "\n")) - 1 = Array.Count(oldEndings)
+        Me.ApplyEdit(prefix, Array.Count(oldChars) - prefix - suffix, String.Substring(text, prefix, Array.Count(newChars) - prefix - suffix), expectedRevision)
+        If sameLineCount Then Me.mEndings = oldEndings
+    End Sub
+
+    ''' Explicit Unicode import is destructive only by user choice, and undoable
+    ''' with Snapshot/Restore. Default conversion never reinterprets literals.
+    Public Sub ConvertEndings(kind As String, expectedRevision As Integer, importUnicode As Boolean = False)
+        Me.CheckRevision(expectedRevision)
+        Dim validated As String = StudioEndingText(kind)
+        If importUnicode Then Me.Parse(Me.Serialize(), True)
+        Me.mPreferred = kind
+        For i As Integer = 0 To Array.Count(Me.mEndings) - 1
+            Me.mEndings(i) = kind
+        Next
+        Me.mRevision += 1
+    End Sub
+
+    ' Only ASCII spaces/tabs at line ends; preserve line count and EOL metadata.
+    Public Sub CleanupWhitespace(expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        Dim chars As Array Of String = String.Chars(Me.mText)
+        Dim lineEnd As Integer = Array.Count(chars)
+        For i As Integer = Array.Count(chars) - 1 To -1 Step -1
+            Dim atBoundary As Boolean = i = -1
+            If i >= 0 Then atBoundary = chars(i) = "\n"
+            If atBoundary Then
+                Dim tail As Integer = lineEnd
+                While tail > i + 1
+                    If chars(tail - 1) <> " " And chars(tail - 1) <> "\t" Then Exit While
+                    tail -= 1
+                End While
+                If tail < lineEnd Then Me.ApplyEdit(tail, lineEnd - tail, "", Me.mRevision)
+                lineEnd = i
+            End If
+        Next
+    End Sub
+
+    Public Sub SetUTF8BOM(enabled As Boolean, expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        Me.mBOM = enabled
+        Me.mRevision += 1
+    End Sub
+
+    Public Function Snapshot() As JSONItem
+        Dim created As JSONItem = JSONItem.NewObject()
+        created.Value("version") = 1.0
+        created.Value("raw") = Me.Serialize()
+        created.Value("text") = Me.mText
+        Dim tokens As JSONItem = JSONItem.NewArray()
+        For Each ending As String In Me.mEndings
+            tokens.Add(ending)
+        Next
+        created.Value("endings") = tokens
+        created.Value("unicode") = Me.mUnicode
+        created.Value("bom") = Me.mBOM
+        created.Value("preferred") = Me.mPreferred
+        created.Value("baseline") = Me.mBaseline
+        created.Value("hasBaseline") = Me.mHasBaseline
+        created.Value("path") = Me.mPath
+        Return created
+    End Function
+
+    Public Sub Restore(snapshot As JSONItem, expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        If Not snapshot.IsObject() Or snapshot.Value("version").AsNumber().Or(0.0) <> 1.0 Then Throw New InvalidArgumentException("Invalid document snapshot")
+        If Not snapshot.Value("raw").IsString() Or Not snapshot.Value("baseline").IsString() Or Not snapshot.Value("unicode").IsBoolean() Or Not snapshot.Value("hasBaseline").IsBoolean() Or Not snapshot.Value("path").IsString() Then Throw New InvalidArgumentException("Incomplete document snapshot")
+        Dim preferred As String = snapshot.Value("preferred").AsString().Or("")
+        Dim validated As String = StudioEndingText(preferred)
+        If Not snapshot.Value("text").IsString() Or Not snapshot.Value("endings").IsArray() Then Throw New InvalidArgumentException("Missing boundary metadata")
+        Dim text As String = snapshot.Value("text").AsString().Value
+        If String.Contains(text, "\r", True) Then Throw New InvalidArgumentException("Snapshot is not normalized")
+        Dim tokens As Array Of String = []
+        Dim encoded As JSONItem = snapshot.Value("endings")
+        For i As Integer = 0 To encoded.Count() - 1
+            Dim kind As String = encoded.ValueAt(i).AsString().Or("")
+            validated = StudioEndingText(kind)
+            Array.Append(tokens, kind)
+        Next
+        If Array.Count(String.Split(text, "\n")) - 1 <> Array.Count(tokens) Then Throw New InvalidArgumentException("Boundary count mismatch")
+        Dim candidate As New StudioDocumentBuffer()
+        candidate.mText = text
+        candidate.mEndings = tokens
+        candidate.mBOM = snapshot.Value("bom").AsBoolean().Or(False)
+        If Not SDEqual(candidate.Serialize(), snapshot.Value("raw").AsString().Value) Then Throw New InvalidArgumentException("Snapshot content mismatch")
+        Me.mText = text
+        Me.mEndings = tokens
+        Me.mBOM = candidate.mBOM
+        Me.mUnicode = snapshot.Value("unicode").AsBoolean().Value
+        Me.mPreferred = preferred
+        ' Undo restores buffer/metadata, never rewinds the current disk baseline.
+        Me.mRevision += 1
+    End Sub
+
+    ''' Recovery reconstructs the recorded disk baseline too; Restore does not.
+    Public Shared Function FromSnapshot(snapshot As JSONItem) As StudioDocumentBuffer
+        Dim created As New StudioDocumentBuffer()
+        created.Restore(snapshot, 0)
+        created.mBaseline = snapshot.Value("baseline").AsString().Value
+        created.mHasBaseline = snapshot.Value("hasBaseline").AsBoolean().Value
+        created.mPath = snapshot.Value("path").AsString().Value
+        If created.mHasBaseline Then created.mPath = StudioDocumentStablePath(created.mPath)
+        Return created
+    End Function
+
+    Public Sub Save(expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        If Not Me.mHasBaseline Or Me.mPath = "" Then Throw New InvalidArgumentException("Use SaveNew for an untitled document")
+        Dim raw As String = Me.Serialize()
+        Try
+            AtomicWriteText(Me.mPath, raw, Me.mBaseline)
+        Catch e As AtomicFileException
+            If e.IsCommitted Then Me.mBaseline = raw
+            Throw e
+        End Try
+        Me.mBaseline = raw
+    End Sub
+
+    ''' Atomic publication to a missing filePath. Parent directory must exist.
+    Public Sub SaveNew(filePath As String, expectedRevision As Integer)
+        Me.CheckRevision(expectedRevision)
+        filePath = StudioDocumentStablePath(filePath)
+        If New FileSystemItem(filePath).Exists() Then Throw New InvalidArgumentException("Destination already exists")
+        Dim raw As String = Me.Serialize()
+        Dim transaction As New AtomicFileTransaction(filePath)
+        transaction.Append(Bytes.FromString(raw, Text.Encodings.UTF8))
+        Try
+            transaction.Commit()
+        Catch e As AtomicFileException
+            If e.IsCommitted Then
+                Me.mPath = filePath
+                Me.mBaseline = raw
+                Me.mHasBaseline = True
+            End If
+            Throw e
+        End Try
+        Me.mPath = filePath
+        Me.mBaseline = raw
+        Me.mHasBaseline = True
+    End Sub
+End Class

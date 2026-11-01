@@ -1,0 +1,1354 @@
+Import StudioChangeReview
+Import StudioDocumentIO
+Import atomicfilekit
+
+' Reference-aware file rename/move (Dreamweaver-style link maintenance).
+' The planner is pure: it reads project-relative paths and texts and proposes
+' per-file rewrites as review entries. The host applies the approved subset.
+'
+' Rewritten references:
+'   * Buoy `Import Name` / `Import "rel/path"` (also Public Import, As, .{ })
+'   * Markdown `](target)` and `[label]: target` links, HTML href/src (double or single
+'     quoted) and CSS url(...) relative links
+'   * quoted paths (and unquoted YAML scalars) in .json/.yml/.yaml/.toml files that resolve
+'     exactly to a moved file; TOML multi-line strings are left alone
+'   * the moved file's own outgoing imports and links when its folder changes (including
+'     relative quoted paths and unquoted YAML scalars in moved config files)
+'   * several moves at once (StudioPathMove / StudioPlanFolderMove): files that move
+'     together keep references that are still valid between them
+' Offered but unchecked by default: plain-text mentions of the old path or file name
+' ("text:" entries) and `OldStem.` -> `NewStem.` module qualifiers ("qual:" entries).
+
+' ---- Project-relative path helpers ("/" separated, no leading slash) -------------------
+
+Public Function StudioPathDir(relPath As String) As String
+    Dim at As Integer = String.InStrRev(relPath, "/")
+    If at <= 0 Then Return ""
+    Return String.Left(relPath, at - 1)
+End Function
+
+Public Function StudioPathBase(relPath As String) As String
+    Dim at As Integer = String.InStrRev(relPath, "/")
+    If at <= 0 Then Return relPath
+    Return String.Substring(relPath, at)
+End Function
+
+Public Function StudioPathStem(relPath As String) As String
+    Dim name As String = StudioPathBase(relPath)
+    Dim at As Integer = String.InStrRev(name, ".")
+    If at <= 1 Then Return name
+    Return String.Left(name, at - 1)
+End Function
+
+''' Resolves "." and ".." segments. A path that climbs above the project root keeps
+''' its leading ".." segments, so it can never equal a project file.
+Public Function StudioPathNormalize(relPath As String) As String
+    Dim output As Array Of String = []
+    For Each part As String In String.Split(String.Replace(relPath, "\\", "/"), "/")
+        If part = "" Or part = "." Then Continue For
+        If part = ".." Then
+            If Array.Count(output) > 0 Then
+                If Array.Last(output) <> ".." Then
+                    Array.RemoveAt(output, Array.Count(output) - 1)
+                    Continue For
+                End If
+            End If
+        End If
+        output.Append(part)
+    Next
+    Return String.Join(output, "/")
+End Function
+
+Public Function StudioPathJoin(folder As String, relative As String) As String
+    If folder = "" Then Return StudioPathNormalize(relative)
+    Return StudioPathNormalize(folder + "/" + relative)
+End Function
+
+''' Relative path from folder fromDir to target, e.g. ("docs", "src/a.bui") -> "../src/a.bui".
+Public Function StudioPathRelative(fromDir As String, target As String) As String
+    Dim fromParts As Array Of String = []
+    If fromDir <> "" Then fromParts = String.Split(fromDir, "/")
+    Dim toParts As Array Of String = String.Split(target, "/")
+    Dim common As Integer = 0
+    While common < Array.Count(fromParts) And common < Array.Count(toParts) - 1
+        If String.Compare(fromParts(common), toParts(common), True) <> 0 Then Exit While
+        common += 1
+    End While
+    Dim output As Array Of String = []
+    For i As Integer = common To Array.Count(fromParts) - 1
+        output.Append("..")
+    Next
+    For i As Integer = common To Array.Count(toParts) - 1
+        output.Append(toParts(i))
+    Next
+    Return String.Join(output, "/")
+End Function
+
+Private Function SRSame(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Private Function SRIdentChar(c As String) As Boolean
+    If c = "" Then Return False
+    Dim code As Integer = String.Asc(c)
+    Return (code >= 48 And code <= 57) Or (code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or c = "_"
+End Function
+
+Private Function SRIsSource(relPath As String) As Boolean
+    Return String.EndsWith(String.LCase(relPath), ".bui")
+End Function
+
+Private Function SRIsLinkDocument(relPath As String) As Boolean
+    Dim lower As String = String.LCase(relPath)
+    Return String.EndsWith(lower, ".md") Or String.EndsWith(lower, ".markdown") Or String.EndsWith(lower, ".html") Or String.EndsWith(lower, ".htm") Or SRIsCss(relPath)
+End Function
+
+Private Function SRIsCss(relPath As String) As Boolean
+    Return String.EndsWith(String.LCase(relPath), ".css")
+End Function
+
+Private Function SRIsMarkdown(relPath As String) As Boolean
+    Dim lower As String = String.LCase(relPath)
+    Return String.EndsWith(lower, ".md") Or String.EndsWith(lower, ".markdown")
+End Function
+
+Private Function SRIsConfig(relPath As String) As Boolean
+    Dim lower As String = String.LCase(relPath)
+    Return String.EndsWith(lower, ".json") Or String.EndsWith(lower, ".yml") Or String.EndsWith(lower, ".yaml") Or String.EndsWith(lower, ".toml")
+End Function
+
+' ---- Model ---------------------------------------------------------------------------------
+
+''' One project text file offered to the planner (current buffer text, LF endings).
+Public Class StudioRefactorFile
+    Public Property RelativePath As String = ""
+    Public Property Content As String = ""
+    Public Sub Constructor(relPath As String, content As String)
+        Me.RelativePath = relPath
+        Me.Content = content
+    End Sub
+End Class
+
+''' One file moving from OldPath to NewPath (project-relative, "/" separated).
+Public Class StudioPathMove
+    Public Property OldPath As String = ""
+    Public Property NewPath As String = ""
+    Public Sub Constructor(oldPath As String, newPath As String)
+        Me.OldPath = oldPath
+        Me.NewPath = newPath
+    End Sub
+End Class
+
+Private Function SRCommonDir(dirs As Array Of String) As String
+    If Array.Count(dirs) = 0 Then Return ""
+    Dim common As Array Of String = []
+    If dirs(0) <> "" Then common = String.Split(dirs(0), "/")
+    For i As Integer = 1 To Array.Count(dirs) - 1
+        Dim parts As Array Of String = []
+        If dirs(i) <> "" Then parts = String.Split(dirs(i), "/")
+        Dim keep As Integer = 0
+        While keep < Array.Count(common) And keep < Array.Count(parts)
+            If String.Compare(common(keep), parts(keep), True) <> 0 Then Exit While
+            keep += 1
+        Wend
+        Dim shorter As Array Of String = []
+        For k As Integer = 0 To keep - 1
+            shorter.Append(common(k))
+        Next
+        common = shorter
+    Next
+    Return String.Join(common, "/")
+End Function
+
+''' True when relPath lies under folder (case-insensitive, on a folder boundary).
+Private Function SRUnderFolder(relPath As String, folder As String) As Boolean
+    If folder = "" Then Return True
+    Return String.StartsWith(String.LCase(relPath), String.LCase(folder) + "/")
+End Function
+
+''' relPath with the leading folder removed (folder must contain relPath).
+Private Function SRBelowFolder(relPath As String, folder As String) As String
+    If folder = "" Then Return relPath
+    Return String.Substring(relPath, String.Len(folder) + 1)
+End Function
+
+''' A planned rename/move of one or several files: Entries(0) is the locked move summary;
+''' the rest are per-file reference rewrites ("refs:" keys, checked), module qualifiers
+''' ("qual:" keys, unchecked) and text mentions ("text:" keys, unchecked). Keys and
+''' FinalText use the file's ORIGINAL path.
+Public Class StudioFileMovePlan
+    Public Property OldPath As String = ""
+    Public Property NewPath As String = ""
+    Public Property Moves As Array Of StudioPathMove = []
+    Public Property Entries As Array Of StudioReviewEntry = []
+    Public Property Warnings As Array Of String = []
+    Private Property mFiles As Array Of StudioRefactorFile = []
+    Private Property mEntryDir As String = ""
+    Private Property mEntryDirAfter As String = ""
+    Private Property mBlock As Boolean = False
+    Private Property mTomlOpen As String = ""
+    Private Property mMaskReferences As Boolean = False
+    Private Property mMentionOld As Array Of String = []
+    Private Property mMentionNew As Array Of String = []
+    Private Property mFolderPair As Integer = -1
+    ' Whole-folder move: every path under it moves, including non-project files (images...).
+    Private Property mWholeOld As String = ""
+    Private Property mWholeNew As String = ""
+
+    Public Sub Constructor(files As Array Of StudioRefactorFile, oldPath As String, newPath As String)
+        Dim one As Array Of StudioPathMove = []
+        one.Append(New StudioPathMove(oldPath, newPath))
+        Me.Plan(files, one, "", "", "", False)
+    End Sub
+
+    Public Sub Constructor(files As Array Of StudioRefactorFile, moves As Array Of StudioPathMove, title As String)
+        Me.Plan(files, moves, title, "", "", False)
+    End Sub
+
+    ''' Whole-folder move: oldFolder/ -> newFolder/ (enables the "old/" -> "new/" text-mention rule).
+    Public Sub Constructor(files As Array Of StudioRefactorFile, moves As Array Of StudioPathMove, title As String, oldFolder As String, newFolder As String)
+        Me.Plan(files, moves, title, StudioPathNormalize(oldFolder), StudioPathNormalize(newFolder), True)
+    End Sub
+
+    Private Sub Plan(files As Array Of StudioRefactorFile, moves As Array Of StudioPathMove, title As String, folderOld As String, folderNew As String, explicitFolder As Boolean)
+        Me.mFiles = files
+        For Each item As StudioPathMove In moves
+            Me.Moves.Append(New StudioPathMove(StudioPathNormalize(item.OldPath), StudioPathNormalize(item.NewPath)))
+        Next
+        If Array.Count(Me.Moves) = 0 Then Throw New Exception("StudioFileMovePlan: no moves")
+        Me.OldPath = Me.Moves(0).OldPath
+        Me.NewPath = Me.Moves(0).NewPath
+        For Each file As StudioRefactorFile In files
+            If SRSame(StudioPathBase(file.RelativePath), "main.bui") Then
+                Me.mEntryDir = StudioPathDir(file.RelativePath)
+                Me.mEntryDirAfter = StudioPathDir(Me.NewOf(file.RelativePath))
+                Exit For
+            End If
+        Next
+        ' Common folder before/after for several moves.
+        Dim oldDirs As Array Of String = []
+        Dim newDirs As Array Of String = []
+        For Each item As StudioPathMove In Me.Moves
+            oldDirs.Append(StudioPathDir(item.OldPath))
+            newDirs.Append(StudioPathDir(item.NewPath))
+        Next
+        Dim derived As Boolean = False
+        If explicitFolder Then
+            Me.OldPath = folderOld
+            Me.NewPath = folderNew
+        ElseIf Array.Count(Me.Moves) > 1 Then
+            Dim commonOld As String = SRCommonDir(oldDirs)
+            If commonOld <> "" Then
+                Me.OldPath = commonOld
+                Me.NewPath = SRCommonDir(newDirs)
+                ' Only a real folder move when every move keeps its place below the folder
+                ' and nothing else lives in the old folder.
+                derived = True
+                For Each item As StudioPathMove In Me.Moves
+                    If Not SRUnderFolder(item.NewPath, Me.NewPath) Or Not SRSame(SRBelowFolder(item.OldPath, Me.OldPath), SRBelowFolder(item.NewPath, Me.NewPath)) Then derived = False
+                Next
+                If derived Then
+                    For Each file As StudioRefactorFile In files
+                        If SRUnderFolder(file.RelativePath, commonOld) And Not Me.IsMoved(file.RelativePath) Then derived = False
+                    Next
+                End If
+            End If
+        End If
+        If explicitFolder Or derived Then
+            Me.mWholeOld = Me.OldPath
+            Me.mWholeNew = Me.NewPath
+        End If
+        Me.BuildMentionPairs(explicitFolder Or derived)
+
+        Dim verb As String = "Rename"
+        For Each item As StudioPathMove In Me.Moves
+            If Not SRSame(StudioPathDir(item.OldPath), StudioPathDir(item.NewPath)) Then verb = "Move"
+        Next
+        Dim summary As New StudioReviewEntry()
+        summary.Key = "move"
+        If title <> "" Then
+            summary.Title = title
+        ElseIf Array.Count(Me.Moves) = 1 Then
+            summary.Title = verb + " " + Me.OldPath + " → " + Me.NewPath
+        Else
+            summary.Title = verb + " " + String.From(Array.Count(Me.Moves)) + " files"
+        End If
+        summary.Locked = True
+        Dim listing As String = ""
+        If Array.Count(Me.Moves) = 1 Then
+            summary.Detail = "the file itself"
+            listing = verb + " on disk:\n  from " + Me.OldPath + "\n  to   " + Me.NewPath
+        Else
+            summary.Detail = String.From(Array.Count(Me.Moves)) + " files"
+            listing = verb + " on disk:"
+            For Each item As StudioPathMove In Me.Moves
+                listing += "\n  " + item.OldPath + " → " + item.NewPath
+            Next
+        End If
+        summary.Note = listing + "\n\nChecked files below are rewritten so their imports and links follow the file. Undo with Edit → Undo File Rename/Move."
+        Me.Entries.Append(summary)
+
+        For Each file As StudioRefactorFile In files
+            Dim refs As String = Me.RewriteReferences(file)
+            Dim fileTitle As String = file.RelativePath
+            If Me.IsMoved(file.RelativePath) Then fileTitle = Me.NewOf(file.RelativePath) + " (moved file)"
+            If String.Compare(refs, file.Content, True) <> 0 Then
+                Dim entry As New StudioReviewEntry()
+                entry.Key = "refs:" + file.RelativePath
+                entry.Title = fileTitle
+                entry.LeftLabel = file.RelativePath
+                entry.LeftText = file.Content
+                entry.RightLabel = file.RelativePath + " (updated)"
+                entry.RightText = refs
+                entry.Detail = "imports/links · " + StudioReviewStat(entry)
+                entry.Note = Me.QualifierNote(file)
+                Me.Entries.Append(entry)
+            End If
+            Dim quals As String = Me.RewriteQualifiers(file)
+            If quals <> file.Content Then
+                Dim entry As New StudioReviewEntry()
+                entry.Key = "qual:" + file.RelativePath
+                entry.Title = fileTitle
+                entry.LeftLabel = file.RelativePath
+                entry.LeftText = file.Content
+                entry.RightLabel = file.RelativePath + " (module qualifiers)"
+                entry.RightText = quals
+                If Array.Count(Me.Moves) = 1 Then
+                    entry.Detail = "module qualifiers `" + StudioPathStem(Me.OldPath) + ".` → `" + StudioPathStem(Me.NewPath) + ".` (review) · " + StudioReviewStat(entry)
+                    entry.Note = "Rewrites `" + StudioPathStem(Me.OldPath) + ".` to `" + StudioPathStem(Me.NewPath) + ".` outside strings and comments. Leave unchecked if the uses name a class that is also called `" + StudioPathStem(Me.OldPath) + "` (for example `Public Class " + StudioPathStem(Me.OldPath) + "` inside " + StudioPathBase(Me.OldPath) + "): the class keeps its name, only the module qualifier changes."
+                Else
+                    entry.Detail = "module qualifiers of renamed modules (review) · " + StudioReviewStat(entry)
+                    entry.Note = "Rewrites `OldModule.` to `NewModule.` for each renamed module outside strings and comments. Leave unchecked if the uses name a class that shares the module's name: the class keeps its name, only the module qualifier changes."
+                End If
+                entry.Included = False
+                Me.Entries.Append(entry)
+            End If
+            ' Mentions already covered by the reference rewrite (e.g. a quoted path in a
+            ' config file) are not offered a second time.
+            Dim mentions As String = Me.RewriteMentions(file.Content)
+            If String.Compare(mentions, file.Content, True) <> 0 And Not SRSame(Me.RewriteMentionsIn(file.Content, Me.ReferenceMask(file)), file.Content) Then
+                Dim entry As New StudioReviewEntry()
+                entry.Key = "text:" + file.RelativePath
+                entry.Title = fileTitle
+                entry.LeftLabel = file.RelativePath
+                entry.LeftText = file.Content
+                entry.RightLabel = file.RelativePath + " (text mentions)"
+                entry.RightText = mentions
+                entry.Detail = "text mentions of the old name (review) · " + StudioReviewStat(entry)
+                entry.Included = False
+                Me.Entries.Append(entry)
+            End If
+        Next
+    End Sub
+
+    ''' Final text for a file (ORIGINAL path in file.RelativePath) given which entries the
+    ''' user approved; equals the input text when nothing for that file was approved.
+    Public Function FinalText(file As StudioRefactorFile) As String
+        ' Protect reference spans in the original text before applying optional mentions.
+        ' Targets in a chain may themselves be old paths; never resolve inserted names.
+        Dim content As String = file.Content
+        Dim masked As String = ""
+        For Each entry As StudioReviewEntry In Me.Entries
+            If entry.Included And SRSame(entry.Key, "refs:" + file.RelativePath) Then masked = Me.ReferenceMask(file)
+        Next
+        For Each entry As StudioReviewEntry In Me.Entries
+            If Not entry.Included Then Continue For
+            If SRSame(entry.Key, "text:" + file.RelativePath) Then content = Me.RewriteMentionsIn(content, masked)
+        Next
+        For Each entry As StudioReviewEntry In Me.Entries
+            If Not entry.Included Then Continue For
+            If SRSame(entry.Key, "refs:" + file.RelativePath) Then content = Me.RewriteReferences(New StudioRefactorFile(file.RelativePath, content))
+        Next
+        For Each entry As StudioReviewEntry In Me.Entries
+            If Not entry.Included Then Continue For
+            If SRSame(entry.Key, "qual:" + file.RelativePath) Then content = Me.RewriteQualifiersIn(content, file)
+        Next
+        Return content
+    End Function
+
+    ' A same-length reference pass marks changed targets with spaces. Mention matching
+    ' uses those original offsets, so combined approvals cannot rewrite a target twice.
+    Private Function ReferenceMask(file As StudioRefactorFile) As String
+        Me.mMaskReferences = True
+        Dim masked As String = Me.RewriteReferences(file)
+        Me.mMaskReferences = False
+        Return masked
+    End Function
+
+    Private Function ReferenceReplacement(original As String, updated As String) As String
+        If Not Me.mMaskReferences Then Return updated
+        Dim masked As String = ""
+        For i As Integer = 1 To String.Len(original)
+            masked += " "
+        Next
+        Return masked
+    End Function
+
+    ' ---- Move bookkeeping ----
+
+    ''' Path after the plan runs (unchanged when the file does not move).
+    Private Function NewOf(relPath As String) As String
+        For Each item As StudioPathMove In Me.Moves
+            If SRSame(item.OldPath, relPath) Then Return item.NewPath
+        Next
+        If Me.mWholeOld <> "" Then
+            If SRUnderFolder(relPath, Me.mWholeOld) Then Return StudioPathJoin(Me.mWholeNew, SRBelowFolder(relPath, Me.mWholeOld))
+        End If
+        Return relPath
+    End Function
+
+    Private Function IsMoved(relPath As String) As Boolean
+        For Each item As StudioPathMove In Me.Moves
+            If SRSame(item.OldPath, relPath) Then Return True
+        Next
+        If Me.mWholeOld <> "" Then Return SRUnderFolder(relPath, Me.mWholeOld)
+        Return False
+    End Function
+
+    Private Function HasSource(relPath As String) As Boolean
+        For Each file As StudioRefactorFile In Me.mFiles
+            If SRSame(file.RelativePath, relPath) Then Return True
+        Next
+        Return False
+    End Function
+
+    ''' A project file exists at relPath before the plan runs.
+    Private Function ExistsBefore(relPath As String) As Boolean
+        Return Me.HasSource(relPath) Or Me.IsMoved(relPath)
+    End Function
+
+    ''' A project file exists at relPath after the plan runs.
+    Private Function ExistsAfter(relPath As String) As Boolean
+        For Each item As StudioPathMove In Me.Moves
+            If SRSame(item.NewPath, relPath) Then Return True
+        Next
+        Return Me.HasSource(relPath) And Not Me.IsMoved(relPath)
+    End Function
+
+    Private Sub BuildMentionPairs(wholeFolder As Boolean)
+        For Each item As StudioPathMove In Me.Moves
+            If SRSame(item.OldPath, item.NewPath) Then Continue For
+            If String.Contains(item.OldPath, "/") Then
+                Me.mMentionOld.Append(item.OldPath)
+                Me.mMentionNew.Append(item.NewPath)
+            End If
+        Next
+        If wholeFolder And Me.OldPath <> "" And Not SRSame(Me.OldPath, Me.NewPath) Then
+            Me.mFolderPair = Array.Count(Me.mMentionOld)
+            Me.mMentionOld.Append(Me.OldPath + "/")
+            If Me.NewPath = "" Then
+                Me.mMentionNew.Append("")
+            Else
+                Me.mMentionNew.Append(Me.NewPath + "/")
+            End If
+        End If
+    End Sub
+
+    ' ---- Buoy imports ----
+
+    ''' Where an identifier import from folder resolves (next to the importer first,
+    ''' then the entry file's folder). after selects the layout after the plan ran.
+    Private Function ResolveIdentifier(folder As String, name As String, after As Boolean) As String
+        Dim local As String = StudioPathJoin(folder, name + ".bui")
+        If after Then
+            If Me.ExistsAfter(local) Then Return local
+        ElseIf Me.ExistsBefore(local) Then
+            Return local
+        End If
+        Dim entryDir As String = Me.mEntryDir
+        If after Then entryDir = Me.mEntryDirAfter
+        Dim entry As String = StudioPathJoin(entryDir, name + ".bui")
+        If after Then
+            If Me.ExistsAfter(entry) Then Return entry
+        ElseIf Me.ExistsBefore(entry) Then
+            Return entry
+        End If
+        Return ""
+    End Function
+
+    ''' Import token (identifier or quoted path) that reaches target (a post-move path) from folder.
+    Private Function ImportToken(folder As String, target As String, quotedBefore As Boolean, withExtension As Boolean, dotPrefix As Boolean) As String
+        Dim stem As String = StudioPathStem(target)
+        If Not quotedBefore Then
+            If SRSame(Me.ResolveIdentifier(folder, stem, True), target) Then Return stem
+        End If
+        Dim relPath As String = StudioPathJoin(StudioPathDir(target), stem)
+        If withExtension Then relPath = target
+        Dim relative As String = StudioPathRelative(folder, relPath)
+        If Not String.StartsWith(relative, "../") And (dotPrefix Or Not quotedBefore) Then relative = "./" + relative
+        Return "\"" + relative + "\""
+    End Function
+
+    Private Function RewriteImportLine(line As String, file As StudioRefactorFile) As String
+        Dim trimmed As String = String.LTrim(line)
+        Dim indent As String = String.Left(line, String.Len(line) - String.Len(trimmed))
+        Dim prefix As String = ""
+        If String.StartsWith(String.LCase(trimmed), "public import ") Then
+            prefix = String.Left(trimmed, 7)
+            trimmed = String.Substring(trimmed, 7)
+        End If
+        If Not String.StartsWith(String.LCase(trimmed), "import ") Then Return line
+        Dim keyword As String = String.Left(trimmed, 7)
+        Dim rest As String = String.Substring(trimmed, 7)
+        Dim lead As String = ""
+        While String.StartsWith(rest, " ")
+            lead += " "
+            rest = String.Substring(rest, 1)
+        End While
+        Dim moved As Boolean = Me.IsMoved(file.RelativePath)
+        Dim oldFolder As String = StudioPathDir(file.RelativePath)
+        Dim newFolder As String = StudioPathDir(Me.NewOf(file.RelativePath))
+        Dim token As String = ""
+        Dim target As String = ""
+        Dim quoted As Boolean = String.StartsWith(rest, "\"")
+        Dim withExtension As Boolean = False
+        Dim dotPrefix As Boolean = False
+        If quoted Then
+            Dim close As Integer = String.InStr(String.Substring(rest, 1), "\"")
+            If close <= 0 Then Return line
+            token = String.Left(rest, close + 1)
+            Dim raw As String = String.Substring(token, 1, String.Len(token) - 2)
+            withExtension = String.EndsWith(String.LCase(raw), ".bui")
+            dotPrefix = String.StartsWith(raw, "./")
+            target = StudioPathJoin(oldFolder, raw)
+            If Not withExtension Then target += ".bui"
+        Else
+            Dim length As Integer = 0
+            While length < String.Len(rest) And SRIdentChar(String.Mid(rest, length + 1, 1))
+                length += 1
+            Wend
+            If length = 0 Then Return line
+            token = String.Left(rest, length)
+            Dim after As String = String.Substring(rest, length)
+            ' Package-qualified imports (Pkg.Mod) never name a project file.
+            If String.StartsWith(after, ".") And Not String.StartsWith(after, ".{") Then Return line
+            target = Me.ResolveIdentifier(oldFolder, token, False)
+            If target = "" Then Return line
+        End If
+        Dim finalTarget As String = Me.NewOf(target)
+        ' Unaffected: neither the importer nor the imported module moved.
+        If Not moved And Not Me.IsMoved(target) Then Return line
+        If moved And Not quoted And SRSame(Me.ResolveIdentifier(newFolder, token, True), finalTarget) Then Return line
+        Dim replacement As String = Me.ImportToken(newFolder, finalTarget, quoted, withExtension, dotPrefix)
+        If String.StartsWith(String.Substring(rest, String.Len(token)), ".{") And String.StartsWith(replacement, "\"") Then
+            Array.Append(Me.Warnings, "Selective import requires manual update in " + file.RelativePath)
+            Return line
+        End If
+        If replacement = token Then Return line
+        Return indent + prefix + keyword + lead + Me.ReferenceReplacement(token, replacement) + String.Substring(rest, String.Len(token))
+    End Function
+
+    ' ---- Markdown / HTML links ----
+
+    Private Function RewriteLinkTarget(link As String, file As StudioRefactorFile) As String
+        If link = "" Or String.StartsWith(link, "#") Or String.StartsWith(link, "/") Or String.Contains(link, ":") Or String.StartsWith(String.LCase(link), "mailto:") Then Return link
+        Dim suffix As String = ""
+        Dim cut As Integer = 0
+        For Each marker As String In ["#", "?"]
+            Dim at As Integer = String.InStr(link, marker)
+            If at > 0 And (cut = 0 Or at < cut) Then cut = at
+        Next
+        Dim relPath As String = link
+        If cut > 0 Then
+            relPath = String.Left(link, cut - 1)
+            suffix = String.Substring(link, cut - 1)
+        End If
+        If relPath = "" Then Return link
+        Dim moved As Boolean = Me.IsMoved(file.RelativePath)
+        Dim target As String = StudioPathJoin(StudioPathDir(file.RelativePath), relPath)
+        If Not moved And Not Me.IsMoved(target) Then Return link
+        Dim finalTarget As String = Me.NewOf(target)
+        Dim folder As String = StudioPathDir(Me.NewOf(file.RelativePath))
+        Dim relative As String = StudioPathRelative(folder, finalTarget)
+        If String.StartsWith(relPath, "./") And Not String.StartsWith(relative, "../") Then relative = "./" + relative
+        If String.Compare(relative, relPath, True) = 0 Then Return link
+        Return Me.ReferenceReplacement(link, relative + suffix)
+    End Function
+
+    ''' Rewrites the text between each opener and the closer that follows it.
+    Private Function RewriteDelimited(content As String, opener As String, closer As String, file As StudioRefactorFile) As String
+        Dim output As String = ""
+        Dim rest As String = content
+        While True
+            Dim at As Integer = String.InStr(rest, opener)
+            If at <= 0 Then Exit While
+            Dim head As String = String.Left(rest, at - 1 + String.Len(opener))
+            Dim tail As String = String.Substring(rest, at - 1 + String.Len(opener))
+            Dim close As Integer = String.InStr(tail, closer)
+            Dim newline As Integer = String.InStr(tail, "\n")
+            If close <= 0 Or (newline > 0 And newline < close) Then
+                output += head
+                rest = tail
+                Continue While
+            End If
+            Dim link As String = String.Left(tail, close - 1)
+            Dim title As String = ""
+            Dim space As Integer = String.InStr(link, " ")
+            If opener = "](" And space > 0 Then
+                title = String.Substring(link, space - 1)
+                link = String.Left(link, space - 1)
+            End If
+            output += head + Me.RewriteLinkTarget(link, file) + title
+            rest = String.Substring(tail, close - 1)
+        End While
+        Return output + rest
+    End Function
+
+    ''' Reference-style Markdown definition: `[label]: target "title"`.
+    Private Function RewriteDefinitionLine(line As String, file As StudioRefactorFile) As String
+        Dim trimmed As String = String.LTrim(line)
+        Dim indent As String = String.Left(line, String.Len(line) - String.Len(trimmed))
+        If String.Len(indent) > 3 Then Return line
+        If Not String.StartsWith(trimmed, "[") Or String.StartsWith(trimmed, "[^") Then Return line
+        Dim close As Integer = String.InStr(trimmed, "]:")
+        If close <= 0 Then Return line
+        Dim head As String = String.Left(trimmed, close + 1)
+        Dim rest As String = String.Substring(trimmed, close + 1)
+        Dim body As String = String.LTrim(rest)
+        Dim lead As String = String.Left(rest, String.Len(rest) - String.Len(body))
+        If body = "" Then Return line
+        If String.StartsWith(body, "<") Then
+            Dim endAt As Integer = String.InStr(body, ">")
+            If endAt <= 0 Then Return line
+            Dim angled As String = String.Substring(body, 1, endAt - 2)
+            Return indent + head + lead + "<" + Me.RewriteLinkTarget(angled, file) + String.Substring(body, endAt - 1)
+        End If
+        Dim space As Integer = String.InStr(body, " ")
+        If space <= 0 Then Return indent + head + lead + Me.RewriteLinkTarget(body, file)
+        Return indent + head + lead + Me.RewriteLinkTarget(String.Left(body, space - 1), file) + String.Substring(body, space - 1)
+    End Function
+
+    Private Function RewriteReferenceDefinitions(content As String, file As StudioRefactorFile) As String
+        Dim lines As Array Of String = String.Split(content, "\n")
+        For i As Integer = 0 To Array.Count(lines) - 1
+            lines(i) = Me.RewriteDefinitionLine(lines(i), file)
+        Next
+        Return String.Join(lines, "\n")
+    End Function
+
+    ''' The argument of one CSS url(...): bare, "double" or 'single' quoted.
+    Private Function RewriteCssArgument(inner As String, file As StudioRefactorFile) As String
+        Dim body As String = String.Trim(inner)
+        If body = "" Then Return inner
+        Dim lead As String = String.Left(inner, String.Len(inner) - String.Len(String.LTrim(inner)))
+        Dim trail As String = String.Substring(inner, String.Len(lead) + String.Len(body))
+        Dim quote As String = String.Left(body, 1)
+        If quote = "\"" Or quote = "'" Then
+            If String.Len(body) < 2 Or String.Mid(body, String.Len(body), 1) <> quote Then Return inner
+            Dim unquoted As String = String.Substring(body, 1, String.Len(body) - 2)
+            Return lead + quote + Me.RewriteCssTarget(unquoted, file) + quote + trail
+        End If
+        Return lead + Me.RewriteCssTarget(body, file) + trail
+    End Function
+
+    Private Function RewriteCssTarget(link As String, file As StudioRefactorFile) As String
+        ' data:, about:, etc. are never project paths.
+        If String.Contains(link, ":") Then Return link
+        Return Me.RewriteLinkTarget(link, file)
+    End Function
+
+    Private Function RewriteCssUrls(content As String, file As StudioRefactorFile) As String
+        Dim output As String = ""
+        Dim rest As String = content
+        While True
+            Dim at As Integer = String.InStr(rest, "url(")
+            If at <= 0 Then Exit While
+            Dim before As String = ""
+            If at > 1 Then before = String.Mid(rest, at - 1, 1)
+            Dim head As String = String.Left(rest, at + 3)
+            Dim tail As String = String.Substring(rest, at + 3)
+            Dim close As Integer = String.InStr(tail, ")")
+            Dim newline As Integer = String.InStr(tail, "\n")
+            If SRIdentChar(before) Or before = "-" Or close <= 0 Or (newline > 0 And newline < close) Then
+                output += head
+                rest = tail
+                Continue While
+            End If
+            output += head + Me.RewriteCssArgument(String.Left(tail, close - 1), file)
+            rest = String.Substring(tail, close - 1)
+        End While
+        Return output + rest
+    End Function
+
+    ' ---- Config / data files (paths relative to the file's folder) ----
+
+    ''' Re-points one path from a config file. Outside files only change when the path
+    ''' resolves exactly to a moved file; a moved file re-points every path that resolves
+    ''' to an existing project file.
+    Private Function RewriteConfigPath(body As String, file As StudioRefactorFile) As String
+        If body = "" Or String.StartsWith(body, "/") Or String.Contains(body, "://") Or String.Contains(body, "\\") Then Return body
+        Dim moved As Boolean = Me.IsMoved(file.RelativePath)
+        Dim target As String = StudioPathJoin(StudioPathDir(file.RelativePath), body)
+        If Not moved And Not Me.IsMoved(target) Then Return body
+        If moved And Not Me.ExistsBefore(target) Then Return body
+        Dim folder As String = StudioPathDir(Me.NewOf(file.RelativePath))
+        Dim relative As String = StudioPathRelative(folder, Me.NewOf(target))
+        If String.StartsWith(body, "./") And Not String.StartsWith(relative, "../") Then relative = "./" + relative
+        If String.Compare(relative, body, True) = 0 Then Return body
+        Return Me.ReferenceReplacement(body, relative)
+    End Function
+
+    ''' YAML unquoted scalar values (`key: ../src/Foo.bui`, `- ./x.bui`).
+    Private Function RewriteYamlBare(line As String, file As StudioRefactorFile) As String
+        Dim rest As String = String.LTrim(line)
+        If rest = "" Or String.StartsWith(rest, "#") Then Return line
+        Dim isItem As Boolean = False
+        If String.StartsWith(rest, "- ") Then
+            rest = String.LTrim(String.Substring(rest, 2))
+            isItem = True
+        End If
+        If rest = "" Then Return line
+        Dim offset As Integer = String.Len(line) - String.Len(rest)
+        If String.Contains("\"'", String.Left(rest, 1)) Then Return line
+        Dim scalar As String = rest
+        Dim colon As Integer = String.InStr(rest, ": ")
+        If colon > 0 Then
+            scalar = String.Substring(rest, colon + 1)
+            offset += colon + 1
+            Dim bare As String = String.LTrim(scalar)
+            offset += String.Len(scalar) - String.Len(bare)
+            scalar = bare
+        ElseIf Not isItem Then
+            Return line
+        End If
+        If scalar = "" Then Return line
+        If String.Contains("\"'[{|>&*!#%@`", String.Left(scalar, 1)) Then Return line
+        Dim hash As Integer = String.InStr(scalar, " #")
+        If hash > 0 Then scalar = String.Left(scalar, hash - 1)
+        scalar = String.Trim(scalar)
+        Dim updated As String = Me.RewriteConfigPath(scalar, file)
+        If updated = scalar Then Return line
+        Return String.Left(line, offset) + updated + String.Substring(line, offset + String.Len(scalar))
+    End Function
+
+    ' Returns the offset after a closing run, including its one or two content quotes.
+    ' In basic strings a backslash escapes the next character, including a quote.
+    Private Function TomlClose(line As String, startAt As Integer, quote As String) As Integer
+        Dim i As Integer = startAt
+        While i < String.Len(line)
+            Dim c As String = String.Mid(line, i + 1, 1)
+            If quote = "\"" And c = "\\" Then
+                i += 2
+                Continue While
+            End If
+            If c = quote Then
+                Dim j As Integer = i
+                While j < String.Len(line) And String.Mid(line, j + 1, 1) = quote
+                    j += 1
+                Wend
+                If j - i >= 3 Then Return j
+                i = j
+            Else
+                i += 1
+            End If
+        Wend
+        Return -1
+    End Function
+
+    Private Function RewriteConfigLine(line As String, file As StudioRefactorFile, hashComments As Boolean, toml As Boolean) As String
+        Dim count As Integer = String.Len(line)
+        Dim pieces As Array Of String = []
+        Dim copied As Integer = 0
+        Dim i As Integer = 0
+        ' Inside a TOML multi-line string from an earlier line: leave it alone.
+        If toml And Me.mTomlOpen <> "" Then
+            Dim closeAt As Integer = Me.TomlClose(line, 0, String.Left(Me.mTomlOpen, 1))
+            If closeAt < 0 Then Return line
+            i = closeAt
+            Me.mTomlOpen = ""
+        End If
+        While i < count
+            Dim c As String = String.Mid(line, i + 1, 1)
+            If hashComments And c = "#" Then
+                If i = 0 Then Exit While
+                Dim prior As String = String.Mid(line, i, 1)
+                If prior = " " Or prior = "\t" Then Exit While
+            End If
+            If c <> "\"" And c <> "'" Then
+                i += 1
+                Continue While
+            End If
+            If toml And String.Mid(line, i + 1, 3) = c + c + c Then
+                Dim tripleClose As Integer = Me.TomlClose(line, i + 3, c)
+                If tripleClose < 0 Then
+                    Me.mTomlOpen = c + c + c
+                    Exit While
+                End If
+                i = tripleClose
+                Continue While
+            End If
+            Dim j As Integer = i + 1
+            Dim endAt As Integer = -1
+            While j < count
+                Dim ch As String = String.Mid(line, j + 1, 1)
+                If ch = "\\" And c = "\"" Then
+                    j += 2
+                ElseIf ch = c Then
+                    endAt = j
+                    Exit While
+                Else
+                    j += 1
+                End If
+            End While
+            If endAt < 0 Then
+                i += 1
+                Continue While
+            End If
+            Dim body As String = String.Substring(line, i + 1, endAt - i - 1)
+            Dim updated As String = Me.RewriteConfigPath(body, file)
+            If updated <> body Then
+                pieces.Append(String.Substring(line, copied, i + 1 - copied))
+                pieces.Append(updated)
+                copied = endAt
+            End If
+            i = endAt + 1
+        End While
+        If Array.Count(pieces) = 0 Then Return line
+        pieces.Append(String.Substring(line, copied))
+        Return String.Join(pieces, "")
+    End Function
+
+    Private Function RewriteConfigFile(file As StudioRefactorFile) As String
+        Dim lower As String = String.LCase(file.RelativePath)
+        Dim hashComments As Boolean = Not String.EndsWith(lower, ".json")
+        Dim toml As Boolean = String.EndsWith(lower, ".toml")
+        Dim yaml As Boolean = String.EndsWith(lower, ".yml") Or String.EndsWith(lower, ".yaml")
+        Me.mTomlOpen = ""
+        Dim lines As Array Of String = String.Split(file.Content, "\n")
+        For i As Integer = 0 To Array.Count(lines) - 1
+            If yaml Then lines(i) = Me.RewriteYamlBare(lines(i), file)
+            lines(i) = Me.RewriteConfigLine(lines(i), file, hashComments, toml)
+        Next
+        Me.mTomlOpen = ""
+        Return String.Join(lines, "\n")
+    End Function
+
+    Public Function RewriteReferences(file As StudioRefactorFile) As String
+        If SRIsSource(file.RelativePath) Then
+            Dim lines As Array Of String = String.Split(file.Content, "\n")
+            For i As Integer = 0 To Array.Count(lines) - 1
+                lines(i) = Me.RewriteImportLine(lines(i), file)
+            Next
+            Return String.Join(lines, "\n")
+        End If
+        If SRIsConfig(file.RelativePath) Then Return Me.RewriteConfigFile(file)
+        If Not SRIsLinkDocument(file.RelativePath) Then Return file.Content
+        If SRIsCss(file.RelativePath) Then Return Me.RewriteCssUrls(file.Content, file)
+        Dim content As String = Me.RewriteDelimited(file.Content, "](", ")", file)
+        If SRIsMarkdown(file.RelativePath) Then content = Me.RewriteReferenceDefinitions(content, file)
+        For Each quote As String In ["\"", "'"]
+            For Each name As String In ["href=", "src="]
+                content = Me.RewriteDelimited(content, name + quote, quote, file)
+            Next
+        Next
+        Return content
+    End Function
+
+    ' ---- Module qualifiers ----
+
+    ''' True when file has an unaliased, non-selective import of the module at modulePath
+    ''' (`Import Foo`, `Public Import Foo`, `Import "../Foo"`), which makes `Foo.Name` legal.
+    Private Function HasUnaliasedImport(file As StudioRefactorFile, modulePath As String) As Boolean
+        Dim folder As String = StudioPathDir(file.RelativePath)
+        For Each line As String In String.Split(file.Content, "\n")
+            Dim trimmed As String = String.LTrim(line)
+            If String.StartsWith(String.LCase(trimmed), "public import ") Then trimmed = String.Substring(trimmed, 7)
+            If Not String.StartsWith(String.LCase(trimmed), "import ") Then Continue For
+            Dim rest As String = String.LTrim(String.Substring(trimmed, 7))
+            Dim after As String = ""
+            Dim target As String = ""
+            If String.StartsWith(rest, "\"") Then
+                Dim close As Integer = String.InStr(String.Substring(rest, 1), "\"")
+                If close <= 0 Then Continue For
+                Dim raw As String = String.Substring(rest, 1, close - 1)
+                after = String.Substring(rest, close + 1)
+                target = StudioPathJoin(folder, raw)
+                If Not String.EndsWith(String.LCase(raw), ".bui") Then target += ".bui"
+            Else
+                Dim length As Integer = 0
+                While length < String.Len(rest) And SRIdentChar(String.Mid(rest, length + 1, 1))
+                    length += 1
+                Wend
+                If length = 0 Then Continue For
+                after = String.Substring(rest, length)
+                target = Me.ResolveIdentifier(folder, String.Left(rest, length), False)
+            End If
+            ' Selective (.{ }) and package-qualified imports, and aliases, never expose `Foo.`.
+            If String.StartsWith(after, ".") Then Continue For
+            Dim tail As String = String.LCase(String.LTrim(after))
+            If tail = "as" Or String.StartsWith(tail, "as ") Then Continue For
+            If target <> "" And SRSame(target, modulePath) Then Return True
+        Next
+        Return False
+    End Function
+
+    ''' Rewrites `OldStem.` qualifiers on one line, skipping strings and comments.
+    ''' mBlock carries an open /* */ comment from line to line.
+    Private Function QualifyLine(line As String, oldStems As Array Of String, newStems As Array Of String) As String
+        Dim count As Integer = String.Len(line)
+        Dim lead As String = String.LCase(String.LTrim(line))
+        If Not Me.mBlock And (String.StartsWith(lead, "import ") Or String.StartsWith(lead, "public import ")) Then Return line
+        Dim pieces As Array Of String = []
+        Dim copied As Integer = 0
+        Dim i As Integer = 0
+        While i < count
+            If Me.mBlock Then
+                Dim closeAt As Integer = String.InStr(String.Substring(line, i), "*/")
+                If closeAt <= 0 Then Exit While
+                i += closeAt + 1
+                Me.mBlock = False
+                Continue While
+            End If
+            Dim c As String = String.Mid(line, i + 1, 1)
+            If c = "'" Then Exit While
+            If c = "\"" Then
+                Dim k As Integer = i + 1
+                While k < count
+                    Dim ch As String = String.Mid(line, k + 1, 1)
+                    k += 1
+                    If ch = "\\" Then
+                        k += 1
+                    ElseIf ch = "\"" Then
+                        Exit While
+                    End If
+                Wend
+                i = k
+                Continue While
+            End If
+            If c = "/" Then
+                Dim nextChar As String = String.Mid(line, i + 2, 1)
+                If nextChar = "/" Then Exit While
+                If nextChar = "*" Then
+                    Me.mBlock = True
+                    i += 2
+                    Continue While
+                End If
+                i += 1
+                Continue While
+            End If
+            If Not SRIdentChar(c) Then
+                i += 1
+                Continue While
+            End If
+            Dim j As Integer = i
+            While j < count And SRIdentChar(String.Mid(line, j + 1, 1))
+                j += 1
+            Wend
+            Dim isMember As Boolean = i > 0 And String.Mid(line, i, 1) = "."
+            If Not isMember And j < count And String.Mid(line, j + 1, 1) = "." And SRIdentChar(String.Mid(line, j + 2, 1)) Then
+                For k As Integer = 0 To Array.Count(oldStems) - 1
+                    If String.Substring(line, i, j - i) = oldStems(k) Then
+                        pieces.Append(String.Substring(line, copied, i - copied))
+                        pieces.Append(newStems(k))
+                        copied = j
+                        Exit For
+                    End If
+                Next
+            End If
+            i = j
+        Wend
+        If Array.Count(pieces) = 0 Then Return line
+        pieces.Append(String.Substring(line, copied))
+        Return String.Join(pieces, "")
+    End Function
+
+    ''' Applies one module rename's qualifier rewrite to content (file keeps its original path).
+    Private Function RewriteQualifiersMove(content As String, file As StudioRefactorFile, oldPath As String, newPath As String) As String
+        If Not SRIsSource(file.RelativePath) Or Not SRIsSource(oldPath) Or SRSame(file.RelativePath, oldPath) Then Return content
+        Dim oldStem As String = StudioPathStem(oldPath)
+        Dim newStem As String = StudioPathStem(newPath)
+        If oldStem = newStem Then Return content
+        If Not Me.HasUnaliasedImport(file, oldPath) Then Return content
+        Me.mBlock = False
+        Dim lines As Array Of String = String.Split(content, "\n")
+        For i As Integer = 0 To Array.Count(lines) - 1
+            lines(i) = Me.QualifyLine(lines(i), [oldStem], [newStem])
+        Next
+        Me.mBlock = False
+        Return String.Join(lines, "\n")
+    End Function
+
+    Private Function RewriteQualifiersIn(content As String, file As StudioRefactorFile) As String
+        If Not SRIsSource(file.RelativePath) Then Return content
+        Dim oldStems As Array Of String = []
+        Dim newStems As Array Of String = []
+        For Each item As StudioPathMove In Me.Moves
+            If Not SRIsSource(item.OldPath) Or SRSame(file.RelativePath, item.OldPath) Then Continue For
+            Dim oldStem As String = StudioPathStem(item.OldPath)
+            Dim newStem As String = StudioPathStem(item.NewPath)
+            If SRSame(oldStem, newStem) Or Not Me.HasUnaliasedImport(file, item.OldPath) Then Continue For
+            oldStems.Append(oldStem)
+            newStems.Append(newStem)
+        Next
+        Me.mBlock = False
+        Dim lines As Array Of String = String.Split(content, "\n")
+        For i As Integer = 0 To Array.Count(lines) - 1
+            lines(i) = Me.QualifyLine(lines(i), oldStems, newStems)
+        Next
+        Me.mBlock = False
+        Return String.Join(lines, "\n")
+    End Function
+
+    ''' `OldStem.Name` -> `NewStem.Name` for files with an unaliased import of a renamed
+    ''' module. Strings and comments are skipped. Offered unchecked because a class inside
+    ''' the module may share the module's name.
+    Public Function RewriteQualifiers(file As StudioRefactorFile) As String
+        Return Me.RewriteQualifiersIn(file.Content, file)
+    End Function
+
+    ' ---- Text mentions ----
+
+    ' Full paths, folder prefixes and bare file names compete at each original offset.
+    ' Prefer full paths (and the longest match), and never scan replacement text.
+    Private Function RewriteMentionsIn(content As String, masked As String) As String
+        Dim oldNames As Array Of String = []
+        Dim newNames As Array Of String = []
+        Dim pathCount As Integer = Array.Count(Me.mMentionOld)
+        For i As Integer = 0 To pathCount - 1
+            oldNames.Append(Me.mMentionOld(i))
+            newNames.Append(Me.mMentionNew(i))
+        Next
+        For Each item As StudioPathMove In Me.Moves
+            Dim oldName As String = StudioPathBase(item.OldPath)
+            Dim newName As String = StudioPathBase(item.NewPath)
+            If SRSame(oldName, newName) Then Continue For
+            oldNames.Append(oldName)
+            newNames.Append(newName)
+        Next
+        Dim output As String = ""
+        Dim i As Integer = 0
+        While i < String.Len(content)
+            Dim best As Integer = -1
+            Dim bestLength As Integer = 0
+            For k As Integer = 0 To Array.Count(oldNames) - 1
+                Dim size As Integer = String.Len(oldNames(k))
+                If size <= bestLength Then Continue For
+                If Not SRSame(String.Substring(content, i, size), oldNames(k)) Then Continue For
+                If masked <> "" Then
+                    If Not SRSame(String.Substring(masked, i, size), oldNames(k)) Then Continue For
+                End If
+                Dim before As String = ""
+                If i > 0 Then before = String.Mid(content, i, 1)
+                Dim blocked As Boolean = SRIdentChar(before) Or before = "." Or before = "-" Or before = "/"
+                If k < pathCount Then
+                    If before = "/" And i >= 2 And String.Mid(content, i - 1, 1) = "." Then
+                        Dim third As String = ""
+                        If i > 2 Then third = String.Mid(content, i - 2, 1)
+                        If third <> "." And third <> "/" And Not SRIdentChar(third) Then blocked = False
+                    End If
+                Else
+                    If SRIdentChar(String.Mid(content, i + size + 1, 1)) Then blocked = True
+                End If
+                If blocked Then Continue For
+                best = k
+                bestLength = size
+            Next
+            If best >= 0 Then
+                output += newNames(best)
+                i += bestLength
+            Else
+                output += String.Mid(content, i + 1, 1)
+                i += 1
+            End If
+        Wend
+        Return output
+    End Function
+
+    Public Function RewriteMentions(content As String) As String
+        Return Me.RewriteMentionsIn(content, "")
+    End Function
+
+    ''' Unaliased imports make `Module.Name` legal; a new stem breaks those qualifiers.
+    ''' Class names inside the module are not renamed, so these are flagged here and edited
+    ''' only through the separate, unchecked "qual:" entry.
+    Private Function QualifierNote(file As StudioRefactorFile) As String
+        Dim notes As Array Of String = []
+        For Each item As StudioPathMove In Me.Moves
+            Dim one As String = Me.QualifierNoteFor(file, item.OldPath, item.NewPath)
+            If one <> "" Then notes.Append(one)
+        Next
+        Return String.Join(notes, "\n")
+    End Function
+
+    Private Function QualifierNoteFor(file As StudioRefactorFile, oldPath As String, newPath As String) As String
+        If Not SRIsSource(file.RelativePath) Or Not SRIsSource(oldPath) Then Return ""
+        Dim oldStem As String = StudioPathStem(oldPath)
+        If SRSame(oldStem, StudioPathStem(newPath)) Then Return ""
+        Dim count As Integer = 0
+        Dim rest As String = file.Content
+        While True
+            Dim at As Integer = String.InStr(rest, oldStem + ".")
+            If at <= 0 Then Exit While
+            Dim before As String = ""
+            If at > 1 Then before = String.Mid(rest, at - 1, 1)
+            If Not SRIdentChar(before) And before <> "." Then count += 1
+            rest = String.Substring(rest, at - 1 + String.Len(oldStem) + 1)
+        Wend
+        If count = 0 Then Return ""
+        Dim newStem As String = StudioPathStem(newPath)
+        Dim note As String = "Note: " + String.From(count) + " use(s) of `" + oldStem + ".` remain."
+        If Me.RewriteQualifiersMove(file.Content, file, oldPath, newPath) <> file.Content Then
+            Return note + " A separate unchecked \"module qualifiers\" entry for this file rewrites those outside strings and comments to `" + newStem + ".`; apply it only if they qualify the module, not a class of the same name."
+        End If
+        Return note + " No separate qualifier entry is offered (no unaliased import of the module, or the uses are only in strings/comments); if they qualify the module, change them to `" + newStem + ".` by hand."
+    End Function
+End Class
+
+''' Plans moving every file under oldFolder/ to newFolder/ (project-relative folders).
+Public Function StudioPlanFolderMove(files As Array Of StudioRefactorFile, oldFolder As String, newFolder As String) As StudioFileMovePlan
+    Dim fromFolder As String = StudioPathNormalize(oldFolder)
+    Dim toFolder As String = StudioPathNormalize(newFolder)
+    Dim moves As Array Of StudioPathMove = []
+    For Each file As StudioRefactorFile In files
+        If fromFolder <> "" And Not SRUnderFolder(file.RelativePath, fromFolder) Then Continue For
+        Dim below As String = SRBelowFolder(file.RelativePath, fromFolder)
+        If toFolder = "" Then
+            moves.Append(New StudioPathMove(file.RelativePath, below))
+        Else
+            moves.Append(New StudioPathMove(file.RelativePath, toFolder + "/" + below))
+        End If
+    Next
+    Dim title As String = "Move folder " + fromFolder + " → " + toFolder
+    If SRSame(StudioPathDir(fromFolder), StudioPathDir(toFolder)) Then title = "Rename folder " + fromFolder + " → " + toFolder
+    Return New StudioFileMovePlan(files, moves, title, fromFolder, toFolder)
+End Function
+
+' ---- Undoable on-disk operation -----------------------------------------------------------
+
+''' One applied rename/move (a file, or a folder with every file in it) with the exact
+''' disk bytes of every rewritten or relocated project file, so it can be undone or redone while the disk
+''' still matches what Studio wrote.
+Public Class StudioFileOperation
+    Public Property Label As String = ""
+    ''' Position on Studio's shared undo timeline (set by the host when applied/undone).
+    Public Property Clock As Integer = 0
+    Public Property Root As String = ""
+    ''' Summary paths (the file, or the folder) before and after the operation.
+    Public Property OldPath As String = ""
+    Public Property NewPath As String = ""
+    ''' When set, the folder itself moves (with any non-project files inside it).
+    Public Property FolderOld As String = ""
+    Public Property FolderNew As String = ""
+    ''' Project files the operation relocates, pairwise.
+    Public Property MovedOld As Array Of String = []
+    Public Property MovedNew As Array Of String = []
+    ''' Project-relative paths of rewritten or relocated files, as named after the operation.
+    Public Property Paths As Array Of String = []
+    Public Property Before As Array Of String = []
+    Public Property After As Array Of String = []
+
+    Private Function Absolute(relPath As String) As String
+        Return Me.Root + "/" + relPath
+    End Function
+
+    ''' Where an after-operation path lives on the side being left (forward = before).
+    Public Function PathOnSide(afterPath As String, beforeSide As Boolean) As String
+        If Not beforeSide Then Return afterPath
+        For i As Integer = 0 To Array.Count(Me.MovedNew) - 1
+            If SRSame(Me.MovedNew(i), afterPath) Then Return Me.MovedOld(i)
+        Next
+        Return afterPath
+    End Function
+
+    ''' Undo (forward=False) or redo (forward=True). Verifies the disk first and throws
+    ''' without touching anything if another program changed the files. All-or-nothing:
+    ''' if a write or the move fails, files already written are restored.
+    Public Sub Perform(forward As Boolean)
+        If Array.Count(Me.MovedOld) <> Array.Count(Me.MovedNew) Or Array.Count(Me.Paths) <> Array.Count(Me.Before) Or Array.Count(Me.Paths) <> Array.Count(Me.After) Then Throw New InvalidArgumentException("Malformed file operation record")
+        ' Older saved receipts omitted unchanged moved payloads. Their original bytes
+        ' cannot be reconstructed later, so retain JSON compatibility but refuse mutation.
+        For Each movedPath As String In Me.MovedNew
+            Dim captured As Boolean = False
+            For Each snapshotPath As String In Me.Paths
+                If SRSame(movedPath, snapshotPath) Then captured = True
+            Next
+            If Not captured Then Throw New InvalidArgumentException("Saved file operation has no baseline for " + movedPath + "; cannot safely undo or redo")
+        Next
+        Dim sources As Array Of String = Me.MovedNew
+        Dim targets As Array Of String = Me.MovedOld
+        Dim folderFrom As String = Me.FolderNew
+        Dim folderTo As String = Me.FolderOld
+        If forward Then
+            sources = Me.MovedOld
+            targets = Me.MovedNew
+            folderFrom = Me.FolderOld
+            folderTo = Me.FolderNew
+        End If
+        If folderFrom <> "" Then
+            If Not New FileSystemItem(Me.Absolute(folderFrom)).IsFolder() Then Throw New InvalidArgumentException(folderFrom + " is no longer a folder on disk")
+            If New FileSystemItem(Me.Absolute(folderTo)).Exists() And Not SRSame(folderFrom, folderTo) Then Throw New InvalidArgumentException(folderTo + " already exists")
+        End If
+        For i As Integer = 0 To Array.Count(sources) - 1
+            If Not New FileSystemItem(Me.Absolute(sources(i))).IsFile() Then Throw New InvalidArgumentException(sources(i) + " is no longer on disk")
+            If folderFrom = "" And New FileSystemItem(Me.Absolute(targets(i))).Exists() And Not SRSame(sources(i), targets(i)) Then Throw New InvalidArgumentException(targets(i) + " already exists")
+        Next
+        Dim current As Array Of String = []
+        For i As Integer = 0 To Array.Count(Me.Paths) - 1
+            Dim relPath As String = Me.PathOnSide(Me.Paths(i), forward)
+            Dim expected As String = Me.After(i)
+            If forward Then expected = Me.Before(i)
+            If String.Compare(StudioDocumentReadUTF8(Me.Absolute(relPath)), expected, True) <> 0 Then Throw New InvalidArgumentException(relPath + " changed on disk since the operation; refused")
+            current.Append(relPath)
+        Next
+        Dim written As Integer = 0
+        Dim moved As Integer = 0
+        Try
+            For i As Integer = 0 To Array.Count(current) - 1
+                Dim replacement As String = Me.Before(i)
+                Dim expected As String = Me.After(i)
+                If forward Then
+                    replacement = Me.After(i)
+                    expected = Me.Before(i)
+                End If
+                ' Unchanged moved payloads are verification-only snapshots: preserve
+                ' their inode permissions and metadata instead of rewriting identical bytes.
+                If String.Compare(replacement, expected, True) <> 0 Then AtomicWriteText(Me.Absolute(current(i)), replacement, expected)
+                written = i + 1
+            Next
+            If folderFrom <> "" Then
+                Dim target As New FileSystemItem(Me.Absolute(folderTo))
+                If target.ParentPath() <> "" Then
+                    If Not New FileSystemItem(target.ParentPath()).CreateFolder(True) Then Throw New InvalidArgumentException("Cannot create the parent folder of " + folderTo)
+                End If
+                If Not New FileSystemItem(Me.Absolute(folderFrom)).MoveTo(target) Then Throw New InvalidArgumentException("Could not move folder " + folderFrom + " to " + folderTo)
+                moved = 1
+            Else
+                For i As Integer = 0 To Array.Count(sources) - 1
+                    Dim target As New FileSystemItem(Me.Absolute(targets(i)))
+                    If Not New FileSystemItem(target.ParentPath()).CreateFolder(True) Then Throw New InvalidArgumentException("Cannot create folder for " + targets(i))
+                    If Not New FileSystemItem(Me.Absolute(sources(i))).MoveTo(target) Then Throw New InvalidArgumentException("Could not move " + sources(i) + " to " + targets(i))
+                    moved = i + 1
+                Next
+            End If
+        Catch e As Exception
+            Dim residue As String = ""
+            If folderFrom <> "" Then
+                If moved > 0 Then
+                    If Not New FileSystemItem(Me.Absolute(folderTo)).MoveTo(New FileSystemItem(Me.Absolute(folderFrom))) Then residue += " " + folderTo
+                End If
+            Else
+                For i As Integer = moved - 1 To 0 Step -1
+                    If Not New FileSystemItem(Me.Absolute(targets(i))).MoveTo(New FileSystemItem(Me.Absolute(sources(i)))) Then residue += " " + targets(i)
+                Next
+            End If
+            For i As Integer = written - 1 To 0 Step -1
+                Dim original As String = Me.After(i)
+                Dim applied As String = Me.Before(i)
+                If forward Then
+                    original = Me.Before(i)
+                    applied = Me.After(i)
+                End If
+                Try
+                    If String.Compare(original, applied, True) <> 0 Then AtomicWriteText(Me.Absolute(current(i)), original, applied)
+                Catch rollback As Exception
+                    residue += " " + current(i)
+                End Try
+            Next
+            If residue <> "" Then Throw New InvalidArgumentException(e.Message + ". Could not restore:" + residue)
+            Throw New InvalidArgumentException(e.Message + ". No files were changed.")
+        End Try
+    End Sub
+
+    Public Function ToJSON() As JSONItem
+        Dim value As JSONItem = JSONItem.NewObject()
+        value.Value("label") = Me.Label
+        value.Value("root") = Me.Root
+        value.Value("oldPath") = Me.OldPath
+        value.Value("newPath") = Me.NewPath
+        value.Value("folderOld") = Me.FolderOld
+        value.Value("folderNew") = Me.FolderNew
+        Dim keys As Array Of String = ["movedOld", "movedNew", "paths", "before", "after"]
+        For k As Integer = 0 To Array.Count(keys) - 1
+            Dim list As Array Of String = Me.MovedOld
+            If k = 1 Then list = Me.MovedNew
+            If k = 2 Then list = Me.Paths
+            If k = 3 Then list = Me.Before
+            If k = 4 Then list = Me.After
+            Dim items As JSONItem = JSONItem.NewArray()
+            For Each entry As String In list
+                items.Add(entry)
+            Next
+            value.Value(keys(k)) = items
+        Next
+        Return value
+    End Function
+
+    Public Shared Function FromJSON(value As JSONItem) As StudioFileOperation
+        Dim operation As New StudioFileOperation()
+        operation.Label = value.Value("label").AsString().Or("")
+        operation.Root = value.Value("root").AsString().Or("")
+        operation.OldPath = value.Value("oldPath").AsString().Or("")
+        operation.NewPath = value.Value("newPath").AsString().Or("")
+        operation.FolderOld = value.Value("folderOld").AsString().Or("")
+        operation.FolderNew = value.Value("folderNew").AsString().Or("")
+        Dim keys As Array Of String = ["movedOld", "movedNew", "paths", "before", "after"]
+        For k As Integer = 0 To Array.Count(keys) - 1
+            Dim list As Array Of String = []
+            Dim items As JSONItem = value.Value(keys(k))
+            For i As Integer = 0 To items.LastRowIndex()
+                list.Append(items.ValueAt(i).AsString().Or(""))
+            Next
+            If k = 0 Then operation.MovedOld = list
+            If k = 1 Then operation.MovedNew = list
+            If k = 2 Then operation.Paths = list
+            If k = 3 Then operation.Before = list
+            If k = 4 Then operation.After = list
+        Next
+        If operation.Root = "" Or Array.Count(operation.MovedOld) <> Array.Count(operation.MovedNew) Or Array.Count(operation.Paths) <> Array.Count(operation.Before) Or Array.Count(operation.Paths) <> Array.Count(operation.After) Then Throw New InvalidArgumentException("Malformed file operation record")
+        Return operation
+    End Function
+End Class
+
+' ---- Name prompt ---------------------------------------------------------------------------
+
+Private Class PromptButton Inherits Button
+    Public Property Owner As Weak StudioTextPrompt
+    Public Property Accept As Boolean = False
+    Handle Action()
+        Dim owner As StudioTextPrompt = Me.Owner
+        If owner <> Nil Then owner.Finish(Me.Accept)
+    End Handle
+End Class
+
+''' Small modal text prompt (Rename File…).
+Public Class StudioTextPrompt Inherits Window
+    Public Property Message As Label = New Label()
+    Public Property Field As TextField = New TextField()
+    Private Property OkButton As PromptButton = New PromptButton()
+    Private Property CancelButton As PromptButton = New PromptButton()
+    Public Property Accepted As Boolean = False
+
+    Public Sub Constructor(title As String, message As String, value As String, acceptCaption As String)
+        Super.Constructor()
+        Me.Title = title
+        Me.Move(220, 200, 520, 150)
+        Me.Message.Text = message
+        Me.Message.Move(16, 14, 488, 22)
+        Me.Field.Text = value
+        Me.Field.Move(16, 44, 488, 26)
+        Me.CancelButton.Caption = "Cancel"
+        Me.CancelButton.Owner = Me
+        Me.CancelButton.Move(300, 100, 96, 30)
+        Me.OkButton.Caption = acceptCaption
+        Me.OkButton.Owner = Me
+        Me.OkButton.Accept = True
+        Me.OkButton.Move(408, 100, 96, 30)
+        Me.AddSubview(Me.Message)
+        Me.AddSubview(Me.Field)
+        Me.AddSubview(Me.CancelButton)
+        Me.AddSubview(Me.OkButton)
+    End Sub
+
+    Public Sub Finish(accept As Boolean)
+        Me.Accepted = accept
+        Me.Close()
+    End Sub
+
+    ''' Returns the entered text, or "" when cancelled.
+    Public Function Run(parent As Window) As String
+        Me.Accepted = False
+        Me.ShowModally(parent)
+        If Not Me.Accepted Then Return ""
+        Return String.Trim(Me.Field.Text)
+    End Function
+End Class

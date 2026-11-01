@@ -1,0 +1,296 @@
+' Navigator filesystem operations. UI confirmation and unsaved-buffer decisions belong to the host.
+' Delete is reversible: exact disk bytes move into the project's private .buoy/deleted store.
+#If TargetWindows Then
+    Private Optional Declare Function SNFAttributes Lib "kernel32" Alias "GetFileAttributesW" (localPath As Ptr) As UInt32
+    Private Optional Declare Function SNFMove Lib "kernel32" Alias "MoveFileW" (source As Ptr, destination As Ptr) As Int32
+    Private Optional Declare Function SNFMkdir Lib "kernel32" Alias "CreateDirectoryW" (localPath As Ptr, security As Ptr) As Int32
+#Else
+    Private Declare Function SNFReadlink Lib "c" Alias "readlink" (localPath As String, buffer As Ptr, size As UInt64) As Int64
+    #If Not TargetMac Then
+        Private Optional Declare Function SNFLinkFile Lib "c" Alias "link" (source As String, destination As String) As Int32
+    #End If
+    Private Optional Declare Function SNFUnlink Lib "c" Alias "unlink" (filePath As String) As Int32
+    Private Declare Function SNFMkdir Lib "c" Alias "mkdir" (localPath As String, mode As UInt32) As Int32
+#End If
+
+#If TargetMac Then
+    Private Declare Function SNFClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function SNFManager Lib "Foundation" Selector "defaultManager" (cls As Ptr) As Ptr
+    Private Declare Function SNFNativeLink Lib "Foundation" Selector "linkItemAtPath:toPath:error:" (manager As Ptr, source As CFStringRef, destination As CFStringRef, error As Ptr) As Boolean
+    Private Declare Sub SNFRelease Lib "CoreFoundation" Alias "CFRelease" (value As CFStringRef)
+
+    ' Foundation preserves hard-link/no-replace semantics without relying on the
+    ' missing link export in Buoy's bundled macOS libc link stub.
+    Private Function SNFLinkFile(source As String, destination As String) As Int32
+        Dim nativeSource As CFStringRef = CType(source, CFStringRef)
+        Dim nativeDestination As CFStringRef = CType(destination, CFStringRef)
+        Try
+            If SNFNativeLink(SNFManager(SNFClass("NSFileManager")), nativeSource, nativeDestination, Nil) Then Return 0
+            Return -1
+        Finally
+            SNFRelease(nativeSource)
+            SNFRelease(nativeDestination)
+        End Try
+    End Function
+#End If
+
+Private Function SNFMoveNoReplace(source As String, destination As String) As Boolean
+    #If TargetWindows Then
+        Return SNFMove(New FileSystemItem(source).Handle, New FileSystemItem(destination).Handle) <> 0
+    #Else
+        If SNFLinkFile(source, destination) <> 0 Then Return False
+        If SNFUnlink(source) = 0 Then Return True
+        SNFUnlink(destination)
+        Return False
+    #End If
+End Function
+
+Private Function SNFExact(left As String, right As String) As Boolean
+    #If TargetWindows Then
+        Return String.Compare(left, right, False) = 0
+    #Else
+        Return String.Compare(left, right, True) = 0
+    #End If
+End Function
+
+Private Function SNFLink(item As FileSystemItem) As Boolean
+    #If TargetWindows Then
+        Dim attributes As UInt32 = SNFAttributes(item.Handle)
+        If attributes = &hffffffff Then Throw New InvalidArgumentException("Cannot inspect path: " + item.FullPath())
+        Return (attributes And &h400) <> 0
+    #Else
+        Dim buffer As New Bytes()
+        buffer.Append(0)
+        Return SNFReadlink(item.FullPath(), buffer.DataPtr(), 1) >= 0
+    #End If
+End Function
+
+Private Function SNFAbsolute(localPath As String) As String
+    Dim value As String = String.Replace(localPath, "\\", "/", True)
+    If value = "" Then Throw New InvalidArgumentException("Choose an absolute local path")
+    #If TargetWindows Then
+        If String.Len(value) < 3 Then Throw New InvalidArgumentException("Choose an absolute local drive path")
+        If String.Mid(value, 2, 2) <> ":/" Then Throw New InvalidArgumentException("Choose an absolute local drive path")
+    #Else
+        If Not String.StartsWith(value, "/") Then Throw New InvalidArgumentException("Choose an absolute local path")
+    #End If
+    For Each character As String In String.Chars(value)
+        Dim code As Integer = String.Asc(character)
+        If code < 32 Or code = 127 Then Throw New InvalidArgumentException("Control character in path")
+    Next
+    For Each component As String In String.Split(value, "/")
+        If component = "." Or component = ".." Then Throw New InvalidArgumentException("Path cannot contain . or ..")
+    Next
+    Dim minimum As Integer = 1
+    #If TargetWindows Then
+        minimum = 3
+    #End If
+    While String.EndsWith(value, "/") And String.Len(value) > minimum
+        value = String.Left(value, String.Len(value) - 1)
+    End While
+    Return value
+End Function
+
+Private Sub SNFCheckExisting(localPath As String)
+    Dim item As New FileSystemItem(SNFAbsolute(localPath))
+    While item <> Nil
+        If SNFLink(item) Then Throw New InvalidArgumentException("Symlink/reparse path is not supported: " + item.FullPath())
+        If Not item.Exists() Then Throw New InvalidArgumentException("Missing path: " + item.FullPath())
+        Dim parent As FileSystemItem = item.Parent
+        If parent <> Nil Then
+            If SNFExact(parent.FullPath(), item.FullPath()) Then Exit While
+        End If
+        item = parent
+    End While
+End Sub
+
+Private Function SNFPrivate(name As String) As Boolean
+    Return SNFExact(name, ".git") Or SNFExact(name, ".hg") Or SNFExact(name, ".svn") Or SNFExact(name, ".buoy")
+End Function
+
+Private Sub SNFName(name As String)
+    If String.Trim(name) = "" Or name = "." Or name = ".." Then Throw New InvalidArgumentException("Choose a folder name")
+    If String.Contains(name, "/") Or String.Contains(name, "\\") Or String.Contains(name, ":") Then Throw New InvalidArgumentException("A name cannot contain a folder separator or colon")
+    For Each character As String In String.Chars(name)
+        Dim code As Integer = String.Asc(character)
+        If code < 32 Or code = 127 Then Throw New InvalidArgumentException("Control character in name")
+        If String.Contains("<>\"|?*", character) Then Throw New InvalidArgumentException("Unsupported character in name")
+    Next
+    If String.EndsWith(name, ".") Or String.EndsWith(name, " ") Then Throw New InvalidArgumentException("A name cannot end with a dot or space")
+    Dim stem As String = String.UCase(name)
+    Dim dot As Integer = String.IndexOf(stem, ".")
+    If dot >= 0 Then stem = String.Left(stem, dot)
+    If stem = "CON" Or stem = "PRN" Or stem = "AUX" Or stem = "NUL" Then Throw New InvalidArgumentException("Reserved device name")
+    For i As Integer = 1 To 9
+        If stem = "COM" + String.From(i) Or stem = "LPT" + String.From(i) Then Throw New InvalidArgumentException("Reserved device name")
+    Next
+    If SNFPrivate(name) Then Throw New InvalidArgumentException("Choose a folder outside the private project stores")
+End Sub
+
+''' Return a project-relative localPath, refusing traversal and paths outside root.
+Public Function StudioNavigatorRelativePath(rootPath As String, localPath As String) As String
+    Dim root As String = SNFAbsolute(rootPath)
+    Dim full As String = SNFAbsolute(localPath)
+    If SNFExact(root, full) Then Return ""
+    Dim prefix As String = root
+    If Not String.EndsWith(prefix, "/") Then prefix += "/"
+    If String.Len(full) <= String.Len(prefix) Then Throw New InvalidArgumentException("Path is outside the project")
+    If Not SNFExact(String.Left(full, String.Len(prefix)), prefix) Then Throw New InvalidArgumentException("Path is outside the project")
+    Return String.Substring(full, String.Len(prefix))
+End Function
+
+Private Sub SNFWalk(folder As FileSystemItem, relative As String, paths As Array Of String, depth As Integer, visited As Array Of Integer)
+    If depth > 64 Then Throw New InvalidArgumentException("Folder nesting exceeds 64")
+    For Each child As FileSystemItem In folder.Children()
+        visited(0) += 1
+        If visited(0) > 100000 Then Throw New InvalidArgumentException("Project inventory exceeds 100000 entries")
+        If SNFPrivate(child.Name()) Or SNFLink(child) Then Continue For
+        If Not child.IsFolder() Then Continue For
+        ' Existing names need not satisfy the portable new-folder naming policy.
+        If String.Contains(child.Name(), "\\") Or String.Contains(child.Name(), ":") Then Throw New InvalidArgumentException("Unsupported project directory name")
+        Dim name As String = child.Name()
+        If relative <> "" Then name = relative + "/" + name
+        If Array.Count(paths) >= 4096 Then Throw New InvalidArgumentException("Project exceeds 4096 folders")
+        paths.Append(name)
+        SNFWalk(child, name, paths, depth + 1, visited)
+    Next
+End Sub
+
+''' Enumerate real project directories, including empty folders. Private stores and links are skipped.
+Public Function StudioNavigatorFolders(rootPath As String) As Array Of String
+    Dim root As String = SNFAbsolute(rootPath)
+    SNFCheckExisting(root)
+    Dim folder As New FileSystemItem(root)
+    If Not folder.IsFolder() Then Throw New InvalidArgumentException("Project root is not a directory")
+    Dim paths As Array Of String = []
+    Dim visited As Array Of Integer = [0]
+    SNFWalk(folder, "", paths, 0, visited)
+    Return paths
+End Function
+
+Private Function SNFExclusiveFolder(localPath As String, privateStore As Boolean = True) As Boolean
+    #If TargetWindows Then
+        Return SNFMkdir(New FileSystemItem(localPath).Handle, Nil) <> 0
+    #Else
+        Dim mode As UInt32 = 448
+        If Not privateStore Then mode = 493
+        Return SNFMkdir(localPath, mode) = 0
+    #End If
+End Function
+
+''' Creates one new directory inside the project; refuses an existing file or folder.
+Public Function StudioNavigatorNewFolder(rootPath As String, parentPath As String, name As String) As String
+    SNFName(name)
+    Dim parent As String = SNFAbsolute(parentPath)
+    Dim relativeParent As String = StudioNavigatorRelativePath(rootPath, parent)
+    For Each component As String In String.Split(relativeParent, "/")
+        If SNFPrivate(component) Then Throw New InvalidArgumentException("Cannot create folders in private project stores")
+    Next
+    SNFCheckExisting(parent)
+    If Not New FileSystemItem(parent).IsFolder() Then Throw New InvalidArgumentException("Choose a parent folder")
+    Dim localPath As String = parent + "/" + name
+    If Not SNFExclusiveFolder(localPath, False) Then Throw New InvalidArgumentException("Cannot create folder; choose a missing writable name")
+    Return localPath
+End Function
+
+Private Function SNFReadExact(localPath As String) As String
+    Dim file As New FileSystemItem(localPath)
+    If Not file.IsFile() Or file.IsFolder() Then Throw New InvalidArgumentException("Choose a regular project file")
+    Dim size As Integer = file.Length()
+    If size < 0 Or size > 8388608 Then Throw New InvalidArgumentException("Unreadable file or file exceeds 8 MiB")
+    Dim read As Result Of String, String = file.ReadAllText()
+    If read.IsErr Then Throw New InvalidArgumentException(read.Error)
+    If Bytes.FromString(read.Value, Text.Encodings.UTF8).Count <> size Or file.Length() <> size Then Throw New InvalidArgumentException("File changed during read or is not lossless UTF-8")
+    Return read.Value
+End Function
+
+''' Receipt retained by the host for Undo Delete and rollback when reinstalling a project fails.
+Public Class StudioNavigatorDeletion
+    Public Property OriginalPath As String
+    Public Property ArchivePath As String
+    Public Property DiskText As String
+    Public Property Restored As Boolean = False
+    Public Sub Restore()
+        If Me.Restored Then Throw New InvalidArgumentException("This deletion has already been restored")
+        SNFCheckExisting(Me.ArchivePath)
+        SNFCheckExisting(New FileSystemItem(Me.OriginalPath).ParentPath())
+        If New FileSystemItem(Me.OriginalPath).Exists() Then Throw New InvalidArgumentException("Restore destination already exists")
+        If String.Compare(SNFReadExact(Me.ArchivePath), Me.DiskText, True) <> 0 Then Throw New InvalidArgumentException("Archived file changed; refusing restore")
+        If Not SNFMoveNoReplace(Me.ArchivePath, Me.OriginalPath) Then Throw New InvalidArgumentException("Could not restore deleted file")
+        Me.Restored = True
+    End Sub
+End Class
+
+''' Reversible deletion of a text file. expectedDiskText must be its accepted serialized disk baseline.
+''' Host resolves selected-file edits, confirms, captures versions, and validates the session before calling.
+Public Function StudioNavigatorDeleteFile(rootPath As String, filePath As String, expectedDiskText As String) As StudioNavigatorDeletion
+    Dim root As String = SNFAbsolute(rootPath)
+    Dim localPath As String = SNFAbsolute(filePath)
+    Dim relative As String = StudioNavigatorRelativePath(root, localPath)
+    If relative = "" Then Throw New InvalidArgumentException("Cannot delete the project root")
+    For Each component As String In String.Split(relative, "/")
+        If SNFPrivate(component) Then Throw New InvalidArgumentException("Cannot delete a private project store")
+    Next
+    SNFCheckExisting(localPath)
+    If String.Compare(SNFReadExact(localPath), expectedDiskText, True) <> 0 Then Throw New InvalidArgumentException("File changed on disk; review it before deleting")
+    Dim privateFolder As String = root + "/.buoy"
+    If Not New FileSystemItem(privateFolder).Exists() Then
+        If Not SNFExclusiveFolder(privateFolder) And Not New FileSystemItem(privateFolder).IsFolder() Then Throw New InvalidArgumentException("Cannot create project recovery store")
+    End If
+    SNFCheckExisting(privateFolder)
+    Dim deleted As String = privateFolder + "/deleted"
+    If Not New FileSystemItem(deleted).Exists() Then
+        If Not SNFExclusiveFolder(deleted) And Not New FileSystemItem(deleted).IsFolder() Then Throw New InvalidArgumentException("Cannot create deleted-file store")
+    End If
+    SNFCheckExisting(deleted)
+    Dim reservation As String = ""
+    For i As Integer = 1 To 1000
+        Dim candidate As String = deleted + "/" + String.From(System.Microseconds()) + "-" + String.From(i)
+        If SNFExclusiveFolder(candidate) Then
+            reservation = candidate
+            Exit For
+        End If
+    Next
+    If reservation = "" Then Throw New InvalidArgumentException("Cannot reserve deleted-file destination")
+    Dim receipt As New StudioNavigatorDeletion()
+    receipt.OriginalPath = localPath
+    receipt.ArchivePath = reservation + "/" + New FileSystemItem(localPath).Name()
+    receipt.DiskText = expectedDiskText
+    SNFCheckExisting(localPath)
+    If String.Compare(SNFReadExact(localPath), expectedDiskText, True) <> 0 Then Throw New InvalidArgumentException("File changed before deletion")
+    If Not SNFMoveNoReplace(localPath, receipt.ArchivePath) Then Throw New InvalidArgumentException("Cannot move the file into the deleted-file store")
+    Return receipt
+End Function
+
+Public Sub StudioNavigatorCopyPath(localPath As String)
+    Dim absolute As String = SNFAbsolute(localPath)
+    Dim clipboard As New Clipboard()
+    clipboard.Text = absolute
+    clipboard.Close()
+End Sub
+
+''' Shell-free launch description. Host retains/reaps its PipeProcess through the normal poller.
+Public Class StudioNavigatorRevealPlan
+    Public Property Executable As String
+    Public Property Arguments As Array Of String = []
+End Class
+
+Public Function StudioNavigatorReveal(localPath As String) As StudioNavigatorRevealPlan
+    Dim absolute As String = SNFAbsolute(localPath)
+    SNFCheckExisting(absolute)
+    Dim plan As New StudioNavigatorRevealPlan()
+    #If TargetMac Then
+        plan.Executable = "/usr/bin/open"
+        plan.Arguments = ["-R", absolute]
+    #ElseIf TargetWindows Then
+        Dim windows As String = System.EnvironmentVariable("WINDIR").Or("C:\\Windows")
+        plan.Executable = windows + "\\explorer.exe"
+        plan.Arguments = ["/select,", String.Replace(absolute, "/", "\\", True)]
+    #Else
+        plan.Executable = "/usr/bin/xdg-open"
+        Dim parent As String = absolute
+        If Not New FileSystemItem(parent).IsFolder() Then parent = New FileSystemItem(parent).ParentPath()
+        plan.Arguments = [parent]
+    #End If
+    Return plan
+End Function

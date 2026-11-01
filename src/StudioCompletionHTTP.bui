@@ -1,0 +1,176 @@
+Import StudioCompletionSettings
+
+Public Function StudioCompletionBase(value As String) As String
+    If String.Contains(value, "?") Or String.Contains(value, "#") Or String.Contains(value, "\\") Or String.Contains(value, "%") Then Throw New InvalidArgumentException("Invalid completion server URL")
+    For Each character As String In String.Chars(value)
+        If String.Asc(character) <= 32 Or String.Asc(character) = 127 Then Throw New InvalidArgumentException("Invalid completion server URL")
+    Next
+    Dim scheme As String = "https://"
+    If String.StartsWith(value, "http://", True) Then scheme = "http://"
+    If Not String.StartsWith(value, scheme, True) Then Throw New InvalidArgumentException("Completion server requires HTTPS or loopback HTTP")
+    Dim authority As String = String.Split(String.Substring(value, String.Len(scheme)), "/")(0)
+    If authority = "" Or String.Contains(authority, "@") Then Throw New InvalidArgumentException("Invalid completion server authority")
+    If scheme = "http://" Then
+        Dim host As String = String.Split(authority, ":")(0)
+        If host <> "localhost" And host <> "127.0.0.1" And host <> "::1" And host <> "[::1]" Then Throw New InvalidArgumentException("HTTP completion servers must use localhost or 127.0.0.1")
+    End If
+    While String.EndsWith(value, "/", True)
+        value = String.Left(value, String.Len(value) - 1)
+    End While
+    Return value
+End Function
+
+''' Exact provider wire contracts, also used by offline protocol tests.
+Public Function StudioCompletionBody(provider As String, model As String, prefix As String, suffix As String, language As String, filePath As String) As JSONItem
+    Dim body As JSONItem = JSONItem.NewObject()
+    If provider = "tabby" Then
+        Dim segments As JSONItem = JSONItem.NewObject()
+        segments.Value("prefix") = prefix
+        segments.Value("suffix") = suffix
+        segments.Value("filepath") = filePath
+        body.Value("segments") = segments
+        body.Value("language") = language
+    ElseIf provider = "codestral" Or provider = "ollama" Then
+        If String.Trim(model) = "" Then Throw New InvalidArgumentException("Choose a fill-in-the-middle completion model in Preferences")
+        body.Value("model") = model
+        body.Value("prompt") = prefix
+        body.Value("suffix") = suffix
+        body.Value("stream") = False
+        If provider = "codestral" Then
+            body.Value("max_tokens") = 128
+            body.Value("temperature") = 0.0
+        Else
+            Dim options As JSONItem = JSONItem.NewObject()
+            options.Value("num_predict") = 128
+            options.Value("temperature") = 0.0
+            body.Value("options") = options
+            body.Value("keep_alive") = "5m"
+        End If
+    Else
+        Throw New InvalidArgumentException("Unknown completion provider")
+    End If
+    Return body
+End Function
+
+Public Function StudioCompletionText(provider As String, reply As JSONItem) As String
+    Dim value As String
+    If provider = "ollama" Then
+        value = reply.Value("response").AsString().Or("")
+    Else
+        Dim choices As JSONItem = reply.Value("choices")
+        If Not choices.IsArray() Or choices.Count() = 0 Then Return ""
+        value = choices.ValueAt(0).Value("text").AsString().Or("")
+        If provider = "codestral" And value = "" Then value = choices.ValueAt(0).Value("message").Value("content").AsString().Or("")
+    End If
+    If String.Len(value) > 8192 Or String.Contains(value, "```") Then Return ""
+    Return value
+End Function
+
+Private Class CompletionRound
+    Public Property Body As String
+    Public Property URL As String
+    Public Property Token As String
+    Public Property Provider As String
+    Public Property Text As String
+    Public Property ErrorText As String
+    Public Property Work As Task
+    Public Property KeepAlive As CompletionRound
+End Class
+
+Private Sub RunCompletion(pointer As Ptr)
+    Dim operation As CompletionRound = CType(pointer, CompletionRound)
+    Try
+        Dim connection As New URLConnection()
+        connection.Timeout = 10
+        connection.ConnectionTimeout = 5
+        connection.FollowRedirects = False
+        connection.VerifySSL = True
+        connection.RequestHeaders.Set("Content-Type", "application/json")
+        If operation.Token <> "" Then connection.RequestHeaders.Set("Authorization", "Bearer " + operation.Token)
+        Dim reply As String = connection.Post(operation.URL, operation.Body)
+        If connection.HTTPStatus < 200 Or connection.HTTPStatus > 299 Then
+            operation.ErrorText = "Completion server returned HTTP " + String.From(connection.HTTPStatus)
+        ElseIf Bytes.FromString(reply, Text.Encodings.UTF8).Count > 1048576 Then
+            operation.ErrorText = "Completion response exceeded 1 MiB"
+        Else
+            Dim parsed As Optional Of JSONItem = Json.TryParse(reply)
+            If Not parsed.HasValue Then
+                operation.ErrorText = "Completion server returned invalid JSON"
+            Else
+                operation.Text = StudioCompletionText(operation.Provider, parsed.Value)
+            End If
+        End If
+    Catch e As Exception
+        operation.ErrorText = "Completion request failed; check the server, model and credentials"
+    End Try
+    operation.Token = ""
+    operation.KeepAlive = Nil
+End Sub
+
+''' At most one HTTP task runs at a time, including cancelled requests.
+Public Class StudioCompletionHTTP
+    Private Property Current As CompletionRound
+    Private Property Cancelled As Boolean = False
+    Public Property Text As String
+    Public Property ErrorText As String
+    Public Property Done As Boolean = False
+
+    Public Function Busy() As Boolean
+        Return Me.Current <> Nil
+    End Function
+
+    Public Sub Start(provider As String, prefix As String, suffix As String, language As String, filePath As String)
+        If Me.Current <> Nil Then Throw New InvalidArgumentException("Previous completion request is still finishing")
+        Dim base As String
+        Dim model As String
+        Dim route As String
+        Dim token As String
+        Select Case provider
+            Case "codestral"
+                base = System.EnvironmentVariable("BUOY_STUDIO_CODESTRAL_BASE").Or(StudioCompletionSettings.CodestralBase)
+                model = System.EnvironmentVariable("BUOY_STUDIO_CODESTRAL_MODEL").Or(StudioCompletionSettings.CodestralModel)
+                token = System.EnvironmentVariable("BUOY_STUDIO_CODESTRAL_TOKEN").Or(System.EnvironmentVariable("MISTRAL_API_KEY").Or(""))
+                If token = "" Then Throw New InvalidArgumentException("Set MISTRAL_API_KEY for Codestral autocomplete")
+                route = "/v1/fim/completions"
+            Case "ollama"
+                base = System.EnvironmentVariable("BUOY_STUDIO_OLLAMA_BASE").Or(StudioCompletionSettings.OllamaBase)
+                model = System.EnvironmentVariable("BUOY_STUDIO_OLLAMA_MODEL").Or(StudioCompletionSettings.OllamaModel)
+                route = "/api/generate"
+            Case "tabby"
+                base = System.EnvironmentVariable("BUOY_STUDIO_TABBY_BASE").Or(StudioCompletionSettings.TabbyBase)
+                token = System.EnvironmentVariable("BUOY_STUDIO_TABBY_TOKEN").Or("")
+                route = "/v1/completions"
+            Case Else
+                Throw New InvalidArgumentException("Unknown completion provider")
+        End Select
+        Dim operation As New CompletionRound()
+        operation.URL = StudioCompletionBase(base) + route
+        operation.Body = Json.Stringify(StudioCompletionBody(provider, model, prefix, suffix, language, filePath))
+        operation.Token = token
+        operation.Provider = provider
+        operation.KeepAlive = operation
+        Me.Text = ""
+        Me.ErrorText = ""
+        Me.Done = False
+        Me.Cancelled = False
+        Me.Current = operation
+        operation.Work = Task.RunWithArg(AddressOf RunCompletion, CType(operation, Ptr))
+    End Sub
+
+    Public Sub Cancel()
+        Me.Cancelled = True
+        Me.Done = False
+        Me.Text = ""
+    End Sub
+
+    Public Sub Poll()
+        If Me.Current = Nil Then Return
+        If Not Me.Current.Work.IsComplete() Then Return
+        If Not Me.Cancelled Then
+            Me.Text = Me.Current.Text
+            Me.ErrorText = Me.Current.ErrorText
+            Me.Done = True
+        End If
+        Me.Current = Nil
+    End Sub
+End Class

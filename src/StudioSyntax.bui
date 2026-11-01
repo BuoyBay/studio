@@ -1,0 +1,1114 @@
+' Buoy lexical highlighting for Studio's source editor.
+' Token classes and vocabulary mirror the documentation viewer's `highlightTokens`
+' (documentation.html) and libraries/buoy-highlighting/vocabulary.mjs, so source
+' code looks the same in the editor and in the documentation. Lexical only: no
+' semantic validation. Pure data; no GUI dependency.
+
+Public Enum StudioTokenKind As Integer
+    Plain = 0
+    Comment = 1
+    Keyword = 2
+    TypeName = 3
+    Text = 4
+    Number = 5
+    Directive = 6
+    FunctionName = 7
+    Literal = 8
+    Punctuation = 9
+    ColorLiteral = 10
+End Enum
+
+''' One highlighted run: codepoint `Start` and `Length` within its line.
+Public Class StudioSyntaxToken
+    Public Property Start As Integer
+    Public Property Length As Integer
+    Public Property Kind As StudioTokenKind
+
+    Public Sub Constructor(start As Integer, length As Integer, kind As StudioTokenKind)
+        Me.Start = start
+        Me.Length = length
+        Me.Kind = kind
+    End Sub
+End Class
+
+''' The tokens of one line plus the block-comment state entering and leaving it.
+''' Whitespace is not tokenized; every other character belongs to exactly one token.
+Public Class StudioSyntaxLine
+    Public Property Tokens As Array Of StudioSyntaxToken = []
+    Public Property StartsInComment As Boolean = False
+    Public Property EndsInComment As Boolean = False
+    Public Property Source As String = ""
+    Public Property SpellingKey As String = ""
+    Public Property LanguageMode As String = "buoy"
+End Class
+
+Private Class StudioSyntaxWords
+    Public Shared Property Ready As Boolean = False
+    Public Shared Property Kinds As Map Of String, Integer = New Map Of String, Integer()
+
+    Public Shared Sub Prepare()
+        If StudioSyntaxWords.Ready Then Return
+        StudioSyntaxWords.Ready = True
+        ' Order matters: literals win over keywords, keywords over types (as in the viewer).
+        StudioSyntaxWords.AddWords("integer double string boolean single byte int8 uint8 int16 uint16 int32 uint32 int64 uint64 ptr bytes array optional result map object color datetime variant jsonitem window view control timer picture cfstringref cstring closure currency", 3)
+        StudioSyntaxWords.AddWords("addhandler addressof and as byref byval call case catch class const constant constructor destructor continue declare default defined delegate destructor dim do each else elseif end enum event exit false finally flags for function get handle if implements import in inherits interface is isa lambda lib loop mod new next not of operator optional or overrides packed paramarray private property protected public raise readonly assigns async await redim return select selector sequential set shared static step structure sub super then throw to try trycast ctype until var weak wend when while with xor alias raiseevent partial internal", 2)
+        StudioSyntaxWords.AddWords("true false nil me", 8)
+    End Sub
+
+    Private Shared Sub AddWords(words As String, kind As Integer)
+        For Each word As String In String.Split(words, " ")
+            If word <> "" Then StudioSyntaxWords.Kinds.Set(word, kind)
+        Next
+    End Sub
+End Class
+
+''' Classifies a bare word exactly as the editor does when no context applies:
+''' Keyword, TypeName, Literal or Plain.
+Public Function StudioWordKind(word As String) As StudioTokenKind
+    StudioSyntaxWords.Prepare()
+    Dim key As String = String.LCase(word)
+    If StudioSyntaxWords.Kinds.ContainsKey(key) Then Return CType(StudioSyntaxWords.Kinds.Get(key).Value, StudioTokenKind)
+    Return StudioTokenKind.Plain
+End Function
+
+''' The documentation viewer's CSS class for a token kind ("t-kw", "t-com", ...).
+Public Function StudioTokenClass(kind As StudioTokenKind) As String
+    Select Case kind
+    Case StudioTokenKind.Comment
+        Return "t-com"
+    Case StudioTokenKind.Keyword
+        Return "t-kw"
+    Case StudioTokenKind.TypeName
+        Return "t-type"
+    Case StudioTokenKind.Text
+        Return "t-str"
+    Case StudioTokenKind.Number
+        Return "t-num"
+    Case StudioTokenKind.Directive
+        Return "t-pre"
+    Case StudioTokenKind.FunctionName
+        Return "t-fn"
+    Case StudioTokenKind.Literal
+        Return "t-lit"
+    Case StudioTokenKind.Punctuation
+        Return "t-punc"
+    Case StudioTokenKind.ColorLiteral
+        Return "t-color"
+    End Select
+    Return ""
+End Function
+
+Private Function SyntaxIsWordStart(code As Integer) As Boolean
+    Return (code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or code = 95
+End Function
+
+Private Function SyntaxIsDigit(code As Integer) As Boolean
+    Return code >= 48 And code <= 57
+End Function
+
+Private Function SyntaxIsWord(code As Integer) As Boolean
+    Return SyntaxIsWordStart(code) Or SyntaxIsDigit(code)
+End Function
+
+Private Function SyntaxIsMark(code As Integer) As Boolean
+    Return code >= &h0300 And StudioCellWidth(code) = 0
+End Function
+
+Private Function SyntaxIsHex(code As Integer) As Boolean
+    Return SyntaxIsDigit(code) Or (code >= 65 And code <= 70) Or (code >= 97 And code <= 102)
+End Function
+
+Private Function SyntaxIsSpace(code As Integer) As Boolean
+    Return code = 32 Or code = 9 Or code = 13 Or code = 12
+End Function
+
+Private Function SyntaxIsPunctuation(code As Integer) As Boolean
+    Select Case code
+    Case 40, 41, 91, 93, 123, 125, 46, 44, 58, 59, 61, 60, 62, 43, 45, 42, 47, 92, 94, 38, 124, 33, 63
+        Return True
+    End Select
+    Return False
+End Function
+
+Private Function SyntaxCodes(line As String) As Array Of Integer
+    Dim codes As Array Of Integer = []
+    For Each ch As String In String.Chars(line)
+        Array.Append(codes, String.Asc(ch))
+    Next
+    Return codes
+End Function
+
+Private Function SyntaxFindBlockEnd(codes As Array Of Integer, start As Integer) As Integer
+    Dim i As Integer = start
+    While i + 1 < Array.Count(codes)
+        If codes(i) = 42 And codes(i + 1) = 47 Then Return i
+        i += 1
+    End While
+    Return -1
+End Function
+
+''' Length of an `&c` colour literal starting at `i` (8 or 6 hex digits followed by a
+''' word boundary), or 0.
+Private Function SyntaxColorLength(codes As Array Of Integer, i As Integer) As Integer
+    Dim n As Integer = Array.Count(codes)
+    If i + 1 >= n Then Return 0
+    If codes(i) <> 38 Or (codes(i + 1) <> 99 And codes(i + 1) <> 67) Then Return 0
+    Dim digits As Integer = 0
+    While i + 2 + digits < n
+        If Not SyntaxIsHex(codes(i + 2 + digits)) Then Exit While
+        digits += 1
+    End While
+    For Each wanted As Integer In [8, 6]
+        If digits >= wanted Then
+            Dim after As Integer = i + 2 + wanted
+            If after >= n Then Return wanted + 2
+            If Not SyntaxIsWord(codes(after)) Then Return wanted + 2
+        End If
+    Next
+    Return 0
+End Function
+
+''' Length of an `&h`/`&b`/`&o` integer literal starting at `i`, or 0.
+Private Function SyntaxRadixLength(codes As Array Of Integer, i As Integer) As Integer
+    Dim n As Integer = Array.Count(codes)
+    If i + 2 >= n Or codes(i) <> 38 Then Return 0
+    Dim marker As Integer = codes(i + 1)
+    If marker <> 104 And marker <> 72 And marker <> 98 And marker <> 66 And marker <> 111 And marker <> 79 Then Return 0
+    Dim j As Integer = i + 2
+    While j < n
+        If Not (SyntaxIsHex(codes(j)) Or codes(j) = 95) Then Exit While
+        j += 1
+    End While
+    If j = i + 2 Then Return 0
+    If j < n Then
+        If SyntaxIsWord(codes(j)) Then Return 0
+    End If
+    Return j - i
+End Function
+
+Private Function SyntaxNumberEnd(codes As Array Of Integer, i As Integer) As Integer
+    Dim n As Integer = Array.Count(codes)
+    Dim j As Integer = i
+    While j < n
+        If Not (SyntaxIsDigit(codes(j)) Or codes(j) = 95) Then Exit While
+        j += 1
+    End While
+    If j + 1 < n Then
+        If codes(j) = 46 And SyntaxIsDigit(codes(j + 1)) Then
+            j += 1
+            While j < n
+                If Not SyntaxIsDigit(codes(j)) Then Exit While
+                j += 1
+            End While
+        End If
+    End If
+    If j + 1 < n Then
+        If codes(j) = 101 Or codes(j) = 69 Then
+            Dim k As Integer = j + 1
+            If codes(k) = 43 Or codes(k) = 45 Then k += 1
+            If k < n Then
+                If SyntaxIsDigit(codes(k)) Then
+                    j = k
+                    While j < n
+                        If Not SyntaxIsDigit(codes(j)) Then Exit While
+                        j += 1
+                    End While
+                End If
+            End If
+        End If
+    End If
+    Return j
+End Function
+
+Private Function SyntaxStartsComment(codes As Array Of Integer, i As Integer) As Boolean
+    If codes(i) = 39 Then Return True
+    If codes(i) = 47 And i + 1 < Array.Count(codes) Then Return codes(i + 1) = 47 Or codes(i + 1) = 42
+    Return False
+End Function
+
+Private Function SyntaxLowerSlice(codes As Array Of Integer, start As Integer, length As Integer) As String
+    Dim text As String = ""
+    For i As Integer = start To start + length - 1
+        Dim code As Integer = codes(i)
+        If code >= 65 And code <= 90 Then code += 32
+        text += String.Chr(code)
+    Next
+    Return text
+End Function
+
+''' Tokenizes one line. `inComment` is True when the line starts inside a `/* */` block.
+Public Function StudioTokenizeLine(line As String, inComment As Boolean) As StudioSyntaxLine
+    StudioSyntaxWords.Prepare()
+    Dim info As New StudioSyntaxLine()
+    info.Source = line
+    info.StartsInComment = inComment
+    Dim codes As Array Of Integer = SyntaxCodes(line)
+    Dim n As Integer = Array.Count(codes)
+    Dim i As Integer = 0
+    If inComment Then
+        Dim close As Integer = SyntaxFindBlockEnd(codes, 0)
+        If close < 0 Then
+            If n > 0 Then Array.Append(info.Tokens, New StudioSyntaxToken(0, n, StudioTokenKind.Comment))
+            info.EndsInComment = True
+            Return info
+        End If
+        Array.Append(info.Tokens, New StudioSyntaxToken(0, close + 2, StudioTokenKind.Comment))
+        i = close + 2
+    End If
+    Dim firstContent As Boolean = True
+    Dim lastWord As String = ""
+    While i < n
+        Dim code As Integer = codes(i)
+        If SyntaxIsSpace(code) Then
+            i += 1
+            Continue While
+        End If
+        Dim leading As Boolean = firstContent
+        firstContent = False
+        If code = 34 Then
+            Dim j As Integer = i + 1
+            While j < n
+                If codes(j) = 92 Then
+                    j += 2
+                ElseIf codes(j) = 34 Then
+                    j += 1
+                    Exit While
+                Else
+                    j += 1
+                End If
+            End While
+            j = Math.Min(j, n)
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Text))
+            lastWord = ""
+            i = j
+        ElseIf code = 39 Or (code = 47 And i + 1 < n And codes(Math.Min(i + 1, n - 1)) = 47) Then
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, n - i, StudioTokenKind.Comment))
+            i = n
+        ElseIf code = 47 And i + 1 < n And codes(Math.Min(i + 1, n - 1)) = 42 Then
+            Dim close As Integer = SyntaxFindBlockEnd(codes, i + 2)
+            If close < 0 Then
+                Array.Append(info.Tokens, New StudioSyntaxToken(i, n - i, StudioTokenKind.Comment))
+                info.EndsInComment = True
+                Return info
+            End If
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, close + 2 - i, StudioTokenKind.Comment))
+            i = close + 2
+        ElseIf code = 35 And leading And i + 1 < n And SyntaxIsWordStart(codes(Math.Min(i + 1, n - 1))) Then
+            Dim j As Integer = i + 1
+            While j < n
+                If Not ((codes(j) >= 65 And codes(j) <= 90) Or (codes(j) >= 97 And codes(j) <= 122)) Then Exit While
+                j += 1
+            End While
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Directive))
+            lastWord = ""
+            i = j
+        ElseIf code = 38 And SyntaxColorLength(codes, i) > 0 Then
+            Dim length As Integer = SyntaxColorLength(codes, i)
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, length, StudioTokenKind.ColorLiteral))
+            lastWord = ""
+            i += length
+        ElseIf code = 38 And SyntaxRadixLength(codes, i) > 0 Then
+            Dim length As Integer = SyntaxRadixLength(codes, i)
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, length, StudioTokenKind.Number))
+            lastWord = ""
+            i += length
+        ElseIf SyntaxIsDigit(code) Then
+            Dim j As Integer = SyntaxNumberEnd(codes, i)
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Number))
+            lastWord = ""
+            i = j
+        ElseIf SyntaxIsWordStart(code) Then
+            Dim j As Integer = i + 1
+            While j < n
+                ' Combining marks stay with the letter they decorate (one drawn cluster).
+                If Not SyntaxIsWord(codes(j)) And Not SyntaxIsMark(codes(j)) Then Exit While
+                j += 1
+            End While
+            Dim word As String = SyntaxLowerSlice(codes, i, j - i)
+            If word = "rem" And leading Then
+                Array.Append(info.Tokens, New StudioSyntaxToken(i, n - i, StudioTokenKind.Comment))
+                i = n
+                Continue While
+            End If
+            Dim kind As StudioTokenKind = StudioTokenKind.Plain
+            If StudioSyntaxWords.Kinds.ContainsKey(word) Then
+                kind = CType(StudioSyntaxWords.Kinds.Get(word).Value, StudioTokenKind)
+            ElseIf j < n And codes(Math.Min(j, n - 1)) = 40 Then
+                kind = StudioTokenKind.FunctionName
+            ElseIf lastWord = "sub" Or lastWord = "function" Then
+                kind = StudioTokenKind.FunctionName
+            ElseIf code >= 65 And code <= 90 And lastWord = "as" Then
+                kind = StudioTokenKind.TypeName
+            End If
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, j - i, kind))
+            lastWord = word
+            i = j
+        ElseIf SyntaxIsPunctuation(code) Then
+            Dim j As Integer = i + 1
+            While j < n
+                If Not SyntaxIsPunctuation(codes(j)) Then Exit While
+                If SyntaxStartsComment(codes, j) Then Exit While
+                If codes(j) = 38 And (SyntaxColorLength(codes, j) > 0 Or SyntaxRadixLength(codes, j) > 0) Then Exit While
+                j += 1
+            End While
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Punctuation))
+            lastWord = ""
+            i = j
+        Else
+            ' Non-ASCII text and other symbols: one plain run up to the next boundary.
+            Dim j As Integer = i + 1
+            While j < n
+                If codes(j) < 128 Then Exit While
+                j += 1
+            End While
+            Array.Append(info.Tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Plain))
+            lastWord = ""
+            i = j
+        End If
+    End While
+    Return info
+End Function
+
+''' Block-comment state after `line`, without building tokens. Lines with no `/*`,
+''' `*/` take a fast path, so scanning thousands of lines stays cheap.
+Public Function StudioCommentStateAfter(line As String, inComment As Boolean) As Boolean
+    If inComment Then
+        If Not String.Contains(line, "*/") Then Return True
+    ElseIf Not String.Contains(line, "/*") Then
+        Return False
+    End If
+    Return StudioTokenizeLine(line, inComment).EndsInComment
+End Function
+
+''' Debug/test helper: "class:text" pairs separated by spaces, plain tokens as "text".
+Public Function StudioDescribeTokens(line As StudioSyntaxLine) As String
+    Dim parts As Array Of String = []
+    For Each token As StudioSyntaxToken In line.Tokens
+        Dim piece As String = String.Substring(line.Source, token.Start, token.Length)
+        Dim cls As String = StudioTokenClass(token.Kind)
+        If cls = "" Then
+            Array.Append(parts, piece)
+        Else
+            Array.Append(parts, cls + ":" + piece)
+        End If
+    Next
+    Return String.Join(parts, " ")
+End Function
+
+' ---- Unicode cells -------------------------------------------------------------------
+
+Private Function SyntaxInRanges(code As Integer, ranges As Array Of Integer) As Boolean
+    Dim i As Integer = 0
+    While i + 1 < Array.Count(ranges)
+        If code < ranges(i) Then Return False
+        If code <= ranges(i + 1) Then Return True
+        i += 2
+    End While
+    Return False
+End Function
+
+Private Class StudioCellTables
+    Public Shared Property Ready As Boolean = False
+    Public Shared Property ZeroWidth As Array Of Integer = []
+    Public Shared Property Wide As Array Of Integer = []
+    Public Shared Property Pictographic As Array Of Integer = []
+    Public Shared Property Extend As Array Of Integer = []
+    Public Shared Property Control As Array Of Integer = []
+
+    Public Shared Sub Prepare()
+        If StudioCellTables.Ready Then Return
+        StudioCellTables.Ready = True
+        ' Unicode 17.0 emoji-data/GraphemeBreakProperty, Unicode License V3
+        ' (bundled unicode-LICENSE.txt). Exact GB11 context; cell widths remain approximate.
+        StudioCellTables.Pictographic = [&hA9, &hA9, &hAE, &hAE, &h203C, &h203C, &h2049, &h2049, &h2122, &h2122, &h2139, &h2139, &h2194, &h2199, &h21A9, &h21AA, &h231A, &h231B, &h2328, &h2328, &h23CF, &h23CF, &h23E9, &h23F3, &h23F8, &h23FA, &h24C2, &h24C2, &h25AA, &h25AB, &h25B6, &h25B6, &h25C0, &h25C0, &h25FB, &h25FE, &h2600, &h2604, &h260E, &h260E, &h2611, &h2611, &h2614, &h2615, &h2618, &h2618, &h261D, &h261D, &h2620, &h2620, &h2622, &h2623, &h2626, &h2626, &h262A, &h262A, &h262E, &h262F, &h2638, &h263A, &h2640, &h2640, &h2642, &h2642, &h2648, &h2653, &h265F, &h2660, &h2663, &h2663, &h2665, &h2666, &h2668, &h2668, &h267B, &h267B, &h267E, &h267F, &h2692, &h2697, &h2699, &h2699, &h269B, &h269C, &h26A0, &h26A1, &h26A7, &h26A7, &h26AA, &h26AB, &h26B0, &h26B1, &h26BD, &h26BE, &h26C4, &h26C5, &h26C8, &h26C8, &h26CE, &h26CF, &h26D1, &h26D1, &h26D3, &h26D4, &h26E9, &h26EA, &h26F0, &h26F5, &h26F7, &h26FA, &h26FD, &h26FD, &h2702, &h2702, &h2705, &h2705, &h2708, &h270D, &h270F, &h270F, &h2712, &h2712, &h2714, &h2714, &h2716, &h2716, &h271D, &h271D, &h2721, &h2721, &h2728, &h2728, &h2733, &h2734, &h2744, &h2744, &h2747, &h2747, &h274C, &h274C, &h274E, &h274E, &h2753, &h2755, &h2757, &h2757, &h2763, &h2764, &h2795, &h2797, &h27A1, &h27A1, &h27B0, &h27B0, &h27BF, &h27BF, &h2934, &h2935, &h2B05, &h2B07, &h2B1B, &h2B1C, &h2B50, &h2B50, &h2B55, &h2B55, &h3030, &h3030, &h303D, &h303D, &h3297, &h3297, &h3299, &h3299, &h1F004, &h1F004, &h1F02C, &h1F02F, &h1F094, &h1F09F, &h1F0AF, &h1F0B0, &h1F0C0, &h1F0C0, &h1F0CF, &h1F0D0, &h1F0F6, &h1F0FF, &h1F170, &h1F171, &h1F17E, &h1F17F, &h1F18E, &h1F18E, &h1F191, &h1F19A, &h1F1AE, &h1F1E5, &h1F201, &h1F20F, &h1F21A, &h1F21A, &h1F22F, &h1F22F, &h1F232, &h1F23A, &h1F23C, &h1F23F, &h1F249, &h1F25F, &h1F266, &h1F321, &h1F324, &h1F393, &h1F396, &h1F397, &h1F399, &h1F39B, &h1F39E, &h1F3F0, &h1F3F3, &h1F3F5, &h1F3F7, &h1F3FA, &h1F400, &h1F4FD, &h1F4FF, &h1F53D, &h1F549, &h1F54E, &h1F550, &h1F567, &h1F56F, &h1F570, &h1F573, &h1F57A, &h1F587, &h1F587, &h1F58A, &h1F58D, &h1F590, &h1F590, &h1F595, &h1F596, &h1F5A4, &h1F5A5, &h1F5A8, &h1F5A8, &h1F5B1, &h1F5B2, &h1F5BC, &h1F5BC, &h1F5C2, &h1F5C4, &h1F5D1, &h1F5D3, &h1F5DC, &h1F5DE, &h1F5E1, &h1F5E1, &h1F5E3, &h1F5E3, &h1F5E8, &h1F5E8, &h1F5EF, &h1F5EF, &h1F5F3, &h1F5F3, &h1F5FA, &h1F64F, &h1F680, &h1F6C5, &h1F6CB, &h1F6D2, &h1F6D5, &h1F6E5, &h1F6E9, &h1F6E9, &h1F6EB, &h1F6F0, &h1F6F3, &h1F6FF, &h1F7DA, &h1F7FF, &h1F80C, &h1F80F, &h1F848, &h1F84F, &h1F85A, &h1F85F, &h1F888, &h1F88F, &h1F8AE, &h1F8AF, &h1F8BC, &h1F8BF, &h1F8C2, &h1F8CF, &h1F8D9, &h1F8FF, &h1F90C, &h1F93A, &h1F93C, &h1F945, &h1F947, &h1F9FF, &h1FA58, &h1FA5F, &h1FA6E, &h1FAFF, &h1FC00, &h1FFFD]
+        StudioCellTables.Extend = [&h300, &h36F, &h483, &h489, &h591, &h5BD, &h5BF, &h5BF, &h5C1, &h5C2, &h5C4, &h5C5, &h5C7, &h5C7, &h610, &h61A, &h64B, &h65F, &h670, &h670, &h6D6, &h6DC, &h6DF, &h6E4, &h6E7, &h6E8, &h6EA, &h6ED, &h711, &h711, &h730, &h74A, &h7A6, &h7B0, &h7EB, &h7F3, &h7FD, &h7FD, &h816, &h819, &h81B, &h823, &h825, &h827, &h829, &h82D, &h859, &h85B, &h897, &h89F, &h8CA, &h8E1, &h8E3, &h902, &h93A, &h93A, &h93C, &h93C, &h941, &h948, &h94D, &h94D, &h951, &h957, &h962, &h963, &h981, &h981, &h9BC, &h9BC, &h9BE, &h9BE, &h9C1, &h9C4, &h9CD, &h9CD, &h9D7, &h9D7, &h9E2, &h9E3, &h9FE, &h9FE, &hA01, &hA02, &hA3C, &hA3C, &hA41, &hA42, &hA47, &hA48, &hA4B, &hA4D, &hA51, &hA51, &hA70, &hA71, &hA75, &hA75, &hA81, &hA82, &hABC, &hABC, &hAC1, &hAC5, &hAC7, &hAC8, &hACD, &hACD, &hAE2, &hAE3, &hAFA, &hAFF, &hB01, &hB01, &hB3C, &hB3C, &hB3E, &hB3F, &hB41, &hB44, &hB4D, &hB4D, &hB55, &hB57, &hB62, &hB63, &hB82, &hB82, &hBBE, &hBBE, &hBC0, &hBC0, &hBCD, &hBCD, &hBD7, &hBD7, &hC00, &hC00, &hC04, &hC04, &hC3C, &hC3C, &hC3E, &hC40, &hC46, &hC48, &hC4A, &hC4D, &hC55, &hC56, &hC62, &hC63, &hC81, &hC81, &hCBC, &hCBC, &hCBF, &hCC0, &hCC2, &hCC2, &hCC6, &hCC8, &hCCA, &hCCD, &hCD5, &hCD6, &hCE2, &hCE3, &hD00, &hD01, &hD3B, &hD3C, &hD3E, &hD3E, &hD41, &hD44, &hD4D, &hD4D, &hD57, &hD57, &hD62, &hD63, &hD81, &hD81, &hDCA, &hDCA, &hDCF, &hDCF, &hDD2, &hDD4, &hDD6, &hDD6, &hDDF, &hDDF, &hE31, &hE31, &hE34, &hE3A, &hE47, &hE4E, &hEB1, &hEB1, &hEB4, &hEBC, &hEC8, &hECE, &hF18, &hF19, &hF35, &hF35, &hF37, &hF37, &hF39, &hF39, &hF71, &hF7E, &hF80, &hF84, &hF86, &hF87, &hF8D, &hF97, &hF99, &hFBC, &hFC6, &hFC6, &h102D, &h1030, &h1032, &h1037, &h1039, &h103A, &h103D, &h103E, &h1058, &h1059, &h105E, &h1060, &h1071, &h1074, &h1082, &h1082, &h1085, &h1086, &h108D, &h108D, &h109D, &h109D, &h135D, &h135F, &h1712, &h1715, &h1732, &h1734, &h1752, &h1753, &h1772, &h1773, &h17B4, &h17B5, &h17B7, &h17BD, &h17C6, &h17C6, &h17C9, &h17D3, &h17DD, &h17DD, &h180B, &h180D, &h180F, &h180F, &h1885, &h1886, &h18A9, &h18A9, &h1920, &h1922, &h1927, &h1928, &h1932, &h1932, &h1939, &h193B, &h1A17, &h1A18, &h1A1B, &h1A1B, &h1A56, &h1A56, &h1A58, &h1A5E, &h1A60, &h1A60, &h1A62, &h1A62, &h1A65, &h1A6C, &h1A73, &h1A7C, &h1A7F, &h1A7F, &h1AB0, &h1ADD, &h1AE0, &h1AEB, &h1B00, &h1B03, &h1B34, &h1B3D, &h1B42, &h1B44, &h1B6B, &h1B73, &h1B80, &h1B81, &h1BA2, &h1BA5, &h1BA8, &h1BAD, &h1BE6, &h1BE6, &h1BE8, &h1BE9, &h1BED, &h1BED, &h1BEF, &h1BF3, &h1C2C, &h1C33, &h1C36, &h1C37, &h1CD0, &h1CD2, &h1CD4, &h1CE0, &h1CE2, &h1CE8, &h1CED, &h1CED, &h1CF4, &h1CF4, &h1CF8, &h1CF9, &h1DC0, &h1DFF, &h200C, &h200C, &h20D0, &h20F0, &h2CEF, &h2CF1, &h2D7F, &h2D7F, &h2DE0, &h2DFF, &h302A, &h302F, &h3099, &h309A, &hA66F, &hA672, &hA674, &hA67D, &hA69E, &hA69F, &hA6F0, &hA6F1, &hA802, &hA802, &hA806, &hA806, &hA80B, &hA80B, &hA825, &hA826, &hA82C, &hA82C, &hA8C4, &hA8C5, &hA8E0, &hA8F1, &hA8FF, &hA8FF, &hA926, &hA92D, &hA947, &hA951, &hA953, &hA953, &hA980, &hA982, &hA9B3, &hA9B3, &hA9B6, &hA9B9, &hA9BC, &hA9BD, &hA9C0, &hA9C0, &hA9E5, &hA9E5, &hAA29, &hAA2E, &hAA31, &hAA32, &hAA35, &hAA36, &hAA43, &hAA43, &hAA4C, &hAA4C, &hAA7C, &hAA7C, &hAAB0, &hAAB0, &hAAB2, &hAAB4, &hAAB7, &hAAB8, &hAABE, &hAABF, &hAAC1, &hAAC1, &hAAEC, &hAAED, &hAAF6, &hAAF6, &hABE5, &hABE5, &hABE8, &hABE8, &hABED, &hABED, &hFB1E, &hFB1E, &hFE00, &hFE0F, &hFE20, &hFE2F, &hFF9E, &hFF9F, &h101FD, &h101FD, &h102E0, &h102E0, &h10376, &h1037A, &h10A01, &h10A03, &h10A05, &h10A06, &h10A0C, &h10A0F, &h10A38, &h10A3A, &h10A3F, &h10A3F, &h10AE5, &h10AE6, &h10D24, &h10D27, &h10D69, &h10D6D, &h10EAB, &h10EAC, &h10EFA, &h10EFF, &h10F46, &h10F50, &h10F82, &h10F85, &h11001, &h11001, &h11038, &h11046, &h11070, &h11070, &h11073, &h11074, &h1107F, &h11081, &h110B3, &h110B6, &h110B9, &h110BA, &h110C2, &h110C2, &h11100, &h11102, &h11127, &h1112B, &h1112D, &h11134, &h11173, &h11173, &h11180, &h11181, &h111B6, &h111BE, &h111C0, &h111C0, &h111C9, &h111CC, &h111CF, &h111CF, &h1122F, &h11231, &h11234, &h11237, &h1123E, &h1123E, &h11241, &h11241, &h112DF, &h112DF, &h112E3, &h112EA, &h11300, &h11301, &h1133B, &h1133C, &h1133E, &h1133E, &h11340, &h11340, &h1134D, &h1134D, &h11357, &h11357, &h11366, &h1136C, &h11370, &h11374, &h113B8, &h113B8, &h113BB, &h113C0, &h113C2, &h113C2, &h113C5, &h113C5, &h113C7, &h113C9, &h113CE, &h113D0, &h113D2, &h113D2, &h113E1, &h113E2, &h11438, &h1143F, &h11442, &h11444, &h11446, &h11446, &h1145E, &h1145E, &h114B0, &h114B0, &h114B3, &h114B8, &h114BA, &h114BA, &h114BD, &h114BD, &h114BF, &h114C0, &h114C2, &h114C3, &h115AF, &h115AF, &h115B2, &h115B5, &h115BC, &h115BD, &h115BF, &h115C0, &h115DC, &h115DD, &h11633, &h1163A, &h1163D, &h1163D, &h1163F, &h11640, &h116AB, &h116AB, &h116AD, &h116AD, &h116B0, &h116B7, &h1171D, &h1171D, &h1171F, &h1171F, &h11722, &h11725, &h11727, &h1172B, &h1182F, &h11837, &h11839, &h1183A, &h11930, &h11930, &h1193B, &h1193E, &h11943, &h11943, &h119D4, &h119D7, &h119DA, &h119DB, &h119E0, &h119E0, &h11A01, &h11A0A, &h11A33, &h11A38, &h11A3B, &h11A3E, &h11A47, &h11A47, &h11A51, &h11A56, &h11A59, &h11A5B, &h11A8A, &h11A96, &h11A98, &h11A99, &h11B60, &h11B60, &h11B62, &h11B64, &h11B66, &h11B66, &h11C30, &h11C36, &h11C38, &h11C3D, &h11C3F, &h11C3F, &h11C92, &h11CA7, &h11CAA, &h11CB0, &h11CB2, &h11CB3, &h11CB5, &h11CB6, &h11D31, &h11D36, &h11D3A, &h11D3A, &h11D3C, &h11D3D, &h11D3F, &h11D45, &h11D47, &h11D47, &h11D90, &h11D91, &h11D95, &h11D95, &h11D97, &h11D97, &h11EF3, &h11EF4, &h11F00, &h11F01, &h11F36, &h11F3A, &h11F40, &h11F42, &h11F5A, &h11F5A, &h13440, &h13440, &h13447, &h13455, &h1611E, &h16129, &h1612D, &h1612F, &h16AF0, &h16AF4, &h16B30, &h16B36, &h16F4F, &h16F4F, &h16F8F, &h16F92, &h16FE4, &h16FE4, &h16FF0, &h16FF1, &h1BC9D, &h1BC9E, &h1CF00, &h1CF2D, &h1CF30, &h1CF46, &h1D165, &h1D169, &h1D16D, &h1D172, &h1D17B, &h1D182, &h1D185, &h1D18B, &h1D1AA, &h1D1AD, &h1D242, &h1D244, &h1DA00, &h1DA36, &h1DA3B, &h1DA6C, &h1DA75, &h1DA75, &h1DA84, &h1DA84, &h1DA9B, &h1DA9F, &h1DAA1, &h1DAAF, &h1E000, &h1E006, &h1E008, &h1E018, &h1E01B, &h1E021, &h1E023, &h1E024, &h1E026, &h1E02A, &h1E08F, &h1E08F, &h1E130, &h1E136, &h1E2AE, &h1E2AE, &h1E2EC, &h1E2EF, &h1E4EC, &h1E4EF, &h1E5EE, &h1E5EF, &h1E6E3, &h1E6E3, &h1E6E6, &h1E6E6, &h1E6EE, &h1E6EF, &h1E6F5, &h1E6F5, &h1E8D0, &h1E8D6, &h1E944, &h1E94A, &h1F3FB, &h1F3FF, &hE0020, &hE007F, &hE0100, &hE01EF]
+        StudioCellTables.Control = [&h0, &h1F, &h7F, &h9F, &hAD, &hAD, &h61C, &h61C, &h180E, &h180E, &h200B, &h200B, &h200E, &h200F, &h2028, &h202E, &h2060, &h206F, &hFEFF, &hFEFF, &hFFF0, &hFFFB, &h13430, &h1343F, &h1BCA0, &h1BCA3, &h1D173, &h1D17A, &hE0000, &hE001F, &hE0080, &hE00FF, &hE01F0, &hE0FFF]
+        ' Sorted, inclusive [first, last] pairs. Combining marks, joiners, directional
+        ' marks, variation selectors, emoji modifiers and tags draw on the preceding cell.
+        StudioCellTables.ZeroWidth = [&h0300, &h036F, &h0483, &h0489, &h0591, &h05BD, &h05BF, &h05BF, &h05C1, &h05C2, &h05C4, &h05C5, &h05C7, &h05C7, &h0610, &h061A, &h064B, &h065F, &h0670, &h0670, &h06D6, &h06DC, &h06DF, &h06E4, &h06E7, &h06E8, &h06EA, &h06ED, &h0900, &h0903, &h093A, &h094F, &h0951, &h0957, &h0962, &h0963, &h0E31, &h0E31, &h0E34, &h0E3A, &h0E47, &h0E4E, &h1AB0, &h1AFF, &h1DC0, &h1DFF, &h200B, &h200F, &h202A, &h202E, &h2060, &h2064, &h20D0, &h20FF, &hFE00, &hFE0F, &hFE20, &hFE2F, &hFEFF, &hFEFF, &h1F3FB, &h1F3FF, &hE0000, &hE007F, &hE0100, &hE01EF]
+        ' East Asian Wide/Fullwidth and emoji-presentation characters.
+        StudioCellTables.Wide = [&h1100, &h115F, &h231A, &h231B, &h2329, &h232A, &h23E9, &h23EC, &h23F0, &h23F0, &h23F3, &h23F3, &h25FD, &h25FE, &h2614, &h2615, &h2648, &h2653, &h267F, &h267F, &h2693, &h2693, &h26A1, &h26A1, &h26AA, &h26AB, &h26BD, &h26BE, &h26C4, &h26C5, &h26CE, &h26CE, &h26D4, &h26D4, &h26EA, &h26EA, &h26F2, &h26F3, &h26F5, &h26F5, &h26FA, &h26FA, &h26FD, &h26FD, &h2705, &h2705, &h270A, &h270B, &h2728, &h2728, &h274C, &h274C, &h274E, &h274E, &h2753, &h2755, &h2757, &h2757, &h2795, &h2797, &h27B0, &h27B0, &h27BF, &h27BF, &h2B1B, &h2B1C, &h2B50, &h2B50, &h2B55, &h2B55, &h2E80, &h303E, &h3041, &h33FF, &h3400, &h4DBF, &h4E00, &h9FFF, &hA000, &hA4CF, &hA960, &hA97F, &hAC00, &hD7A3, &hF900, &hFAFF, &hFE10, &hFE19, &hFE30, &hFE6F, &hFF00, &hFF60, &hFFE0, &hFFE6, &h16FE0, &h16FE4, &h17000, &h18CFF, &h1B000, &h1B2FF, &h1F004, &h1F004, &h1F0CF, &h1F0CF, &h1F18E, &h1F18E, &h1F191, &h1F19A, &h1F200, &h1F251, &h1F300, &h1F64F, &h1F680, &h1F6FF, &h1F7E0, &h1F7EB, &h1F90C, &h1F9FF, &h1FA70, &h1FAFF, &h20000, &h3FFFD]
+    End Sub
+End Class
+
+''' Monospace cells a codepoint occupies when drawn alone: 0 for combining marks,
+''' joiners, variation selectors and other marks that draw on the preceding character,
+''' 2 for East Asian wide/fullwidth characters and emoji, otherwise 1. A table-driven
+''' approximation of Unicode East Asian Width; tabs are the caller's concern.
+Public Function StudioCellWidth(code As Integer) As Integer
+    If code < &h0300 Then Return 1
+    StudioCellTables.Prepare()
+    If SyntaxInRanges(code, StudioCellTables.ZeroWidth) Then Return 0
+    If SyntaxInRanges(code, StudioCellTables.Wide) Then Return 2
+    Return 1
+End Function
+
+''' Cell geometry of one line: where a caret may stop and which cell it is drawn at.
+''' Positions are codepoint indices 0..Count. A caret stops only between clusters: a
+''' base character plus its combining marks, a ZWJ emoji sequence, or a regional-
+''' indicator flag pair are one cluster. Tabs advance to the next IndentWidth stop.
+Public Class StudioLineLayout
+    ''' Visual cell before codepoint i (Count + 1 entries).
+    Public Property Visual As Array Of Integer = []
+    ''' True where a caret may stop before codepoint i (Count + 1 entries).
+    Public Property Boundary As Array Of Boolean = []
+    Public Property Count As Integer = 0
+    ''' True when every character is one cell and one cluster (no tabs, no wide text).
+    Public Property Simple As Boolean = True
+
+    Public Sub Constructor(line As String, indentWidth As Integer)
+        Dim tab As Integer = Math.Max(1, indentWidth)
+        Dim column As Integer = 0
+        Dim joinNext As Boolean = False
+        Dim pictographicBase As Boolean = False
+        Dim regionalRun As Integer = 0
+        Dim previousControl As Boolean = False
+        Dim index As Integer = 0
+        Array.Append(Me.Visual, 0)
+        Array.Append(Me.Boundary, True)
+        For Each ch As String In String.Chars(line)
+            Dim code As Integer = String.Asc(ch)
+            Dim cells As Integer = 1
+            Dim joined As Boolean = False
+            Dim flag As Boolean = code >= &h1F1E6 And code <= &h1F1FF
+            StudioCellTables.Prepare()
+            Dim pictographic As Boolean = SyntaxInRanges(code, StudioCellTables.Pictographic)
+            Dim control As Boolean = SyntaxInRanges(code, StudioCellTables.Control)
+            Dim pairedFlag As Boolean = flag And regionalRun Mod 2 = 1
+            Dim joinedEmoji As Boolean = joinNext And pictographic
+            If code = 9 Then
+                cells = tab - (column Mod tab)
+                Me.Simple = False
+            Else
+                Dim natural As Integer = StudioCellWidth(code)
+                If index > 0 And Not control And Not previousControl And (joinedEmoji Or natural = 0 Or pairedFlag) Then
+                    joined = True
+                    ' A flag pair is one wide glyph: the second indicator adds the second cell.
+                    cells = 0
+                    If pairedFlag Then cells = 1
+                Else
+                    cells = Math.Max(1, natural)
+                    If control And natural = 0 Then cells = 0
+                End If
+                If natural <> 1 Or joined Then Me.Simple = False
+            End If
+            If flag Then
+                regionalRun += 1
+            Else
+                regionalRun = 0
+            End If
+            If code = &h200D Then
+                joinNext = pictographicBase
+                pictographicBase = False
+            ElseIf SyntaxInRanges(code, StudioCellTables.Extend) Then
+                joinNext = False
+            Else
+                joinNext = False
+                pictographicBase = pictographic
+            End If
+            previousControl = control
+            Me.Boundary(index) = Not joined
+            column += cells
+            Array.Append(Me.Visual, column)
+            Array.Append(Me.Boundary, True)
+            index += 1
+        Next
+        Me.Count = index
+        If index > 0 Then Me.Boundary(0) = True
+    End Sub
+
+    ''' Total width in cells.
+    Public Property Width As Integer
+        Get
+            Return Me.Visual(Me.Count)
+        End Get
+    End Property
+
+    ''' Visual cell of a codepoint column; columns past the end continue one cell each.
+    Public Function CellOf(column As Integer) As Integer
+        If column <= 0 Then Return 0
+        If column >= Me.Count Then Return Me.Visual(Me.Count) + column - Me.Count
+        Return Me.Visual(column)
+    End Function
+
+    ''' The caret stop nearest to a (fractional) visual cell.
+    Public Function ColumnAt(visualTarget As Double) As Integer
+        If visualTarget <= 0 Then Return 0
+        Dim previous As Integer = 0
+        For i As Integer = 1 To Me.Count
+            If Me.Boundary(i) Then
+                If visualTarget < (Me.Visual(previous) + Me.Visual(i)) / 2.0 Then Return previous
+                previous = i
+            End If
+        Next
+        Return Me.Count
+    End Function
+
+    ''' The caret stop at or before `column`.
+    Public Function StopBefore(column As Integer) As Integer
+        Dim i As Integer = Math.Max(0, Math.Min(column, Me.Count))
+        While i > 0 And Not Me.Boundary(i)
+            i -= 1
+        Wend
+        Return i
+    End Function
+
+    ''' The caret stop at or after `column`.
+    Public Function StopAfter(column As Integer) As Integer
+        Dim i As Integer = Math.Max(0, Math.Min(column, Me.Count))
+        While i < Me.Count And Not Me.Boundary(i)
+            i += 1
+        Wend
+        Return i
+    End Function
+
+    ''' The previous caret stop strictly before `column` (0 stays 0).
+    Public Function PreviousStop(column As Integer) As Integer
+        If column <= 0 Then Return 0
+        Return Me.StopBefore(Math.Min(column, Me.Count) - 1)
+    End Function
+
+    ''' The next caret stop strictly after `column` (Count stays Count).
+    Public Function NextStop(column As Integer) As Integer
+        If column >= Me.Count Then Return Me.Count
+        Return Me.StopAfter(Math.Max(0, column) + 1)
+    End Function
+End Class
+
+' ---- Block structure (smart indent) -----------------------------------------------------
+
+Public Enum StudioBlockRole As Integer
+    None = 0
+    Opens = 1
+    Continues = 2
+    Closes = 3
+End Enum
+
+''' How one line takes part in Buoy block structure. `Kind` names the block family
+''' ("if", "for", "sub", "#if", ...) shared by its opener, middle and closing lines.
+Public Class StudioBlockInfo
+    Public Property Role As StudioBlockRole = StudioBlockRole.None
+    Public Property Kind As String = ""
+    ''' The closing line an opener expects ("End If", "Next", "Loop", "#End If", ...).
+    Public Property Closer As String = ""
+    ''' A `Property` declaration that may be followed by Get/Set blocks.
+    Public Property IsPropertyHeader As Boolean = False
+    ''' A Sub/Function/Property/Operator signature (opens a body unless in an Interface).
+    Public Property IsMember As Boolean = False
+End Class
+
+Private Function SyntaxBlockModifier(word As String) As Boolean
+    Select Case word
+    Case "public", "private", "protected", "internal", "shared", "static", "partial", "overrides", "async", "inline", "export", "final", "sequential", "packed", "flags", "extension", "iterator"
+        Return True
+    End Select
+    Return False
+End Function
+
+''' Closing line for a block family.
+Public Function StudioBlockCloser(kind As String) As String
+    Select Case kind
+    Case "for"
+        Return "Next"
+    Case "do"
+        Return "Loop"
+    Case "#if"
+        Return "#End If"
+    Case "if"
+        Return "End If"
+    Case "while"
+        Return "End While"
+    Case "select"
+        Return "End Select"
+    Case "try"
+        Return "End Try"
+    Case "sub"
+        Return "End Sub"
+    Case "function"
+        Return "End Function"
+    Case "class"
+        Return "End Class"
+    Case "interface"
+        Return "End Interface"
+    Case "enum"
+        Return "End Enum"
+    Case "flags enum"
+        Return "End Flags Enum"
+    Case "structure"
+        Return "End Structure"
+    Case "get"
+        Return "End Get"
+    Case "set"
+        Return "End Set"
+    Case "handle"
+        Return "End Handle"
+    Case "operator"
+        Return "End Operator"
+    Case "with"
+        Return "End With"
+    Case "synclock"
+        Return "End SyncLock"
+    Case "namespace"
+        Return "End Namespace"
+    Case "window"
+        Return "End Window"
+    Case "view"
+        Return "End View"
+    Case "control"
+        Return "End Control"
+    Case "tab"
+        Return "End Tab"
+    Case "page"
+        Return "End Page"
+    Case "constraints"
+        Return "End Constraints"
+    End Select
+    Return ""
+End Function
+
+''' Classifies a source line for block structure, ignoring comments and string
+''' contents. Single-line forms (`If x Then y`, `Declare Function`, abstract members)
+''' are not openers. Whether a member opens a body inside an Interface is the
+''' caller's concern (`IsMember`).
+Public Function StudioClassifyBlock(line As String, inComment As Boolean) As StudioBlockInfo
+    Dim info As New StudioBlockInfo()
+    Dim tokens As StudioSyntaxLine = StudioTokenizeLine(line, inComment)
+    Dim words As Array Of String = []
+    Dim kinds As Array Of StudioTokenKind = []
+    For Each token As StudioSyntaxToken In tokens.Tokens
+        If token.Kind <> StudioTokenKind.Comment Then
+            Array.Append(words, String.LCase(String.Substring(line, token.Start, token.Length)))
+            Array.Append(kinds, token.Kind)
+        End If
+    Next
+    Dim count As Integer = Array.Count(words)
+    If count = 0 Then Return info
+    Dim first As Integer = 0
+    Dim isFlags As Boolean = False
+    Dim isAbstract As Boolean = False
+    While first < count - 1 And (SyntaxBlockModifier(words(first)) Or words(first) = "abstract")
+        If words(first) = "flags" Then isFlags = True
+        If words(first) = "abstract" Then isAbstract = True
+        first += 1
+    Wend
+    Dim word As String = words(first)
+    Dim following As String = ""
+    If first + 1 < count Then following = words(first + 1)
+    Dim last As String = words(count - 1)
+    Dim kind As String = ""
+    Dim role As StudioBlockRole = StudioBlockRole.None
+    Select Case word
+    Case "#if"
+        kind = "#if"
+        role = StudioBlockRole.Opens
+    Case "#else", "#elseif"
+        kind = "#if"
+        role = StudioBlockRole.Continues
+    Case "#end"
+        kind = "#if"
+        role = StudioBlockRole.Closes
+    Case "end"
+        Dim target As Integer = first + 1
+        If target < count Then
+            If words(target) = "flags" And target + 1 < count Then
+                kind = "flags enum"
+            Else
+                kind = words(target)
+            End If
+            If kind = "wend" Then kind = ""
+            If StudioBlockCloser(kind) <> "" Or kind = "property" Or kind = "block" Or kind = "lambda" Then role = StudioBlockRole.Closes
+        End If
+    Case "next"
+        kind = "for"
+        role = StudioBlockRole.Closes
+    Case "loop"
+        kind = "do"
+        role = StudioBlockRole.Closes
+    Case "wend"
+        kind = "while"
+        role = StudioBlockRole.Closes
+    Case "else", "elseif"
+        kind = "if"
+        role = StudioBlockRole.Continues
+    Case "case"
+        kind = "select"
+        role = StudioBlockRole.Continues
+    Case "catch", "finally"
+        kind = "try"
+        role = StudioBlockRole.Continues
+    Case "if"
+        If last = "then" Then
+            kind = "if"
+            role = StudioBlockRole.Opens
+        End If
+    Case "for", "while", "do", "select", "with", "synclock", "namespace"
+        kind = word
+        role = StudioBlockRole.Opens
+    Case "try"
+        If count = first + 1 Then
+            kind = "try"
+            role = StudioBlockRole.Opens
+        End If
+    Case "class", "interface", "structure"
+        kind = word
+        role = StudioBlockRole.Opens
+    Case "enum"
+        kind = "enum"
+        If isFlags Then kind = "flags enum"
+        role = StudioBlockRole.Opens
+    Case "sub", "function", "operator"
+        info.IsMember = True
+        If Not isAbstract Then
+            kind = word
+            role = StudioBlockRole.Opens
+        End If
+    Case "handle"
+        kind = "handle"
+        role = StudioBlockRole.Opens
+    Case "get", "set"
+        If count = first + 1 Or following = "(" Then
+            kind = word
+            role = StudioBlockRole.Opens
+        End If
+    Case "property"
+        info.IsMember = True
+        Dim hasValue As Boolean = False
+        For i As Integer = first + 1 To count - 1
+            If String.StartsWith(words(i), "=") Then hasValue = True
+        Next
+        info.IsPropertyHeader = Not hasValue And Not isAbstract
+    Case "window", "view", "control"
+        If first + 1 < count And kinds(Math.Min(first + 1, count - 1)) <> StudioTokenKind.Punctuation Then
+            kind = word
+            role = StudioBlockRole.Opens
+        End If
+    Case "tab"
+        If first + 1 < count And kinds(Math.Min(first + 1, count - 1)) = StudioTokenKind.Text Then
+            kind = "tab"
+            role = StudioBlockRole.Opens
+        End If
+    Case "page", "constraints"
+        If count = first + 1 Then
+            kind = word
+            role = StudioBlockRole.Opens
+        End If
+    End Select
+    info.Role = role
+    info.Kind = kind
+    If role = StudioBlockRole.Opens Then info.Closer = StudioBlockCloser(kind)
+    Return info
+End Function
+
+' ---- Compiler columns ------------------------------------------------------------------
+
+''' Converts a compiler diagnostic column to a 0-based codepoint column within `line`.
+''' `buoy --diagnostic-format json` reports `character` 1-based and counted in UTF-8
+''' bytes. A byte inside a multi-byte character maps to that character; columns <= 1
+''' map to 0 and columns past the end map to the line length.
+Public Function StudioColumnFromUtf8(line As String, byteColumn As Integer) As Integer
+    Dim target As Integer = byteColumn - 1
+    If target <= 0 Then Return 0
+    Dim used As Integer = 0
+    Dim column As Integer = 0
+    For Each ch As String In String.Chars(line)
+        Dim size As Integer = String.LenBytes(ch)
+        If used + size > target Then Return column
+        used += size
+        column += 1
+    Next
+    Return column
+End Function
+
+''' The compiler's 1-based UTF-8 byte column for a 0-based codepoint column of `line`.
+Public Function StudioUtf8Column(line As String, column As Integer) As Integer
+    Dim count As Integer = Math.Max(0, Math.Min(column, String.Len(line)))
+    Return String.LenBytes(String.Left(line, count)) + 1 + Math.Max(0, column - count)
+End Function
+
+' ---- Language modes ----------------------------------------------------------------------
+' Studio also edits auxiliary documents. A mode selects the lexical highlighter only;
+' Buoy's block, indent and comment rules apply in "buoy" mode alone. The boolean line
+' state carried between lines means "inside a block comment" for Buoy and "inside a
+' fenced code block" for Markdown; plain text and JSON carry no state.
+
+''' Normalizes a mode name: "buoy", "plain", "json" or "markdown" ("" and unknown names
+''' are "plain").
+Public Function StudioLanguageModeName(mode As String) As String
+    Select Case String.LCase(String.Trim(mode))
+    Case "buoy", "bui"
+        Return "buoy"
+    Case "json", "jsonc"
+        Return "json"
+    Case "markdown", "md"
+        Return "markdown"
+    End Select
+    Return "plain"
+End Function
+
+''' The mode for a file path by extension: .bui -> buoy, .json/.jsonc/.buipkg.json ->
+''' json, .md/.markdown -> markdown, anything else -> plain.
+Public Function StudioLanguageModeForPath(filePath As String) As String
+    Dim lower As String = String.LCase(filePath)
+    If String.EndsWith(lower, ".bui") Then Return "buoy"
+    If String.EndsWith(lower, ".json") Or String.EndsWith(lower, ".jsonc") Then Return "json"
+    If String.EndsWith(lower, ".md") Or String.EndsWith(lower, ".markdown") Then Return "markdown"
+    Return "plain"
+End Function
+
+''' Splits every non-whitespace run not covered by a token into Plain tokens, keeping
+''' tokens ordered (the editor draws tokens only).
+Private Function SyntaxFillGaps(source As String, tokens As Array Of StudioSyntaxToken) As Array Of StudioSyntaxToken
+    Dim codes As Array Of Integer = SyntaxCodes(source)
+    Dim filled As Array Of StudioSyntaxToken = []
+    Dim cursor As Integer = 0
+    Dim k As Integer = 0
+    While cursor < Array.Count(codes) Or k < Array.Count(tokens)
+        Dim nextStart As Integer = Array.Count(codes)
+        If k < Array.Count(tokens) Then nextStart = tokens(k).Start
+        While cursor < nextStart
+            If SyntaxIsSpace(codes(cursor)) Then
+                cursor += 1
+                Continue While
+            End If
+            Dim runStart As Integer = cursor
+            While cursor < nextStart
+                If SyntaxIsSpace(codes(cursor)) Then Exit While
+                cursor += 1
+            Wend
+            Array.Append(filled, New StudioSyntaxToken(runStart, cursor - runStart, StudioTokenKind.Plain))
+        Wend
+        If k < Array.Count(tokens) Then
+            Array.Append(filled, tokens(k))
+            cursor = Math.Max(cursor, tokens(k).Start + tokens(k).Length)
+            k += 1
+        End If
+    Wend
+    Return filled
+End Function
+
+Private Function SyntaxPlainLine(line As String) As StudioSyntaxLine
+    Dim info As New StudioSyntaxLine()
+    info.LanguageMode = "plain"
+    info.Source = line
+    Dim noTokens As Array Of StudioSyntaxToken = []
+    info.Tokens = SyntaxFillGaps(line, noTokens)
+    Return info
+End Function
+
+Private Function SyntaxJsonLine(line As String) As StudioSyntaxLine
+    Dim info As New StudioSyntaxLine()
+    info.LanguageMode = "json"
+    info.Source = line
+    Dim codes As Array Of Integer = SyntaxCodes(line)
+    Dim tokens As Array Of StudioSyntaxToken = []
+    Dim i As Integer = 0
+    While i < Array.Count(codes)
+        Dim code As Integer = codes(i)
+        If code = 34 Then
+            Dim j As Integer = i + 1
+            While j < Array.Count(codes)
+                If codes(j) = 92 Then
+                    j += 2
+                    Continue While
+                End If
+                If codes(j) = 34 Then Exit While
+                j += 1
+            Wend
+            Dim finish As Integer = Math.Min(Array.Count(codes), j + 1)
+            ' A string followed by ':' is an object key.
+            Dim after As Integer = finish
+            While after < Array.Count(codes)
+                If Not SyntaxIsSpace(codes(after)) Then Exit While
+                after += 1
+            Wend
+            Dim kind As StudioTokenKind = StudioTokenKind.Text
+            If after < Array.Count(codes) Then
+                If codes(after) = 58 Then kind = StudioTokenKind.TypeName
+            End If
+            Array.Append(tokens, New StudioSyntaxToken(i, finish - i, kind))
+            i = finish
+        ElseIf SyntaxIsDigit(code) Or (code = 45 And i + 1 < Array.Count(codes)) Then
+            Dim j As Integer = i + 1
+            While j < Array.Count(codes)
+                Dim c As Integer = codes(j)
+                If Not (SyntaxIsDigit(c) Or c = 46 Or c = 101 Or c = 69 Or c = 43 Or c = 45) Then Exit While
+                j += 1
+            Wend
+            Array.Append(tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Number))
+            i = j
+        ElseIf SyntaxIsWordStart(code) Then
+            Dim j As Integer = i + 1
+            While j < Array.Count(codes)
+                If Not SyntaxIsWord(codes(j)) Then Exit While
+                j += 1
+            Wend
+            Dim word As String = SyntaxLowerSlice(codes, i, j - i)
+            Dim kind As StudioTokenKind = StudioTokenKind.Plain
+            If word = "true" Or word = "false" Or word = "null" Then kind = StudioTokenKind.Literal
+            Array.Append(tokens, New StudioSyntaxToken(i, j - i, kind))
+            i = j
+        ElseIf SyntaxIsSpace(code) Then
+            i += 1
+        Else
+            Array.Append(tokens, New StudioSyntaxToken(i, 1, StudioTokenKind.Punctuation))
+            i += 1
+        End If
+    Wend
+    info.Tokens = SyntaxFillGaps(line, tokens)
+    Return info
+End Function
+
+Private Function SyntaxIsFence(line As String) As Boolean
+    Dim trimmed As String = String.LTrim(line)
+    Return String.StartsWith(trimmed, "```") Or String.StartsWith(trimmed, "~~~")
+End Function
+
+Private Function SyntaxMarkdownLine(line As String, inFence As Boolean) As StudioSyntaxLine
+    Dim info As New StudioSyntaxLine()
+    info.LanguageMode = "markdown"
+    info.Source = line
+    info.StartsInComment = inFence
+    Dim codes As Array Of Integer = SyntaxCodes(line)
+    Dim count As Integer = Array.Count(codes)
+    Dim tokens As Array Of StudioSyntaxToken = []
+    Dim lead As Integer = 0
+    While lead < count
+        If Not SyntaxIsSpace(codes(lead)) Then Exit While
+        lead += 1
+    Wend
+    If SyntaxIsFence(line) Then
+        info.EndsInComment = Not inFence
+        If lead < count Then Array.Append(tokens, New StudioSyntaxToken(lead, count - lead, StudioTokenKind.Directive))
+        info.Tokens = tokens
+        Return info
+    End If
+    info.EndsInComment = inFence
+    If inFence Then
+        Dim noTokens As Array Of StudioSyntaxToken = []
+        info.Tokens = SyntaxFillGaps(line, noTokens)
+        For Each token As StudioSyntaxToken In info.Tokens
+            token.Kind = StudioTokenKind.Text
+        Next
+        Return info
+    End If
+    If lead >= count Then Return info
+    Dim first As Integer = codes(lead)
+    If first = 35 Then
+        ' ATX heading: the whole line.
+        Array.Append(tokens, New StudioSyntaxToken(lead, count - lead, StudioTokenKind.Keyword))
+        info.Tokens = tokens
+        Return info
+    End If
+    If first = 62 Then
+        Array.Append(tokens, New StudioSyntaxToken(lead, count - lead, StudioTokenKind.Comment))
+        info.Tokens = tokens
+        Return info
+    End If
+    Dim i As Integer = lead
+    ' List markers: -, *, +, or digits followed by '.' / ')'.
+    If (first = 45 Or first = 42 Or first = 43) And lead + 1 < count Then
+        If codes(lead + 1) = 32 Then
+            Array.Append(tokens, New StudioSyntaxToken(lead, 1, StudioTokenKind.Punctuation))
+            i = lead + 1
+        End If
+    End If
+    While i < count
+        Dim code As Integer = codes(i)
+        If code = 96 Then
+            Dim j As Integer = i + 1
+            While j < count
+                If codes(j) = 96 Then Exit While
+                j += 1
+            Wend
+            Dim finish As Integer = Math.Min(count, j + 1)
+            Array.Append(tokens, New StudioSyntaxToken(i, finish - i, StudioTokenKind.Text))
+            i = finish
+        ElseIf code = 91 Then
+            ' [label](target)
+            Dim j As Integer = i + 1
+            While j < count
+                If codes(j) = 93 Then Exit While
+                j += 1
+            Wend
+            If j + 1 < count And j < count Then
+                If codes(j + 1) = 40 Then
+                    Dim k As Integer = j + 2
+                    While k < count
+                        If codes(k) = 41 Then Exit While
+                        k += 1
+                    Wend
+                    Dim finish As Integer = Math.Min(count, k + 1)
+                    Array.Append(tokens, New StudioSyntaxToken(i, finish - i, StudioTokenKind.FunctionName))
+                    i = finish
+                    Continue While
+                End If
+            End If
+            Array.Append(tokens, New StudioSyntaxToken(i, 1, StudioTokenKind.Punctuation))
+            i += 1
+        ElseIf code = 42 Or code = 95 Then
+            Dim j As Integer = i
+            While j < count
+                If codes(j) <> code Then Exit While
+                j += 1
+            Wend
+            Array.Append(tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Directive))
+            i = j
+        ElseIf SyntaxIsSpace(code) Then
+            i += 1
+        Else
+            Dim j As Integer = i
+            While j < count
+                Dim c As Integer = codes(j)
+                If SyntaxIsSpace(c) Or c = 96 Or c = 91 Or c = 42 Or c = 95 Then Exit While
+                j += 1
+            Wend
+            If j = i Then j = i + 1
+            Array.Append(tokens, New StudioSyntaxToken(i, j - i, StudioTokenKind.Plain))
+            i = j
+        End If
+    Wend
+    info.Tokens = tokens
+    Return info
+End Function
+
+''' Tokens of one line in a language mode (see StudioLanguageModeName). "buoy" is
+''' StudioTokenizeLine; `state` is the mode's carried line state.
+Public Function StudioTokenizeLineFor(mode As String, line As String, state As Boolean) As StudioSyntaxLine
+    Select Case mode
+    Case "buoy"
+        Return StudioTokenizeLine(line, state)
+    Case "json"
+        Return SyntaxJsonLine(line)
+    Case "markdown"
+        Return SyntaxMarkdownLine(line, state)
+    End Select
+    Return SyntaxPlainLine(line)
+End Function
+
+''' The carried state after `line` in a mode (cheap for lines that cannot change it).
+Public Function StudioLineStateAfter(mode As String, line As String, state As Boolean) As Boolean
+    Select Case mode
+    Case "buoy"
+        Return StudioCommentStateAfter(line, state)
+    Case "markdown"
+        If SyntaxIsFence(line) Then Return Not state
+        Return state
+    End Select
+    Return False
+End Function
+
+''' Markdown ATX heading level of a line (1-6), 0 when it is not a heading.
+Public Function StudioMarkdownHeadingLevel(line As String) As Integer
+    Dim trimmed As String = String.LTrim(line)
+    If String.Len(line) - String.Len(trimmed) > 3 Then Return 0
+    Dim level As Integer = 0
+    While level < String.Len(trimmed) And level < 7
+        If String.Substring(trimmed, level, 1) <> "#" Then Exit While
+        level += 1
+    Wend
+    If level = 0 Or level > 6 Then Return 0
+    If level < String.Len(trimmed) Then
+        If String.Substring(trimmed, level, 1) <> " " Then Return 0
+    End If
+    Return level
+End Function

@@ -1,0 +1,629 @@
+Import processkit
+
+''' Immutable source snapshot supplied by the project host. Paths are relative to
+''' the project root; unsaved buffers replace their corresponding disk snapshot.
+Public Class StudioDiagnosticSource
+    Public Property RelativePath As String
+    Public Property Text As String
+    Public Sub Constructor(relativePath As String, text As String)
+        Me.RelativePath = relativePath
+        Me.Text = text
+    End Sub
+End Class
+
+Public Class StudioDiagnostic
+    Public Property Target As String
+    Public Property FileName As String
+    Public Property Line As Integer
+    Public Property Character As Integer
+    Public Property Severity As String
+    Public Property Message As String
+End Class
+
+Public Class StudioTargetResult
+    Public Property Target As String
+    Public Property State As String = "pending"
+    Public Property CheckedFiles As Integer = 0
+    Public Property ErrorCount As Integer = 0
+    Public Property WarningCount As Integer = 0
+    Public Property Message As String
+End Class
+
+Public Interface StudioDiagnosticsListener
+    Sub DiagnosticsChanged()
+    ''' Compiler positions are one-based lines; character is passed through unchanged.
+    Sub DiagnosticSelected(fileName As String, line As Integer, character As Integer)
+End Interface
+
+Public Class StudioDiagnosticsLink
+    Public Property Listener As StudioDiagnosticsListener
+End Class
+
+Private Function DiagnosticRelativePath(value As String) As Boolean
+    If value = "" Or String.Contains(value, "\\") Or String.Contains(value, ":") Then Return False
+    If String.Left(value, 1) = "/" Or String.Right(value, 4) <> ".bui" Then Return False
+    For Each part As String In String.Split(value, "/")
+        If part = "" Or part = "." Or part = ".." Then Return False
+    Next
+    Dim bytes As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To bytes.Count - 1
+        If bytes.Item(i) < 32 Then Return False
+    Next
+    Return True
+End Function
+
+''' A check-only compiler job. No executable is linked or run. Sources and archives
+''' are staged privately, preserving paths; the opened project is never modified.
+''' Supply the complete project snapshot rather than just the selected buffer.
+Public Class StudioDiagnosticsJob
+    Public Property State As String = "idle"
+    Public Property Summary As String = "No check has run."
+    Public Property Items As Array Of StudioDiagnostic = []
+    Public Property Link As Weak StudioDiagnosticsLink
+    Public Property CompilerPath As String
+    Public Property TimeoutSeconds As Integer = 60
+    Public Property Folder As String
+    Public Property ErrorCount As Integer = 0
+    Public Property WarningCount As Integer = 0
+    Public Property TargetResults As Array Of StudioTargetResult = []
+    Public Property ExecutablePath As String
+    Private Property Targets As Array Of String = [""]
+    Private Property TargetIndex As Integer = 0
+    Private Property Linking As Boolean = False
+    Private Property CompileEntry As String
+    Private Property OwnedFolder As String
+    Private Property HadFailure As Boolean = False
+    Private Property StopReason As String
+    Private Property CancellationRequested As Boolean = False
+    Private Property Process As PipeProcess
+    Private Property Sources As Array Of String = []
+    Private Property SourceIndex As Integer = 0
+    Private Property Output As Bytes = New Bytes()
+    Private Property Errors As Bytes = New Bytes()
+    Private Property Started As Integer
+    Private Property Exited As Integer = 0
+    Private Property Poller As StudioDiagnosticsTimer = New StudioDiagnosticsTimer()
+    Private Property Seen As Map Of String, Boolean = New Map Of String, Boolean()
+
+    Public Sub Constructor()
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 40
+    End Sub
+
+    Public Function IsActive() As Boolean
+        Return Me.State = "checking" Or Me.State = "stopping"
+    End Function
+
+    Private Sub Notify()
+        Dim link As StudioDiagnosticsLink = Me.Link
+        Try
+            If link <> Nil And link.Listener <> Nil Then link.Listener.DiagnosticsChanged()
+        Catch e As Exception
+            Print "Diagnostics view refresh failed: " + e.Message
+        End Try
+    End Sub
+
+    ''' compiler must be an explicit trusted executable path. projectRoot supplies
+    ''' only sealed package archives; all source bytes come from sources.
+    Public Sub Start(compiler As String, projectRoot As String, sources As Array Of StudioDiagnosticSource)
+        Me.Begin(compiler, projectRoot, sources, [""], "")
+    End Sub
+
+    Public Sub StartAllTargets(compiler As String, projectRoot As String, sources As Array Of StudioDiagnosticSource)
+        Me.Begin(compiler, projectRoot, sources, ["arm64-darwin", "x86_64-darwin", "arm64-linux", "x86_64-linux", "arm64-windows", "x86_64-windows"], "")
+    End Sub
+
+    ''' Successful compilation retains its private snapshot until ReleaseSnapshot.
+    Public Sub StartCompile(compiler As String, projectRoot As String, sources As Array Of StudioDiagnosticSource, entry As String)
+        If Not DiagnosticRelativePath(entry) Then Throw New InvalidArgumentException("Unsafe entry source path.")
+        Me.Begin(compiler, projectRoot, sources, [""], entry)
+    End Sub
+
+    Private Sub Begin(compiler As String, projectRoot As String, sources As Array Of StudioDiagnosticSource, targets As Array Of String, entry As String)
+        If Me.IsActive() Then Throw New InvalidArgumentException("A project check is already running.")
+        Me.Cleanup()
+        Me.Targets = targets
+        Me.TargetIndex = 0
+        Me.TargetResults = []
+        Me.CompileEntry = entry
+        Me.Linking = False
+        Me.ExecutablePath = ""
+        Me.HadFailure = False
+        Me.StopReason = ""
+        Me.CancellationRequested = False
+        For Each target As String In targets
+            Dim targetResult As New StudioTargetResult()
+            targetResult.Target = target
+            Me.TargetResults.Append(targetResult)
+        Next
+        Me.Items = []
+        Me.Sources = []
+        Me.Seen = New Map Of String, Boolean()
+        Me.ErrorCount = 0
+        Me.WarningCount = 0
+        Me.SourceIndex = 0
+        Me.CompilerPath = compiler
+        Me.State = "checking"
+        Try
+            If Not New FileSystemItem(compiler).IsFile() Then Throw New InvalidArgumentException("Compiler not found: " + compiler)
+            If Array.Count(sources) = 0 Or Array.Count(sources) > 512 Then Throw New InvalidArgumentException("Check requires 1–512 source snapshots.")
+            Dim parent As FileSystemItem = System.Folders.Temporary().Child("buoy-studio-check")
+            If Not parent.CreateFolder(True) Then Throw New InvalidArgumentException("Cannot create check staging folder.")
+            Dim folder As FileSystemItem
+            For attempt As Integer = 0 To 30
+                Dim candidate As FileSystemItem = parent.Child("check-" + String.From(Random.RandomInteger(100000000, 999999999)) + "-" + String.From(Random.RandomInteger(100000000, 999999999)))
+                If Not candidate.Exists() And candidate.CreateFolder(False) Then
+                    folder = candidate
+                    Exit For
+                End If
+            Next
+            If folder = Nil Then Throw New InvalidArgumentException("Cannot allocate private check staging folder.")
+            Me.OwnedFolder = folder.FullPath()
+            Me.Folder = Me.OwnedFolder
+            Dim paths As New Map Of String, Boolean()
+            Dim size As Integer = 0
+            For Each source As StudioDiagnosticSource In sources
+                If source = Nil Then Throw New InvalidArgumentException("Missing source snapshot.")
+                If Not DiagnosticRelativePath(source.RelativePath) Then Throw New InvalidArgumentException("Unsafe source path: " + source.RelativePath)
+                Dim key As String = String.LCase(source.RelativePath)
+                If paths.ContainsKey(key) Then Throw New InvalidArgumentException("Ambiguous source path: " + source.RelativePath)
+                paths.Set(key, True)
+                size += String.LenBytes(source.Text)
+                If size > 16777216 Then Throw New InvalidArgumentException("Project check source limit is 16 MiB.")
+                Dim destination As FileSystemItem = folder.Child(source.RelativePath)
+                If Not New FileSystemItem(destination.ParentPath()).CreateFolder(True) Then Throw New InvalidArgumentException("Cannot create source folder.")
+                Dim written As Result Of Integer, String = destination.WriteAllText(source.Text)
+                If written.IsErr Then Throw New InvalidArgumentException("Cannot stage source: " + written.Error)
+                Me.Sources.Append(source.RelativePath)
+            Next
+            If entry <> "" Then
+                If Not paths.ContainsKey(String.LCase(entry)) Then Throw New InvalidArgumentException("Active source is not registered in the project snapshot.")
+                Me.Sources = [entry]
+                Me.ExecutablePath = folder.Child("studio-active").FullPath()
+                #If TargetWindows Then
+                    Me.ExecutablePath += ".exe"
+                #End If
+            End If
+            If projectRoot <> "" Then Me.CopyPackages(New FileSystemItem(projectRoot).Child("packages"), folder.Child("packages"))
+            Me.StartNext()
+            Me.Poller.Start()
+        Catch e As Exception
+            Me.Fail(e.Message)
+        End Try
+    End Sub
+
+    Private Sub CopyPackages(original As FileSystemItem, destination As FileSystemItem)
+        If Not original.IsFolder() Then Return
+        If Not destination.CreateFolder(True) Then Throw New InvalidArgumentException("Cannot create package folder.")
+        Dim count As Integer = 0
+        Dim total As Integer = 0
+        For Each archive As FileSystemItem In original.Children()
+            If Not archive.IsFile() Or String.Right(archive.Name(), 7) <> ".buipkg" Then Continue For
+            count += 1
+            total += archive.Length()
+            If count > 256 Or total > 536870912 Then Throw New InvalidArgumentException("Project check package limit exceeded.")
+            If Not archive.CopyTo(destination.Child(archive.Name())) Then Throw New InvalidArgumentException("Cannot stage package " + archive.Name())
+        Next
+    End Sub
+
+    Private Sub StartNext()
+        If Me.CompileEntry <> "" And Not Me.Linking And Me.SourceIndex >= Array.Count(Me.Sources) And Me.ErrorCount = 0 Then
+            Me.Linking = True
+            Me.SourceIndex = 0
+        End If
+        If Me.SourceIndex >= Array.Count(Me.Sources) Then
+            Dim targetResult As StudioTargetResult = Me.TargetResults(Me.TargetIndex)
+            If targetResult.State <> "failed" Then
+                targetResult.State = "passed"
+                If targetResult.ErrorCount > 0 Then targetResult.State = "errors"
+            End If
+            Me.TargetIndex += 1
+            Me.SourceIndex = 0
+        End If
+        If Me.TargetIndex >= Array.Count(Me.Targets) Then
+            Me.State = "finished"
+            If Me.HadFailure Then Me.State = "failed"
+            Me.Summary = String.From(Me.ErrorCount) + " errors · " + String.From(Me.WarningCount) + " warnings · " + String.From(Array.Count(Me.Sources)) + " files · " + String.From(Array.Count(Me.Targets)) + " target(s)"
+            If Array.Count(Me.Targets) = 1 Then Me.Summary = String.From(Me.ErrorCount) + " errors · " + String.From(Me.WarningCount) + " warnings · " + String.From(Array.Count(Me.Sources)) + " files checked"
+            If Me.HadFailure Then Me.Summary = "Incomplete check: " + Me.Summary
+            Me.Poller.Stop()
+            If Me.CompileEntry = "" Or Me.ErrorCount > 0 Or Me.HadFailure Then Me.TryCleanup()
+            Me.Notify()
+            Return
+        End If
+        Me.TargetResults(Me.TargetIndex).State = "checking"
+        Me.Output = New Bytes()
+        Me.Errors = New Bytes()
+        Me.Started = System.Microseconds()
+        Me.Exited = 0
+        Dim relative As String = Me.Sources(Me.SourceIndex)
+        Me.Summary = "Checking " + relative + " (" + String.From(Me.SourceIndex + 1) + "/" + String.From(Array.Count(Me.Sources)) + ")"
+        Dim argv As Array Of String = []
+        argv.Append("./" + relative)
+        If Me.CompileEntry = "" Or Not Me.Linking Then
+            argv.Append("--check")
+        Else
+            argv.Append("-o")
+            argv.Append(Me.ExecutablePath)
+        End If
+        argv.Append("--diagnostic-format")
+        argv.Append("json")
+        If Me.Targets(Me.TargetIndex) <> "" Then
+            argv.Append("--target")
+            argv.Append(Me.Targets(Me.TargetIndex))
+            Me.Summary += " [" + Me.Targets(Me.TargetIndex) + "]"
+        End If
+        Me.Process = New PipeProcess(Me.CompilerPath, argv, Me.OwnedFolder, True)
+        Me.Process.CloseInput()
+        Me.Notify()
+    End Sub
+
+    Private Sub AppendChunk(target As Bytes, chunk As Bytes, limit As Integer)
+        If chunk = Nil Then Return
+        If target.Count + chunk.Count > limit Then Throw New InvalidArgumentException("Compiler diagnostic output exceeded its limit.")
+        For i As Integer = 0 To chunk.Count - 1
+            If chunk.Item(i) = 0 Then Throw New InvalidArgumentException("Compiler output contains NUL.")
+            target.Append(chunk.Item(i))
+        Next
+    End Sub
+
+    Public Sub Poll()
+        If Not Me.IsActive() Or Me.Process = Nil Then Return
+        Try
+            If Me.State = "stopping" Then
+                If Me.Process.Poll() Then Return
+                Me.Process.Close()
+                Me.Process = Nil
+                If Not Me.CancellationRequested And Me.StopReason <> "" And Array.Count(Me.Targets) > 1 Then
+                    Me.State = "checking"
+                    Me.StopReason = ""
+                    Me.SourceIndex = Array.Count(Me.Sources)
+                    Me.StartNext()
+                    Return
+                End If
+                Me.Poller.Stop()
+                Me.State = "cancelled"
+                If Not Me.CancellationRequested And Me.StopReason <> "" Then Me.State = "failed"
+                Me.Summary = "Project check cancelled; results are incomplete."
+                If Not Me.CancellationRequested And Me.StopReason <> "" Then Me.Summary = "Check failed: " + Me.StopReason
+                Me.TryCleanup()
+                Me.Notify()
+                Return
+            End If
+            Me.AppendChunk(Me.Output, Me.Process.ReadOutput(16384), 4194304)
+            Me.AppendChunk(Me.Errors, Me.Process.ReadError(4096), 65536)
+            If System.Microseconds() - Me.Started > Me.TimeoutSeconds * 1000000 Then Throw New InvalidArgumentException("Compiler check timed out.")
+            If Me.Process.Poll() Then Return
+            If Me.Exited = 0 Then Me.Exited = System.Microseconds()
+            If Not Me.Process.OutputClosed Or Not Me.Process.ErrorClosed Then
+                If System.Microseconds() - Me.Exited > 2000000 Then Throw New InvalidArgumentException("Compiler output pipes did not close.")
+                Return
+            End If
+            Dim code As Integer = Me.Process.ExitCode
+            Me.Process.Close()
+            Me.Process = Nil
+            ' Successful code generation is silent even in diagnostic JSON mode.
+            ' Always check first; only a successful link may omit its JSON report.
+            If Not Me.Linking Or String.Trim(Me.Output.ToString(Text.Encodings.UTF8)) <> "" Or code <> 0 Then Me.ParseOutput(code)
+            If Not Me.Linking Then Me.TargetResults(Me.TargetIndex).CheckedFiles += 1
+            Me.SourceIndex += 1
+            Me.StartNext()
+        Catch e As Exception
+            If Array.Count(Me.Targets) > 1 And Me.Process = Nil And Me.TargetIndex < Array.Count(Me.Targets) Then
+                Me.RecordFailure(e.Message)
+                Me.SourceIndex = Array.Count(Me.Sources)
+                Me.StartNext()
+            Else
+                Me.Fail(e.Message)
+            End If
+        End Try
+    End Sub
+
+    Private Sub ParseOutput(code As Integer)
+        Dim diagnosticJSON As String = Me.Output.ToString(Text.Encodings.UTF8)
+        ' Compiler output is trusted local input, but still bound nesting before
+        ' stdlib JSON parsing (the current runtime has no parser depth limit).
+        Dim depth As Integer = 0
+        Dim quoted As Boolean = False
+        Dim escaped As Boolean = False
+        Dim bytes As Bytes = Bytes.FromString(diagnosticJSON, Text.Encodings.UTF8)
+        For i As Integer = 0 To bytes.Count - 1
+            Dim value As Integer = bytes.Item(i)
+            If quoted Then
+                If escaped Then
+                    escaped = False
+                ElseIf value = 92 Then
+                    escaped = True
+                ElseIf value = 34 Then
+                    quoted = False
+                End If
+            ElseIf value = 34 Then
+                quoted = True
+            ElseIf value = 91 Or value = 123 Then
+                depth += 1
+                If depth > 32 Then Throw New InvalidArgumentException("Compiler diagnostics nesting limit exceeded.")
+            ElseIf value = 93 Or value = 125 Then
+                depth -= 1
+            End If
+        Next
+        Dim parsed As Optional Of JSONItem = Json.TryParse(diagnosticJSON)
+        If Not parsed.HasValue Then Throw New InvalidArgumentException("Compiler returned invalid diagnostic JSON: " + Me.Errors.ToString(Text.Encodings.UTF8))
+        Dim report As JSONItem = parsed.Value
+        If Not report.IsObject() Or Not report.Value("errors").IsArray() Or Not report.Value("warnings").IsArray() Then Throw New InvalidArgumentException("Compiler returned an unexpected diagnostic schema.")
+        Me.AddItems(report.Value("errors"), "Error")
+        Me.AddItems(report.Value("warnings"), "Warning")
+        ' Inspect errors[] independently of exit status. BUI-004 remains an
+        ' unconfirmed upstream candidate; do not assume success from status alone.
+        If code <> 0 And report.Value("errors").Count() = 0 Then Throw New InvalidArgumentException("Compiler failed with exit " + String.From(code) + ": " + Me.Errors.ToString(Text.Encodings.UTF8))
+    End Sub
+
+    Private Sub AddItems(values As JSONItem, severity As String)
+        For i As Integer = 0 To values.Count() - 1
+            Dim value As JSONItem = values.ValueAt(i)
+            If Not value.IsObject() Or Not value.Value("message").IsString() Then Throw New InvalidArgumentException("Invalid compiler diagnostic entry.")
+            Dim item As New StudioDiagnostic()
+            item.FileName = String.Replace(value.Value("file").AsString().Or(Me.Sources(Me.SourceIndex)), "\\", "/", True)
+            Dim prefix As String = String.Replace(Me.Folder, "\\", "/", True) + "/"
+            If String.Left(item.FileName, String.Len(prefix)) = prefix And String.Compare(String.Left(item.FileName, String.Len(prefix)), prefix, True) = 0 Then item.FileName = String.Mid(item.FileName, String.Len(prefix) + 1)
+            If String.Left(item.FileName, 2) = "./" Then item.FileName = String.Mid(item.FileName, 3)
+            item.Line = Math.Round(value.Value("line").AsNumber().Or(1.0))
+            item.Character = Math.Round(value.Value("character").AsNumber().Or(0.0))
+            item.Message = value.Value("message").AsString().Or("")
+            item.Severity = severity
+            item.Target = Me.Targets(Me.TargetIndex)
+            Dim key As String = item.Target + "\n" + severity + "\n" + item.FileName + "\n" + String.From(item.Line) + ":" + String.From(item.Character) + "\n" + item.Message
+            If Me.Seen.ContainsKey(key) Then Continue For
+            Me.Seen.Set(key, True)
+            If Array.Count(Me.Items) >= 10000 Then Throw New InvalidArgumentException("Compiler problem limit exceeded (10000).")
+            Me.Items.Append(item)
+            If severity = "Error" Then
+                Me.ErrorCount += 1
+                Me.TargetResults(Me.TargetIndex).ErrorCount += 1
+            Else
+                Me.WarningCount += 1
+                Me.TargetResults(Me.TargetIndex).WarningCount += 1
+            End If
+        Next
+    End Sub
+
+    Private Sub RecordFailure(message As String)
+        Me.HadFailure = True
+        If Me.TargetIndex >= Array.Count(Me.TargetResults) Then Return
+        Dim targetResult As StudioTargetResult = Me.TargetResults(Me.TargetIndex)
+        targetResult.State = "failed"
+        targetResult.Message = message
+        targetResult.ErrorCount += 1
+        Me.ErrorCount += 1
+        Dim item As New StudioDiagnostic()
+        item.Target = targetResult.Target
+        item.Severity = "Error"
+        item.Message = "Compiler job failed: " + message
+        item.Line = 1
+        If Me.SourceIndex < Array.Count(Me.Sources) Then item.FileName = Me.Sources(Me.SourceIndex)
+        Me.Items.Append(item)
+    End Sub
+
+    Private Sub Fail(message As String)
+        Me.RecordFailure(message)
+        If Me.Process <> Nil Then
+            Me.StopReason = message
+            Me.RequestStop()
+            Return
+        End If
+        Me.Poller.Stop()
+        Me.State = "failed"
+        Me.Summary = "Check failed: " + message
+        Me.TryCleanup()
+        Me.Notify()
+    End Sub
+
+    Private Sub TryCleanup()
+        Try
+            Me.Cleanup()
+        Catch e As Exception
+            Me.State = "failed"
+            Me.Summary += "; " + e.Message
+        End Try
+    End Sub
+
+    Private Sub Cleanup()
+        ' Public Folder is informational. Never delete a caller-supplied path.
+        If Me.OwnedFolder = "" Then Return
+        Dim folder As New FileSystemItem(Me.OwnedFolder)
+        If folder.Exists() Then
+            If Not folder.Delete(True) Then Throw New InvalidArgumentException("Cannot remove owned compiler snapshot: " + Me.OwnedFolder)
+        End If
+        Me.OwnedFolder = ""
+        Me.Folder = ""
+    End Sub
+
+    Public Sub ReleaseSnapshot()
+        If Me.IsActive() Then Throw New InvalidArgumentException("Compiler still owns the snapshot.")
+        Me.Cleanup()
+    End Sub
+
+    ''' Nonblocking kill request; Poll acknowledges and reaps before cleanup.
+    Public Sub Cancel()
+        If Not Me.IsActive() Then Return
+        ' A caller stop overrides internal failure continuation, even during reap.
+        Me.CancellationRequested = True
+        Me.RequestStop()
+    End Sub
+
+    Private Sub RequestStop()
+        If Not Me.IsActive() Or Me.State = "stopping" Then Return
+        If Me.TargetIndex < Array.Count(Me.TargetResults) Then
+            If Me.TargetResults(Me.TargetIndex).State <> "failed" Then Me.TargetResults(Me.TargetIndex).State = "cancelled"
+        End If
+        If Me.Process = Nil Then
+            Me.State = "cancelled"
+            Me.Poller.Stop()
+            Me.TryCleanup()
+        Else
+            Me.Process.TerminateTree()
+            Me.State = "stopping"
+            Me.Summary = "Stopping compiler process tree…"
+            Me.Poller.Start()
+        End If
+        Me.Notify()
+    End Sub
+
+    Public Sub Shutdown()
+        Me.Cancel()
+        If Not Me.IsActive() Then Me.ReleaseSnapshot()
+        Me.Link = Nil
+    End Sub
+End Class
+
+Private Class StudioDiagnosticsTimer Inherits Timer
+    Public Property Owner As Weak StudioDiagnosticsJob
+    Public Overrides Sub NotifyTick()
+        Dim job As StudioDiagnosticsJob = Me.Owner
+        If job <> Nil Then job.Poll()
+    End Sub
+End Class
+
+Public Class StudioProblemsDataSource Inherits ListBoxDataSource
+    Public Property Items As Array Of StudioDiagnostic = []
+    Public Overrides Function RowCount() As Integer
+        Return Array.Count(Me.Items)
+    End Function
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        Dim label As New Label()
+        Dim width As Integer = 420
+        If column = 0 Then width = 70
+        If column = 1 Then width = 190
+        If column = 2 Or column = 3 Then width = 55
+        label.Move(4, 3, width - 8, 18)
+        label.FontSize = 12.0
+        cell.AddSubview(label)
+    End Sub
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        If row < 0 Or row >= Array.Count(Me.Items) Or cell.SubviewCount() = 0 Then Return
+        Dim label As Label = TryCast(cell.Subview(0), Label)
+        If label = Nil Then Return
+        Dim item As StudioDiagnostic = Me.Items(row)
+        Select Case column
+            Case 0
+                label.Text = item.Severity
+            Case 1
+                label.Text = item.FileName
+            Case 2
+                label.Text = String.From(item.Line)
+            Case 3
+                label.Text = String.From(item.Character)
+            Case Else
+                label.Text = item.Message
+                If item.Target <> "" Then label.Text = "[" + item.Target + "] " + item.Message
+        End Select
+    End Sub
+End Class
+
+Private Class StudioProblemsList Inherits ListBox
+    Public Property Owner As Weak StudioProblemsWindow
+    Handle SelectionChanged()
+        Dim target As StudioProblemsWindow = Me.Owner
+        Try
+            If target <> Nil Then target.SelectProblem(Me.SelectedRow)
+        Catch e As Exception
+            Print "Problem selection ignored: " + e.Message
+        End Try
+    End Handle
+End Class
+
+Private Class StudioProblemsStopButton Inherits Button
+    Public Property Owner As Weak StudioProblemsWindow
+    Handle Action()
+        Dim target As StudioProblemsWindow = Me.Owner
+        If target <> Nil Then
+            target.Job.Cancel()
+            target.RefreshResults()
+        End If
+    End Handle
+End Class
+
+Public Class StudioProblemsWindow Inherits Window
+    Public Property Job As StudioDiagnosticsJob
+    Public Property IsClosed As Boolean = False
+    Public Property Disposing As Boolean = False
+    Public Property HostLink As Weak StudioDiagnosticsLink
+    Public Property Status As Label = New Label()
+    Public Property Detail As TextArea = New TextArea()
+    Private Property StopButton As StudioProblemsStopButton = New StudioProblemsStopButton()
+    Private Property Source As StudioProblemsDataSource = New StudioProblemsDataSource()
+    Private Property Results As StudioProblemsList = New StudioProblemsList()
+
+    Public Sub Constructor(job As StudioDiagnosticsJob)
+        Super.Constructor()
+        Me.Job = job
+        Me.Title = "Project Problems"
+        Me.Move(120, 100, 960, 540)
+        Me.SetMinSize(900.0, 400.0)
+        Me.Status.Move(16, 16, 920, 24)
+        Me.AddSubview(Me.Status)
+        Me.StopButton.Owner = Me
+        Me.StopButton.Caption = "Stop Check"
+        Me.AddSubview(Me.StopButton)
+        Me.Results.Owner = Me
+        Me.Results.AddColumn("Kind", 70.0)
+        Me.Results.AddColumn("File", 190.0)
+        Me.Results.AddColumn("Line", 55.0)
+        Me.Results.AddColumn("Column", 55.0)
+        Me.Results.AddColumn("Message", 420.0)
+        Me.Results.DefaultRowHeight = 24.0
+        Me.Results.DataSource = Me.Source
+        Me.AddSubview(Me.Results)
+        Me.Detail.IsReadOnly = True
+        Me.AddSubview(Me.Detail)
+        Me.LayoutControls(960, 540)
+        Me.RefreshResults()
+    End Sub
+
+    Public Sub RefreshResults()
+        Me.Status.Text = Me.Job.Summary
+        Me.StopButton.Enabled = Me.Job.IsActive()
+        Me.Source.Items = Me.Job.Items
+        Me.Results.ReloadData()
+    End Sub
+
+    Public Sub SelectProblem(index As Integer)
+        If index < 0 Or index >= Array.Count(Me.Source.Items) Then Return
+        Dim item As StudioDiagnostic = Me.Source.Items(index)
+        Me.Detail.Text = item.Severity + " · " + item.FileName + ":" + String.From(item.Line) + ":" + String.From(item.Character) + "\n" + item.Message
+        If item.Target <> "" Then Me.Detail.Text = "[" + item.Target + "] " + Me.Detail.Text
+        Dim link As StudioDiagnosticsLink = Me.HostLink
+        If link <> Nil And link.Listener <> Nil Then link.Listener.DiagnosticSelected(item.FileName, item.Line, item.Character)
+    End Sub
+
+    Private Sub LayoutControls(width As Integer, height As Integer)
+        Me.Status.Move(16, 16, Math.Max(width - 156, 100), 24)
+        Me.StopButton.Move(width - 124, 12, 108, 30)
+        Me.Results.Move(16, 48, Math.Max(width - 32, 100), Math.Max(height - 190, 100))
+        Me.Detail.Move(16, height - 126, Math.Max(width - 32, 100), 110)
+    End Sub
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.LayoutControls(Math.Round(width), Math.Round(height))
+    End Handle
+
+    Handle Closing() As Boolean
+        If Not Me.Disposing Then
+            Me.Visible = False
+            Return True
+        End If
+        Return False
+    End Handle
+
+    Handle Closed()
+        Me.IsClosed = True
+    End Handle
+
+    Public Sub Dispose()
+        Me.HostLink = Nil
+        Me.IsClosed = True
+        ' Keep native child ownership intact until the Window is released. Calling
+        ' Close here and then releasing the child views double-destroys GTK peers
+        ' (BUI-103). Remove only after its saved native repro passes cleanly.
+        Me.Visible = False
+    End Sub
+End Class

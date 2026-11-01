@@ -1,0 +1,1268 @@
+Import desktopmenus
+Import StudioTesting
+
+''' One visible line of the results list: a configured/reported suite, one of its
+''' cases, or an explanatory note. Suite and CaseName hold the exact names.
+Public Class StudioTestRow
+    Public Property Kind As String
+    Public Property Suite As String
+    Public Property CaseName As String
+    Public Property Title As String
+    Public Property Status As String
+    Public Property DurationText As String
+    Public Property Key As String
+End Class
+
+''' Results list cells: Run mark, Test, Result, Duration — all plain text.
+Public Class StudioTestDataSource Inherits ListBoxDataSource
+    Public Property Rows As Array Of StudioTestRow = []
+    Public Property Marks As Map Of String, Boolean = New Map Of String, Boolean()
+    Public Property Widths As Array Of Integer = []
+
+    Public Overrides Function RowCount() As Integer
+        Return Array.Count(Me.Rows)
+    End Function
+
+    Public Overrides Sub SetupCell(cell As ListBoxCell, column As Integer)
+        Dim width As Integer = 120
+        If column >= 0 And column < Array.Count(Me.Widths) Then width = Me.Widths(column)
+        Dim label As New Label()
+        label.FontSize = 12.0
+        ' 20 points fits a 12-point line with descenders on Windows (18 clipped "y"/"g").
+        label.Move(6, 2, Math.Max(width - 12, 16), 20)
+        cell.AddSubview(label)
+    End Sub
+
+    Public Overrides Sub BindCell(cell As ListBoxCell, row As Integer, column As Integer)
+        ' Native callback: a stale row index or recycled cell must never throw.
+        Try
+            If row < 0 Or row >= Array.Count(Me.Rows) Or cell.SubviewCount() < 1 Then Return
+            Dim label As Label = TryCast(cell.Subview(0), Label)
+            If label = Nil Then Return
+            Dim item As StudioTestRow = Me.Rows(row)
+            Select Case column
+                Case 0
+                    label.Text = ""
+                    If item.Kind <> "note" Then
+                        label.Text = "☐"
+                        If Me.Marks.ContainsKey(item.Key) Then label.Text = "☑"
+                    End If
+                Case 1
+                    label.Text = item.Title
+                Case 2
+                    label.Text = item.Status
+                Case Else
+                    label.Text = item.DurationText
+            End Select
+        Catch e As Exception
+            Print "Test results row could not be drawn: " + e.Message
+        End Try
+    End Sub
+End Class
+
+Public Class StudioTestList Inherits ListBox
+    Public Property Owner As Weak StudioTestingWindow
+    Handle SelectionChanged()
+        Try
+            Dim target As StudioTestingWindow = Me.Owner
+            If target <> Nil Then target.RowSelected()
+        Catch e As Exception
+            Print "Test selection ignored: " + e.Message
+        End Try
+    End Handle
+End Class
+
+Public Class StudioTestButton Inherits Button
+    Public Property Owner As Weak StudioTestingWindow
+    Public Property ActionName As String
+    Handle Action()
+        Dim target As StudioTestingWindow = Me.Owner
+        If target <> Nil Then target.Command(Me.ActionName)
+    End Handle
+End Class
+
+Public Class StudioTestFilter Inherits ComboBox
+    Public Property Owner As Weak StudioTestingWindow
+    Handle SelectionChanged()
+        Dim target As StudioTestingWindow = Me.Owner
+        If target <> Nil Then target.Command("filter")
+    End Handle
+End Class
+
+''' Studio's Tests window. It is a view of the Studio window's StudioTestSession:
+''' closing it never stops a run, and reopening shows the same job and results.
+''' Closing only hides the view (Closing veto); Dispose closes it for real when
+''' Studio shuts down. The Linux runtime quits the whole run loop whenever any
+''' non-modal window really closes, so the view must not close while Studio runs.
+Public Class StudioTestingWindow Inherits Window Implements StudioTestListener
+    Public Property Session As StudioTestSession
+    Public Property IsClosed As Boolean = False
+    Public Property Disposing As Boolean = False
+    Public Property Source As StudioTestDataSource = New StudioTestDataSource()
+    Public Property AllRows As Array Of StudioTestRow = []
+    Public Property Results As StudioTestList = New StudioTestList()
+    Public Property RunAllButton As StudioTestButton = New StudioTestButton()
+    Public Property RunSelectedButton As StudioTestButton = New StudioTestButton()
+    Public Property RerunButton As StudioTestButton = New StudioTestButton()
+    Public Property StopButton As StudioTestButton = New StudioTestButton()
+    Public Property MarkButton As StudioTestButton = New StudioTestButton()
+    Public Property ClearButton As StudioTestButton = New StudioTestButton()
+    Public Property Filter As StudioTestFilter = New StudioTestFilter()
+    Public Property HeadlineLabel As Label = New Label()
+    Public Property DetailLabel As Label = New Label()
+    Public Property NoteLabel As Label = New Label()
+    Public Property SelectionLabel As Label = New Label()
+    Public Property DetailsHeading As Label = New Label()
+    Public Property DetailsText As TextArea = New TextArea()
+    Public Property FooterLabel As Label = New Label()
+    Public Property ProblemsOnly As Boolean = False
+    Public Property LastMessage As String
+    Private Property Link As StudioTestLink = New StudioTestLink()
+    Private Property Menus As MenuBar = New MenuBar()
+    Private Property StopItem As MenuItem
+    Private Property Rendering As Boolean = False
+    ''' The frame ShowForHost applies after each owned Show: the screen-fitted initial
+    ''' frame, then the frame the view had when it was last hidden or shown. Show(owner)
+    ''' centres the window over its owner, which can push it past the bottom of the screen.
+    Public Property PlaceLeft As Integer = 160
+    Public Property PlaceTop As Integer = 100
+    Public Property PlaceWidth As Integer = 1040
+    Public Property PlaceHeight As Integer = 720
+    Private Property HasShown As Boolean = False
+
+    Public Sub Constructor(session As StudioTestSession)
+        Super.Constructor()
+        Me.Session = session
+        Me.Title = "Buoy Tests"
+        Dim frameWidth As Integer = 1040
+        Dim frameHeight As Integer = 720
+        Dim frameLeft As Integer = 160
+        Dim frameTop As Integer = 100
+        Try
+            ' Buoy 0.72 has no work-area API: Screen reports the full monitor, and Move sets
+            ' the content size. So reserve fixed space instead: 32 points across, and below a
+            ' top of 48, another 48 for a Windows taskbar or Dock plus 64 for title bar,
+            ' menu bar and borders. This fits a 1280x800 screen with a default taskbar.
+            Dim display As Screen = System.Screen(0)
+            Dim screenWidth As Integer = Math.Round(display.Width)
+            Dim screenHeight As Integer = Math.Round(display.Height)
+            Dim screenLeft As Integer = Math.Round(display.Left)
+            Dim screenTop As Integer = Math.Round(display.Top)
+            frameWidth = Math.Max(720, Math.Min(1040, screenWidth - 32))
+            frameHeight = Math.Max(480, Math.Min(720, screenHeight - 48 - 48 - 64))
+            frameLeft = screenLeft + Math.Max(16, Math.Min(160, (screenWidth - frameWidth) \ 2))
+            frameTop = screenTop + 48
+        Catch e As Exception
+            ' Keep the fixed frame when the display cannot be queried.
+        End Try
+        Me.PlaceLeft = frameLeft
+        Me.PlaceTop = frameTop
+        Me.PlaceWidth = frameWidth
+        Me.PlaceHeight = frameHeight
+        Me.Move(frameLeft, frameTop, frameWidth, frameHeight)
+        Me.SetMinSize(720.0, 480.0)
+        Me.BuildMenus()
+        Me.ConfigureButton(Me.RunAllButton, "Run All", "run-all")
+        Me.ConfigureButton(Me.RunSelectedButton, "Run Selected", "run-selected")
+        Me.ConfigureButton(Me.RerunButton, "Rerun Failed", "rerun-failed")
+        Me.ConfigureButton(Me.StopButton, "Stop", "stop")
+        Me.ConfigureButton(Me.MarkButton, "Mark", "mark")
+        Me.ConfigureButton(Me.ClearButton, "Clear Marks", "clear-marks")
+        Me.Filter.Owner = Me
+        Me.Filter.AddItem("All results")
+        Me.Filter.AddItem("Problems only")
+        Me.Filter.SelectedIndex = 0
+        Me.AddSubview(Me.Filter)
+        Me.HeadlineLabel.Bold = True
+        Me.HeadlineLabel.FontSize = 14.0
+        Me.DetailLabel.Multiline = True
+        Me.DetailLabel.FontSize = 12.0
+        Me.NoteLabel.FontSize = 12.0
+        Me.SelectionLabel.FontSize = 11.0
+        Me.SelectionLabel.TextColor = Color.Gray
+        Me.DetailsHeading.Text = "Details"
+        Me.DetailsHeading.Bold = True
+        Me.FooterLabel.FontSize = 11.0
+        Me.FooterLabel.TextColor = Color.Gray
+        Me.DetailsText.IsReadOnly = True
+        Me.DetailsText.WordWrap = False
+        #If TargetMac Then
+            Me.DetailsText.FontName = "Menlo"
+        #Else
+            Me.DetailsText.FontName = "monospace"
+        #End If
+        Me.DetailsText.FontSize = 11.0
+        For Each label As Label In [Me.HeadlineLabel, Me.DetailLabel, Me.NoteLabel, Me.SelectionLabel, Me.DetailsHeading, Me.FooterLabel]
+            Me.AddSubview(label)
+        Next
+        ' Columns cannot be resized after AddColumn, so they fit the list at the
+        ' 720-point minimum window (688 wide) with room for a vertical scroll bar.
+        ' Labels clip without an ellipsis, so Result fits "(stale) ■ Cancelled (interrupted)".
+        Me.Source.Widths = [44, 300, 250, 80]
+        Me.Results.Owner = Me
+        Me.Results.DefaultRowHeight = 24.0
+        Me.Results.AddColumn("Run", 44.0)
+        Me.Results.AddColumn("Test", 300.0)
+        Me.Results.AddColumn("Result", 250.0)
+        Me.Results.AddColumn("Duration", 80.0)
+        Me.Results.DataSource = Me.Source
+        Me.AddSubview(Me.Results)
+        Me.AddSubview(Me.DetailsText)
+        Me.Link.Listener = Me
+        Me.Session.UILink = Me.Link
+        Me.LayoutControls(frameWidth, frameHeight)
+        Me.Render()
+    End Sub
+
+    Private Sub ConfigureButton(button As StudioTestButton, caption As String, actionName As String)
+        button.Owner = Me
+        button.Caption = caption
+        button.ActionName = actionName
+        Me.AddSubview(button)
+    End Sub
+
+    Private Function Shortcut(key As String) As String
+        #If TargetMac Then
+            Return "Cmd+" + key
+        #Else
+            Return "Ctrl+" + key
+        #End If
+    End Function
+
+    Private Function MenuEntry(menu As Menu, caption As String, tag As String, shortcut As String) As MenuItem
+        Dim item As New MenuItem()
+        item.Caption = caption
+        item.Tag = tag
+        If shortcut <> "" Then item.Shortcut = shortcut
+        menu.AddItem(item)
+        Return item
+    End Function
+
+    ''' Its own MenuBar instance (required on Linux for per-window dispatch).
+    Private Sub BuildMenus()
+        Dim fileMenu As New Menu()
+        Me.MenuEntry(fileMenu, "Close Tests", "close", Me.Shortcut("W"))
+        Dim testMenu As New Menu()
+        Me.MenuEntry(testMenu, "Run All Tests", "run-all", Me.Shortcut("U"))
+        Me.MenuEntry(testMenu, "Run Selected", "run-selected", Me.Shortcut("Shift+U"))
+        Me.MenuEntry(testMenu, "Rerun Failed", "rerun-failed", Me.Shortcut("Alt+U"))
+        Me.StopItem = Me.MenuEntry(testMenu, "Stop", "stop", Me.Shortcut("."))
+        testMenu.AddSeparator()
+        Me.MenuEntry(testMenu, "Mark or Unmark for Run", "mark", "")
+        Me.MenuEntry(testMenu, "Clear Marks", "clear-marks", "")
+        testMenu.AddSeparator()
+        Me.MenuEntry(testMenu, "Reload Configuration", "reload", "")
+        Me.Menus.AddMenu(fileMenu, "File")
+        Me.Menus.AddMenu(testMenu, "Test")
+        #If TargetMac Then
+            Dim helpMenu As New Menu()
+            Me.Menus.AddMenu(helpMenu, "Help")
+        #End If
+        Me.MenuBar = Me.Menus
+        RegisterSystemMenus()
+    End Sub
+
+    Public Sub LayoutControls(width As Integer, height As Integer)
+        Dim x As Integer = 16
+        For Each pair As Pair Of StudioTestButton, Integer In [New Pair Of StudioTestButton, Integer(Me.RunAllButton, 92), New Pair Of StudioTestButton, Integer(Me.RunSelectedButton, 120), New Pair Of StudioTestButton, Integer(Me.RerunButton, 116), New Pair Of StudioTestButton, Integer(Me.StopButton, 100)]
+            pair.Key.Move(x, 12, pair.Value, 30)
+            x += pair.Value + 8
+        Next
+        x += 16
+        Me.MarkButton.Move(x, 12, 84, 30)
+        Me.ClearButton.Move(x + 92, 12, 108, 30)
+        Dim inner As Integer = width - 32
+        Dim headlineWidth As Integer = inner
+        If x + 200 + 16 + 160 <= width - 16 Then
+            Me.Filter.Move(width - 176, 14, 160, 28)
+        Else
+            ' Narrow window: the filter shares the headline row instead of leaving the window.
+            Me.Filter.Move(width - 176, 47, 160, 28)
+            headlineWidth = inner - 172
+        End If
+        Me.HeadlineLabel.Move(16, 52, headlineWidth, 22)
+        Me.DetailLabel.Move(16, 76, inner, 36)
+        Me.NoteLabel.Move(16, 114, inner, 20)
+        Me.SelectionLabel.Move(16, 136, inner, 19)
+        Dim listTop As Integer = 158
+        Dim available As Integer = height - listTop - 60
+        Dim listHeight As Integer = Math.Max(120, (available * 58) \ 100)
+        Me.Results.Move(16, listTop, inner, listHeight)
+        Me.DetailsHeading.Move(16, listTop + listHeight + 8, inner, 18)
+        Dim detailsTop As Integer = listTop + listHeight + 28
+        Me.DetailsText.Move(16, detailsTop, inner, Math.Max(60, height - detailsTop - 34))
+        Me.FooterLabel.Move(16, height - 28, inner, 18)
+    End Sub
+
+    ' ---- Rows ----------------------------------------------------------------------------
+
+    Private Function RowKey(suite As String, caseName As String) As String
+        Dim parts As JSONItem = JSONItem.NewArray()
+        parts.Add(suite)
+        If caseName <> "" Or suite = "" Then parts.Add(caseName)
+        Return parts.ToString()
+    End Function
+
+    Private Function NewRow(kind As String, suite As String, caseName As String, title As String, status As String, duration As String) As StudioTestRow
+        Dim item As New StudioTestRow()
+        item.Kind = kind
+        item.Suite = suite
+        item.CaseName = caseName
+        item.Title = title
+        item.Status = status
+        item.DurationText = duration
+        item.Key = Me.RowKey(suite, caseName)
+        If kind = "case" Then
+            ' A case named "" still needs a key distinct from its suite.
+            Dim parts As JSONItem = JSONItem.NewArray()
+            parts.Add(suite)
+            parts.Add(caseName)
+            item.Key = parts.ToString()
+        End If
+        Return item
+    End Function
+
+    Private Function SuiteHasProblem(outcome As StudioTestSuiteResult) As Boolean
+        If outcome = Nil Then Return False
+        If StudioTestIsBad(outcome.Status) Or outcome.Cancelled Then Return True
+        For Each entry As StudioTestCaseResult In outcome.Cases
+            If StudioTestCaseKind(entry) = "failed" Then Return True
+        Next
+        Return False
+    End Function
+
+    Private Sub AddSuiteRows(rows As Array Of StudioTestRow, name As String, config As StudioTestSuiteConfig, outcome As StudioTestSuiteResult, report As StudioTestReport)
+        ' Per suite: an edit to one suite's inputs leaves the other suites' results current.
+        Dim stale As String = ""
+        If Me.Session.ResultsStaleFor(name) Then stale = "(stale) "
+        Dim title As String = StudioTestDisplayName(name)
+        If config = Nil Then
+            title += "  (no longer configured)"
+        ElseIf String.Compare(config.RuntimeSuite, config.Name, True) <> 0 Then
+            title += "  · TestKit suite “" + StudioTestDisplayName(config.RuntimeSuite) + "”"
+        End If
+        Dim status As String
+        Dim duration As String = "—"
+        If outcome <> Nil Then
+            status = StudioTestSuiteStatusText(outcome)
+            duration = StudioTestDuration(outcome.Duration, outcome.HasDuration)
+        ElseIf report = Nil Then
+            status = "○ Not run yet"
+        ElseIf report.WasNotRun(name) Then
+            status = "○ Not run (cancelled first)"
+        Else
+            status = "○ Not in this run"
+        End If
+        If outcome <> Nil Or report <> Nil Then status = stale + status
+        rows.Append(Me.NewRow("suite", name, "", title, status, duration))
+        If outcome = Nil Then Return
+        For Each entry As StudioTestCaseResult In outcome.Cases
+            Dim row As StudioTestRow = Me.NewRow("case", name, entry.Name, "      " + StudioTestDisplayName(entry.Name), stale + StudioTestCaseStatusText(entry), StudioTestDuration(entry.Duration, entry.HasDuration))
+            rows.Append(row)
+        Next
+    End Sub
+
+    Public Sub RebuildRows()
+        Dim rows As Array Of StudioTestRow = []
+        Dim report As StudioTestReport = Me.Session.Report
+        For Each config As StudioTestSuiteConfig In Me.Session.Suites
+            Dim outcome As StudioTestSuiteResult = Nil
+            If report <> Nil Then outcome = report.SuiteNamed(config.Name)
+            Me.AddSuiteRows(rows, config.Name, config, outcome, report)
+        Next
+        If report <> Nil Then
+            For Each outcome As StudioTestSuiteResult In report.Suites
+                If Me.Session.ConfigNamed(outcome.Name) = Nil Then Me.AddSuiteRows(rows, outcome.Name, Nil, outcome, report)
+            Next
+        End If
+        Me.AllRows = rows
+        ' Marks follow names, not row positions; names that disappeared are dropped.
+        Dim keep As New Map Of String, Boolean()
+        For Each item As StudioTestRow In rows
+            If Me.Source.Marks.ContainsKey(item.Key) Then keep.Set(item.Key, True)
+        Next
+        Me.Source.Marks = keep
+        Dim visible As Array Of StudioTestRow = []
+        If Me.ProblemsOnly Then
+            For Each item As StudioTestRow In rows
+                Dim outcome As StudioTestSuiteResult = Nil
+                If report <> Nil Then outcome = report.SuiteNamed(item.Suite)
+                If item.Kind = "suite" And Me.SuiteHasProblem(outcome) Then visible.Append(item)
+                If item.Kind = "case" And Me.SuiteHasProblem(outcome) Then
+                    Dim entry As StudioTestCaseResult = Me.CaseNamed(outcome, item.CaseName)
+                    If entry <> Nil Then
+                        If StudioTestCaseKind(entry) = "failed" Then visible.Append(item)
+                    End If
+                End If
+            Next
+            If Array.Count(visible) = 0 Then
+                Dim message As String = "No problems in the shown results."
+                If report = Nil Then message = "No results yet."
+                visible.Append(Me.NewRow("note", "", "", message, "", ""))
+            End If
+        Else
+            visible = rows
+            If Array.Count(visible) = 0 Then visible.Append(Me.NewRow("note", "", "", "No suites are configured.", "", ""))
+        End If
+        Dim selectedKey As String = ""
+        Dim current As StudioTestRow = Me.SelectedRow()
+        If current <> Nil Then selectedKey = current.Key
+        Me.Source.Rows = visible
+        Me.Results.ReloadData()
+        Me.Results.SelectedRow = -1
+        If selectedKey <> "" Then
+            For i As Integer = 0 To Array.Count(visible) - 1
+                If visible(i).Key = selectedKey And String.Compare(visible(i).Key, selectedKey, True) = 0 Then Me.Results.SelectedRow = i
+            Next
+        End If
+    End Sub
+
+    Public Function CaseNamed(outcome As StudioTestSuiteResult, name As String) As StudioTestCaseResult
+        If outcome = Nil Then Return Nil
+        For Each entry As StudioTestCaseResult In outcome.Cases
+            If String.Compare(entry.Name, name, True) = 0 Then Return entry
+        Next
+        Return Nil
+    End Function
+
+    Public Function SelectedRow() As StudioTestRow
+        Dim index As Integer = Me.Results.SelectedRow
+        If index < 0 Or index >= Array.Count(Me.Source.Rows) Then Return Nil
+        Dim item As StudioTestRow = Me.Source.Rows(index)
+        If item.Kind = "note" Then Return Nil
+        Return item
+    End Function
+
+    Public Function FindRow(suite As String, caseName As String) As Integer
+        For i As Integer = 0 To Array.Count(Me.Source.Rows) - 1
+            Dim item As StudioTestRow = Me.Source.Rows(i)
+            If item.Kind <> "note" And String.Compare(item.Suite, suite, True) = 0 And String.Compare(item.CaseName, caseName, True) = 0 Then
+                If caseName = "" And item.Kind = "suite" Then Return i
+                If caseName <> "" And item.Kind = "case" Then Return i
+            End If
+        Next
+        Return -1
+    End Function
+
+    ''' Marked rows win; otherwise the highlighted row. Suites are requested whole,
+    ''' cases by exact name, and a whole-suite request absorbs its cases.
+    Public Function SelectionEntries() As Array Of StudioTestSelectionEntry
+        Dim chosen As Array Of StudioTestRow = []
+        For Each item As StudioTestRow In Me.AllRows
+            If Me.Source.Marks.ContainsKey(item.Key) Then chosen.Append(item)
+        Next
+        If Array.Count(chosen) = 0 Then
+            Dim current As StudioTestRow = Me.SelectedRow()
+            If current <> Nil Then chosen.Append(current)
+        End If
+        Dim entries As Array Of StudioTestSelectionEntry = []
+        For Each item As StudioTestRow In chosen
+            Dim entry As StudioTestSelectionEntry = Nil
+            For Each existing As StudioTestSelectionEntry In entries
+                If String.Compare(existing.Suite, item.Suite, True) = 0 Then entry = existing
+            Next
+            If entry = Nil Then
+                entry = New StudioTestSelectionEntry()
+                entry.Suite = item.Suite
+                entries.Append(entry)
+            End If
+            If item.Kind = "suite" Then
+                entry.Whole = True
+            Else
+                entry.Cases.Append(item.CaseName)
+            End If
+        Next
+        For Each entry As StudioTestSelectionEntry In entries
+            If entry.Whole Then entry.Cases = []
+        Next
+        Return entries
+    End Function
+
+    Private Function SelectionSummary() As String
+        Dim marked As Integer = Me.Source.Marks.Count()
+        If marked > 0 Then
+            Dim text As String = "Run Selected uses " + String.From(marked) + " marked item"
+            If marked <> 1 Then text += "s"
+            Return text + ". Clear the marks to run the highlighted row instead."
+        End If
+        Dim current As StudioTestRow = Me.SelectedRow()
+        If current = Nil Then Return "Highlight a suite or case (or mark several) to enable Run Selected."
+        If current.Kind = "suite" Then Return "Run Selected runs the whole suite “" + StudioTestDisplayName(current.Suite) + "”."
+        Return "Run Selected runs only the case “" + StudioTestDisplayName(current.CaseName) + "” of suite “" + StudioTestDisplayName(current.Suite) + "”."
+    End Function
+
+    ' ---- Rendering -----------------------------------------------------------------------
+
+    Public Sub Render()
+        If Me.IsClosed Or Me.Rendering Then Return
+        Me.Rendering = True
+        Try
+            Dim session As StudioTestSession = Me.Session
+            Dim running As Boolean = session.IsRunning()
+            Dim headline As String = session.Headline
+            If running Then headline += " · " + String.From(session.ElapsedSeconds()) + " s elapsed"
+            Me.HeadlineLabel.Text = headline
+            Me.DetailLabel.Text = session.Detail
+            Me.NoteLabel.Text = session.ResultsNote
+            If session.Report <> Nil Then
+                If session.Report.RepeatSummary <> "" Then Me.NoteLabel.Text = session.ResultsNote + " " + session.Report.RepeatSummary
+            End If
+            Me.RebuildRows()
+            Dim canStart As Boolean = Not running And session.ConfigError = ""
+            Me.RunAllButton.Enabled = canStart
+            Me.RunSelectedButton.Enabled = canStart And Array.Count(Me.SelectionEntries()) > 0
+            Me.RerunButton.Enabled = canStart And session.CanRerunFailed()
+            Me.StopButton.Enabled = running
+            Me.StopButton.Caption = "Stop"
+            If session.State = "stopping" Then Me.StopButton.Caption = "Force Stop"
+            If Me.StopItem <> Nil Then Me.StopItem.Caption = Me.StopButton.Caption
+            Me.RenderSelection()
+            Dim runner As String = StudioTestRunnerPath(session.ProjectRoot)
+            If runner = "" Then runner = "(no project)"
+            Dim config As String = session.ConfigPath
+            If config = "" Then config = "(no project)"
+            Me.FooterLabel.Text = "Runner: " + runner + "   ·   Configuration: " + config
+        Catch e As Exception
+            Print "Tests window could not refresh: " + e.Message
+        End Try
+        Me.Rendering = False
+    End Sub
+
+    Private Sub RenderSelection()
+        Dim current As StudioTestRow = Me.SelectedRow()
+        Me.MarkButton.Enabled = current <> Nil
+        Me.MarkButton.Caption = "Mark"
+        If current <> Nil Then
+            If Me.Source.Marks.ContainsKey(current.Key) Then Me.MarkButton.Caption = "Unmark"
+        End If
+        Me.ClearButton.Enabled = Me.Source.Marks.Count() > 0
+        Me.SelectionLabel.Text = Me.SelectionSummary()
+        Dim details As String = Me.DetailsFor(current)
+        #If TargetWindows Then
+            ' Buoy 0.72's Windows TextArea shows bare LF as nothing, running lines together.
+            details = String.Replace(details, "\r\n", "\n")
+            details = String.Replace(details, "\r", "\n")
+            details = String.Replace(details, "\n", "\r\n")
+        #End If
+        Me.DetailsText.Text = details
+    End Sub
+
+    Public Function DetailsFor(current As StudioTestRow) As String
+        Dim session As StudioTestSession = Me.Session
+        Dim lines As Array Of String = []
+        If current = Nil Then
+            lines.Append(session.Headline)
+            If session.Detail <> "" Then lines.Append(session.Detail)
+            If session.ResultsNote <> "" Then lines.Append(session.ResultsNote)
+            If Array.Count(session.LastArguments) > 0 Then
+                lines.Append("")
+                lines.Append("Last runner arguments (run #" + String.From(session.RunNumber) + "):")
+                For Each argument As String In session.LastArguments
+                    lines.Append("  " + JSONItem.From(argument).ToString())
+                Next
+            End If
+            Me.AppendFreshness(lines, session)
+            lines.Append("")
+            lines.Append("Select a suite or case to see its outcome, diagnostics and logs.")
+            Return String.Join(lines, "\n")
+        End If
+        Dim report As StudioTestReport = session.Report
+        Dim outcome As StudioTestSuiteResult = Nil
+        If report <> Nil Then outcome = report.SuiteNamed(current.Suite)
+        Dim config As StudioTestSuiteConfig = session.ConfigNamed(current.Suite)
+        Dim origin As String = ""
+        If report <> Nil Then origin = " — " + session.ResultsNote
+        If current.Kind = "case" Then
+            Dim entry As StudioTestCaseResult = Me.CaseNamed(outcome, current.CaseName)
+            lines.Append("Case: " + StudioTestDisplayName(current.CaseName))
+            lines.Append("Exact name: " + JSONItem.From(current.CaseName).ToString())
+            lines.Append("Suite: " + StudioTestDisplayName(current.Suite))
+            If entry <> Nil Then
+                lines.Append("Result: " + StudioTestCaseStatusText(entry) + origin)
+                If entry.Selected Then
+                    lines.Append("Selected: yes")
+                Else
+                    lines.Append("Selected: no — excluded by this run's selection; not a skip by the test")
+                End If
+                lines.Append("Duration: " + StudioTestDuration(entry.Duration, entry.HasDuration))
+                If entry.Message <> "" Then lines.Append("Message: " + entry.Message)
+                If Array.Count(entry.Diagnostics) > 0 Then
+                    lines.Append("Diagnostics:")
+                    For Each detail As String In entry.Diagnostics
+                        lines.Append("  " + detail)
+                    Next
+                End If
+            End If
+            Return String.Join(lines, "\n")
+        End If
+        lines.Append("Suite: " + StudioTestDisplayName(current.Suite))
+        If config = Nil Then
+            lines.Append("Configuration: no longer in buoy.dev.json")
+        Else
+            Dim protocolText As String = "Protocol: " + config.Protocol
+            If config.Protocol = "testkit" Then protocolText += " · runtime TestKit suite “" + StudioTestDisplayName(config.RuntimeSuite) + "”"
+            If config.Protocol <> "testkit" Then protocolText += " · exit status only; cases cannot be selected"
+            lines.Append(protocolText)
+        End If
+        If outcome = Nil Then
+            lines.Append("Result: " + current.Status)
+            Return String.Join(lines, "\n")
+        End If
+        lines.Append("Result: " + StudioTestSuiteStatusText(outcome) + origin)
+        If report.Inputs <> Nil Then
+            Dim changes As Array Of String = report.Inputs.ChangesFor(current.Suite)
+            If Array.Count(changes) > 0 Then
+                lines.Append("Inputs of run #" + String.From(report.RunNumber) + " changed: " + String.Join(changes, "; "))
+            Else
+                lines.Append("Inputs: " + String.From(report.Inputs.FilesFor(current.Suite)) + " tracked files unchanged since run #" + String.From(report.RunNumber) + " started")
+            End If
+        End If
+        lines.Append("Run-phase duration: " + StudioTestDuration(outcome.Duration, outcome.HasDuration))
+        If outcome.Message <> "" Then lines.Append("Message: " + outcome.Message)
+        If Array.Count(outcome.Cases) > 0 Then
+            Dim counts As Array Of String = []
+            For Each kind As String In ["passed", "failed", "skipped", "unselected"]
+                Dim count As Integer = 0
+                For Each entry As StudioTestCaseResult In outcome.Cases
+                    If StudioTestCaseKind(entry) = kind Then count += 1
+                Next
+                Dim word As String = kind
+                If kind = "unselected" Then word = "not selected"
+                If count > 0 Then counts.Append(String.From(count) + " " + word)
+            Next
+            lines.Append("Cases: " + String.Join(counts, ", "))
+        End If
+        If outcome.Iterations > 1 Then lines.Append("Iterations recorded: " + String.From(outcome.Iterations) + " (this is the representative record)")
+        If outcome.StepsText <> "" Then
+            lines.Append("")
+            lines.Append(outcome.StepsText)
+        End If
+        Return String.Join(lines, "\n")
+    End Function
+
+    ''' What freshness covers for the shown results, and what it cannot see.
+    Private Sub AppendFreshness(lines As Array Of String, session As StudioTestSession)
+        Dim report As StudioTestReport = session.Report
+        If report = Nil Then Return
+        If report.Inputs = Nil Then Return
+        Dim inputs As StudioTestInputs = report.Inputs
+        lines.Append("")
+        lines.Append("Freshness of run #" + String.From(report.RunNumber) + ": " + String.From(inputs.TrackedFiles()) + " input files recorded when it started (buoy.dev.json and each suite's files, packages and source). Size and modification times rotate through up to 400 entries per second; a full pass can take about 50 seconds near the tracking limit. Recently saved files also receive bounded content checks.")
+        Dim listed As Integer = 0
+        For Each change As StudioTestInputChange In inputs.Changes
+            If listed = 20 Then
+                lines.Append("  … and " + String.From(Array.Count(inputs.Changes) - listed) + " more changes")
+                Exit For
+            End If
+            lines.Append("  " + change.Describe())
+            listed += 1
+        Next
+        If inputs.Problem <> "" Then lines.Append("  Tracking is incomplete: " + inputs.Problem + ".")
+        If inputs.Unverified > 0 Then lines.Append("  " + String.From(inputs.Unverified) + " recently saved files could not be compared by content (unreadable, over 1 MiB, or beyond the combined 8 MiB budget); a same-size edit within the same second would be missed.")
+        If Array.Count(report.UnsavedInputs) > 0 Then lines.Append("  Not tested: unsaved editor changes to " + String.Join(report.UnsavedInputs, ", ") + ".")
+        lines.Append("  Not tracked: the compiler and installed packages, the runner, environment variables, files a test reads outside its staged inputs, and unsaved editor changes (runs test the saved files).")
+    End Sub
+
+    ' ---- Actions -------------------------------------------------------------------------
+
+    Public Sub RowSelected()
+        If Me.Rendering Then Return
+        Me.Render()
+    End Sub
+
+    Public Sub Command(name As String)
+        Try
+            Select Case name
+                Case "run-all"
+                    Me.Session.RunAll()
+                Case "run-selected"
+                    Me.Session.RunSelection(Me.SelectionEntries())
+                Case "rerun-failed"
+                    Me.Session.RerunFailed()
+                Case "stop"
+                    Me.Session.StopRun()
+                Case "mark"
+                    Dim current As StudioTestRow = Me.SelectedRow()
+                    If current <> Nil Then
+                        If Me.Source.Marks.ContainsKey(current.Key) Then
+                            Me.Source.Marks.Remove(current.Key)
+                        Else
+                            Me.Source.Marks.Set(current.Key, True)
+                        End If
+                    End If
+                    Me.Render()
+                Case "clear-marks"
+                    Me.Source.Marks.Clear()
+                    Me.Render()
+                Case "filter"
+                    Me.ProblemsOnly = Me.Filter.SelectedIndex = 1
+                    Me.Render()
+                Case "reload"
+                    Me.Session.ReloadConfiguration()
+                Case "close"
+                    Me.Close()
+            End Select
+        Catch e As Exception
+            Me.TestSessionMessage("Tests: " + e.Message)
+        End Try
+    End Sub
+
+    Public Sub TestSessionChanged()
+        Me.Render()
+    End Sub
+
+    Public Sub TestSessionMessage(message As String)
+        Me.LastMessage = message
+        If Not Me.IsClosed And Not Me.Session.IsRunning() And (Me.Session.State = "idle" Or Me.Session.State = "unavailable") Then Me.DetailLabel.Text = message
+    End Sub
+
+    Handle MenuSelected(item As MenuItem) As Boolean
+        Me.Command(item.Tag)
+        Return True
+    End Handle
+
+    Handle Activated()
+        RegisterSystemMenus()
+    End Handle
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Dim w As Integer = width
+        Dim h As Integer = height
+        Me.LayoutControls(w, h)
+    End Handle
+
+    ''' Shows the view owned by `owner` (kept above it and closed with it) at its own
+    ''' frame. Show(owner) centres the window over the owner, so the frame is applied
+    ''' again afterwards: the screen-fitted frame the first time, and later the frame the
+    ''' view had when it was hidden, or its current frame when it is already visible.
+    ''' Linux ignores window positions, so there only the size is reapplied.
+    Public Sub ShowForHost(owner As Window)
+        If Me.HasShown And Me.Visible Then Me.RememberFrame()
+        Me.Show(owner)
+        Me.HasShown = True
+        Me.Move(Me.PlaceLeft, Me.PlaceTop, Me.PlaceWidth, Me.PlaceHeight)
+    End Sub
+
+    Private Sub RememberFrame()
+        ' Windows parks a minimised window at (-32000, -32000); keep the last real frame.
+        If Me.X <= -30000 Or Me.Y <= -30000 Or Me.Width <= 0 Or Me.Height <= 0 Then Return
+        Me.PlaceLeft = Me.X
+        Me.PlaceTop = Me.Y
+        Me.PlaceWidth = Me.Width
+        Me.PlaceHeight = Me.Height
+    End Sub
+
+    ''' Really closes the view; only for Studio's own shutdown.
+    Public Sub Dispose()
+        Me.Disposing = True
+        If Not Me.IsClosed Then Me.Close()
+    End Sub
+
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.RememberFrame()
+        Me.Visible = False
+        Return True
+    End Handle
+
+    Handle Closed()
+        ' Closing the view never stops the run; Studio's window owns the session.
+        Me.IsClosed = True
+        Me.Link.Listener = Nil
+    End Handle
+End Class
+
+Private Sub HarnessNeed(passed As Boolean, message As String)
+    If Not passed Then Throw New Exception(message)
+End Sub
+
+Private Function HarnessSame(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+''' Native Tests-window harness (`--testing-test SCENARIO`). It drives the real window
+''' through button clicks and list selection against a configured runner and prints a
+''' distinct verdict line. Scenarios: contract (scripted fake runner), missing-runner,
+''' real (the native buoy-dev against a fixture project).
+Public Class StudioTestingHarness Inherits Timer Implements StudioTestUnsavedSource
+    Public Property Window As StudioTestingWindow
+    ''' Studio's window: reopening shows the Tests view owned by it, as ShowTests does.
+    Public Property Host As Window
+    Public Property Scenario As String
+    Public Property StepIndex As Integer = 0
+    Public Property Waiting As Boolean = False
+    Public Property Ticks As Integer = 0
+    Public Property StopAtTick As Integer = 0
+    ''' Stop also waits for this file: the scripted runner's call log, so a slow runner
+    ''' start (a Windows shim relaunching Python) records its inputs before the cancel file.
+    Public Property StopWhenFile As String
+    Public Property Checks As Integer = 0
+    Public Property Saved As String
+    ''' The next step waits (bounded by the overall tick limit) until this suite's
+    ''' results are marked stale by the freshness timer.
+    Public Property HoldSuite As String
+    ''' Project-relative files the harness reports as unsaved in an editor.
+    Public Property Unsaved As Array Of String = []
+    Private Property UnsavedHolder As StudioTestUnsavedLink = New StudioTestUnsavedLink()
+
+    Private Function S() As StudioTestSession
+        Return Me.Window.Session
+    End Function
+
+    Public Function UnsavedTestPaths() As Array Of String
+        Dim paths As Array Of String = []
+        For Each relative As String In Me.Unsaved
+            paths.Append(StudioNativeJoin(Me.S().ProjectRoot, relative))
+        Next
+        Return paths
+    End Function
+
+    Private Function ProjectFile(relative As String) As FileSystemItem
+        Return New FileSystemItem(StudioNativeJoin(Me.S().ProjectRoot, relative))
+    End Function
+
+    Private Sub WriteProjectFile(relative As String, text As String)
+        Dim written As Result Of Integer, String = Me.ProjectFile(relative).WriteAllText(text)
+        HarnessNeed(written.IsOk, "wrote " + relative)
+    End Sub
+
+    Private Sub ExpectFresh(suite As String)
+        Dim status As String = Me.RowStatus(suite, "")
+        HarnessNeed(Not String.Contains(status, "(stale)", True), suite + " should still be current: \"" + status + "\" · " + Me.S().ResultsNote)
+        Me.Checks += 1
+    End Sub
+
+    Private Function FakeCallLog(index As Integer) As String
+        Dim folder As String = System.EnvironmentVariable("STUDIO_FAKE_LOG").Or("")
+        If folder = "" Then Return ""
+        Return StudioNativeJoin(folder, "call-" + String.From(index) + ".json")
+    End Function
+
+    Private Function StopReady() As Boolean
+        If Me.StopWhenFile = "" Then Return True
+        Return New FileSystemItem(Me.StopWhenFile).IsFile()
+    End Function
+
+    Private Function RowStatus(suite As String, caseName As String) As String
+        Dim index As Integer = Me.Window.FindRow(suite, caseName)
+        HarnessNeed(index >= 0, "row for " + suite + " / " + caseName)
+        Return Me.Window.Source.Rows(index).Status
+    End Function
+
+    Private Sub Expect(suite As String, caseName As String, fragment As String)
+        Dim status As String = Me.RowStatus(suite, caseName)
+        HarnessNeed(String.Contains(status, fragment, True), suite + " / " + caseName + " shows \"" + status + "\", expected \"" + fragment + "\"")
+        Me.Checks += 1
+    End Sub
+
+    Private Sub Highlight(suite As String, caseName As String)
+        Dim index As Integer = Me.Window.FindRow(suite, caseName)
+        HarnessNeed(index >= 0, "highlight " + suite + " / " + caseName)
+        Me.Window.Results.PerformSelectionChanged(index)
+        Dim current As StudioTestRow = Me.Window.SelectedRow()
+        HarnessNeed(current <> Nil, "selection reached the window")
+        HarnessNeed(HarnessSame(current.CaseName, caseName), "highlighted the exact case")
+    End Sub
+
+    Private Sub Mark(suite As String, caseName As String)
+        Me.Highlight(suite, caseName)
+        Me.Window.MarkButton.PerformClick()
+        HarnessNeed(Me.Window.MarkButton.Caption = "Unmark", "Mark toggles to Unmark")
+    End Sub
+
+    Private Sub Contains(text As String, fragment As String, label As String)
+        HarnessNeed(String.Contains(text, fragment, True), label + ": \"" + text + "\" lacks \"" + fragment + "\"")
+        Me.Checks += 1
+    End Sub
+
+    Private Sub StartedRun(expectedRun As Integer)
+        HarnessNeed(Me.S().IsRunning(), "run started: " + Me.S().Headline + " " + Me.S().Detail)
+        HarnessNeed(Me.S().RunNumber = expectedRun, "run number " + String.From(expectedRun))
+        HarnessNeed(Not Me.Window.RunAllButton.Enabled And Not Me.Window.RunSelectedButton.Enabled And Not Me.Window.RerunButton.Enabled, "start buttons disabled while running")
+        HarnessNeed(Me.Window.StopButton.Enabled, "Stop enabled while running")
+        Me.Contains(Me.S().Detail, "does not show per-case progress", "running detail")
+        Me.Waiting = True
+    End Sub
+
+    Private Function OddName() As String
+        Return "odd * ? [x] \"q\"\nline"
+    End Function
+
+    Public Overrides Sub NotifyTick()
+        Me.Ticks += 1
+        Dim done As Boolean = False
+        Try
+            If Me.Ticks > 2400 Then Throw New Exception("timed out at step " + String.From(Me.StepIndex) + ": " + Me.S().Headline)
+            If Me.Waiting Then
+                If Me.StopAtTick > 0 And Me.Ticks >= Me.StopAtTick And Me.StopReady() Then
+                    Me.StopAtTick = 0
+                    Me.StopWhenFile = ""
+                    Me.Window.StopButton.PerformClick()
+                    HarnessNeed(Me.S().State = "stopping", "Stop requests cooperative cancellation")
+                    HarnessNeed(New FileSystemItem(Me.S().ActiveCancelPath).IsFile(), "cancel file written")
+                End If
+                If Me.S().IsRunning() Then Return
+                Me.Waiting = False
+            End If
+            If Me.HoldSuite <> "" Then
+                If Not Me.S().InputsChangedFor(Me.HoldSuite) Then Return
+                Me.HoldSuite = ""
+            End If
+            If Me.Scenario = "contract" Then
+                done = Me.Contract()
+            ElseIf Me.Scenario = "missing-runner" Then
+                done = Me.MissingRunner()
+            ElseIf Me.Scenario = "real" Then
+                done = Me.Real()
+            Else
+                Throw New Exception("unknown scenario " + Me.Scenario)
+            End If
+            Me.StepIndex += 1
+            If done Then Print "BUOY STUDIO TESTING TEST PASSED: " + Me.Scenario + " · " + String.From(Me.Checks) + " checks"
+        Catch e As Exception
+            Print "BUOY STUDIO TESTING TEST FAILED: " + Me.Scenario + " step " + String.From(Me.StepIndex) + ": " + e.Message
+            done = True
+        End Try
+        If done Then
+            Me.Stop()
+            Dim warning As String = Me.S().Shutdown(3000)
+            If warning <> "" Then Print warning
+            Application.Quit()
+        End If
+    End Sub
+
+    Private Function Contract() As Boolean
+        Dim w As StudioTestingWindow = Me.Window
+        Dim s As StudioTestSession = Me.S()
+        Select Case Me.StepIndex
+            Case 0
+                HarnessNeed(Array.Count(s.Suites) = 3, "three configured suites: " + s.ConfigError)
+                Me.Expect("alpha", "", "Not run yet")
+                Me.Expect("gamma*?[x]", "", "Not run yet")
+                Me.Contains(w.Source.Rows(w.FindRow("alpha", "")).Title, "TestKit suite “alpha-runtime”", "runtime suite name")
+                HarnessNeed(w.RunAllButton.Enabled And Not w.RerunButton.Enabled And Not w.RunSelectedButton.Enabled, "initial button states")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(1)
+                s.RunAll()
+                HarnessNeed(s.RunNumber = 1, "a second job is refused while one runs")
+            Case 1
+                HarnessNeed(s.State = "failed", "run 1 failed: " + s.Headline + " " + s.Detail)
+                Me.Expect("alpha", "", "✗ Failed")
+                Me.Expect("alpha", "passes", "Passed")
+                Me.Expect("alpha", "fails", "Failed")
+                Me.Expect("alpha", "skips", "Skipped")
+                Me.Expect("alpha", Me.OddName(), "Passed")
+                Me.Expect("beta", "", "Compile error")
+                Me.Expect("gamma*?[x]", "g1", "Passed")
+                Me.Contains(w.Source.Rows(w.FindRow("alpha", Me.OddName())).Title, "⏎", "control characters are visible")
+                Me.Highlight("beta", "")
+                Me.Contains(w.DetailsText.Text, "Phase check", "beta details")
+                Me.Contains(w.DetailsText.Text, "error main.bui:2:4: undefined function 'Foo'", "compiler diagnostic")
+                Me.Highlight("alpha", "fails")
+                Me.Contains(w.DetailsText.Text, "[run] AssertionException (code 7): expected 1, got 2", "case diagnostic")
+                #If TargetWindows Then
+                    Me.Contains(w.DetailsText.Text, "mixed one\r\nmixed two\r\nmixed three\r\nmixed four", "mixed diagnostic line endings")
+                    HarnessNeed(Not String.Contains(w.DetailsText.Text, "\r\r", True), "details have no doubled carriage returns")
+                #End If
+                Me.Contains(w.DetailsText.Text, "Duration: 20 ms", "case duration")
+                Me.Contains(s.ResultsNote, "latest run", "current results note")
+                HarnessNeed(w.RerunButton.Enabled, "Rerun Failed enabled after failures")
+                Me.Saved = s.Report.Path
+                w.RerunButton.PerformClick()
+                Me.StartedRun(2)
+                Me.Contains(s.ResultsNote, "STALE", "old results are stale while running")
+                Me.Expect("alpha", "", "(stale)")
+            Case 2
+                HarnessNeed(s.State = "failed", "run 2 failed: " + s.Detail)
+                Me.Contains(String.Join(s.LastArguments, " "), "--rerun-failed " + Me.Saved, "rerun uses the previous report")
+                HarnessNeed(Not New FileSystemItem(Me.Saved).Exists(), "the superseded report folder is removed")
+                Me.Expect("gamma*?[x]", "", "Not in this run")
+                Me.Expect("alpha", "passes", "Not selected")
+                Me.Highlight("alpha", "passes")
+                Me.Contains(w.DetailsText.Text, "not a skip", "not selected is distinct from skipped")
+                Me.Mark("alpha", "fails")
+                Me.Mark("alpha", Me.OddName())
+                Me.Mark("gamma*?[x]", "")
+                HarnessNeed(w.Source.Marks.Count() = 3, "three marks")
+                Me.Contains(w.SelectionLabel.Text, "3 marked items", "selection summary")
+                w.RunSelectedButton.PerformClick()
+                Me.StartedRun(3)
+                Dim written As Result Of String, String = New FileSystemItem(s.ActiveSelectionPath).ReadAllText()
+                HarnessNeed(written.IsOk, "selection file written")
+                Dim selection As JSONItem = Json.Parse(written.Value)
+                HarnessNeed(selection.Value("version").AsNumber().Or(0.0) = 1.0, "selection version 1")
+                Dim suites As JSONItem = selection.Value("suites")
+                HarnessNeed(suites.Count() = 2, "two selected suites")
+                HarnessNeed(HarnessSame(suites.ValueAt(0).Value("name").AsString().Or(""), "alpha"), "alpha first")
+                Dim cases As JSONItem = suites.ValueAt(0).Value("cases")
+                HarnessNeed(cases.Count() = 2, "two exact cases")
+                HarnessNeed(HarnessSame(cases.ValueAt(0).AsString().Or(""), "fails") And HarnessSame(cases.ValueAt(1).AsString().Or(""), Me.OddName()), "exact case names")
+                HarnessNeed(HarnessSame(suites.ValueAt(1).Value("name").AsString().Or(""), "gamma*?[x]"), "glob characters stay literal")
+                HarnessNeed(suites.ValueAt(1).HasKey("cases") And suites.ValueAt(1).Value("cases").IsNull(), "a whole suite is cases: null")
+                Me.Checks += 8
+            Case 3
+                HarnessNeed(s.State = "passed", "run 3 passed: " + s.Headline + " " + s.Detail)
+                Me.Contains(s.Report.RepeatSummary, "Repeated 3 of 3", "repeat summary")
+                Me.Expect("alpha", "skips", "Not selected")
+                Me.Expect("beta", "", "Not in this run")
+                HarnessNeed(Not w.RerunButton.Enabled, "nothing to rerun after a pass")
+                Me.Highlight("alpha", "")
+                Me.Contains(w.DetailsText.Text, "Iterations recorded: 3", "iteration evidence")
+                w.ClearButton.PerformClick()
+                HarnessNeed(w.Source.Marks.Count() = 0, "marks cleared")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(4)
+                Me.StopAtTick = Me.Ticks + 3
+                Me.StopWhenFile = Me.FakeCallLog(3)
+            Case 4
+                HarnessNeed(s.State = "cancelled" And Not s.ForcedStop, "run 4 cancelled cooperatively: " + s.Headline + " " + s.Detail)
+                Me.Expect("alpha", "", "Cancelled (interrupted)")
+                Me.Expect("beta", "", "Not run (cancelled first)")
+                s.StopGraceMilliseconds = 1500
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(5)
+                Me.StopAtTick = Me.Ticks + 3
+                Me.StopWhenFile = Me.FakeCallLog(4)
+            Case 5
+                HarnessNeed(s.State = "cancelled" And s.ForcedStop, "run 5 force-stopped: " + s.Headline)
+                Me.Contains(s.Headline, "force-stopped", "forced headline")
+                Me.Contains(s.Detail, "may still be running", "orphan warning")
+                Me.Contains(s.ResultsNote, "Run #5 produced no results", "stale after a forced stop")
+                HarnessNeed(s.Report.RunNumber = 4, "results still from run 4")
+                Me.Expect("alpha", "", "(stale) ■ Cancelled")
+                Me.Highlight("gamma*?[x]", "")
+                w.RunSelectedButton.PerformClick()
+                Me.StartedRun(6)
+            Case 6
+                HarnessNeed(s.State = "runner-failed", "run 6 rejected")
+                Me.Contains(s.Detail, "no longer match", "unmatched explanation")
+                Me.Contains(s.Detail, "suite “gamma*?[x]” has no case “g-missing”", "structured unmatched entry")
+                HarnessNeed(s.Report.RunNumber = 4, "a rejected run keeps the previous results")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(7)
+            Case 7
+                HarnessNeed(s.State = "runner-failed", "run 7 has an unreadable report")
+                Me.Contains(s.Detail, "not valid JSON", "invalid report")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(8)
+            Case 8
+                HarnessNeed(s.State = "runner-failed", "run 8 wrote no report")
+                Me.Contains(s.Detail, "wrote no report", "missing report")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(9)
+            Case 9
+                HarnessNeed(s.State = "runner-failed", "run 9 has an unknown status")
+                Me.Contains(s.Detail, "unknown status", "unknown statuses are rejected")
+                HarnessNeed(s.Report.RunNumber = 4, "results still from run 4")
+                ' Closing the view hides it and keeps the session; reopening shows the same results.
+                ' The view was moved since it opened, as a user might; reopening keeps that frame
+                ' instead of centring over Studio again.
+                w.Move(w.PlaceLeft + 8, w.PlaceTop + 4, w.Width, w.Height)
+                Dim beforeX As Integer = w.X
+                Dim beforeY As Integer = w.Y
+                Dim beforeWidth As Integer = w.Width
+                Dim beforeHeight As Integer = w.Height
+                w.Command("close")
+                HarnessNeed(Not w.Visible And Not w.IsClosed, "Close Tests hides the view without closing it")
+                HarnessNeed(s.Report.RunNumber = 4 And s.RunNumber = 9, "the session survives closing the view")
+                w.ShowForHost(Me.Host)
+                HarnessNeed(w.Visible, "reopening shows the same view")
+                HarnessNeed(w.Owner = Me.Host, "the reopened view stays owned by Studio")
+                HarnessNeed(w.Width = beforeWidth And w.Height = beforeHeight, "reopening keeps the size: " + Me.FrameText(w))
+                #If Not TargetLinux Then
+                    HarnessNeed(w.X = beforeX And w.Y = beforeY, "reopening keeps the position " + String.From(beforeX) + "," + String.From(beforeY) + ": " + Me.FrameText(w))
+                #End If
+                Me.NeedFrameFits(w, "reopened")
+                Me.Expect("alpha", "", "Cancelled (interrupted)")
+                Dim config As New FileSystemItem(s.ConfigPath)
+                Dim text As Result Of String, String = config.ReadAllText()
+                config.WriteAllText(text.Value + "\n")
+                s.ReloadConfiguration()
+                Me.Contains(s.ResultsNote, "Run #9 produced no results", "stale note")
+                Me.Window.RunAllButton.PerformClick()
+                Me.StartedRun(10)
+            Case 10
+                HarnessNeed(s.State = "failed", "partial selection rejection retains executed failure")
+                HarnessNeed(s.Report.RunNumber = 10, "fresh partial report replaces stale evidence")
+                Me.Expect("alpha", "fails", "Failed")
+                Me.Contains(s.Detail, "no longer match", "partial rejection explains stale names")
+                HarnessNeed(Not String.Contains(s.Detail, "No tests ran", True), "executed cases must not be described as unrun")
+                ' Source freshness. The host hook reports a.bui as unsaved in an editor.
+                Me.UnsavedHolder.Source = Me
+                s.UnsavedLink = Me.UnsavedHolder
+                Me.Unsaved = ["a.bui"]
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(11)
+                Me.Contains(s.Detail, "saved files on disk", "runs test saved files")
+                Me.Contains(s.Detail, "Unsaved editor changes to a.bui are not part of this run", "unsaved input named")
+            Case 11
+                HarnessNeed(s.State = "passed", "run 11 passed: " + s.Headline + " " + s.Detail)
+                Me.Contains(s.ResultsNote, "latest run; its 5 tracked input files are unchanged", "fresh results count their inputs")
+                Me.Contains(s.ResultsNote, "Not tested: unsaved editor changes to a.bui", "unsaved edits stay visible after the run")
+                Me.ExpectFresh("alpha")
+                Me.ExpectFresh("beta")
+                Me.ExpectFresh("gamma*?[x]")
+                Me.Unsaved = []
+                ' Between runs: b.bui grows, so its size and (maybe) its second change.
+                Dim beta As Result Of String, String = Me.ProjectFile("b.bui").ReadAllText()
+                HarnessNeed(beta.IsOk, "read b.bui")
+                Me.WriteProjectFile("b.bui", beta.Value + "' edited between runs\n")
+                Me.HoldSuite = "beta"
+            Case 12
+                Me.Expect("beta", "", "(stale) ✓ Passed")
+                Me.ExpectFresh("alpha")
+                Me.ExpectFresh("gamma*?[x]")
+                Me.Contains(s.ResultsNote, "STALE", "edited results are stale")
+                Me.Contains(s.ResultsNote, "b.bui changed after this run finished", "names the edited file")
+                Me.Contains(s.ResultsNote, "Affects suite “beta”; the other suites' inputs are unchanged", "scopes staleness to its suite")
+                Me.Highlight("beta", "")
+                Me.Contains(w.DetailsText.Text, "Inputs of run #11 changed: b.bui changed after this run finished", "suite details name the change")
+                Me.Highlight("alpha", "")
+                Me.Contains(w.DetailsText.Text, "Inputs: 2 tracked files unchanged", "unaffected suite details")
+                ' Saved just before the run (so its stamp is in the racy second), then rewritten
+                ' at the same size while the run is in progress: usually within the same second,
+                ' where only the content comparison can tell.
+                Dim alpha As Result Of String, String = Me.ProjectFile("a.bui").ReadAllText()
+                HarnessNeed(alpha.IsOk And String.Contains(alpha.Value, "version 1", True), "read a.bui")
+                Me.WriteProjectFile("a.bui", alpha.Value)
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(12)
+                Me.WriteProjectFile("a.bui", String.Replace(alpha.Value, "version 1", "version 2"))
+            Case 13
+                HarnessNeed(s.State = "passed", "run 12 passed: " + s.Detail)
+                Me.Expect("alpha", "", "(stale) ✓ Passed")
+                Me.ExpectFresh("beta")
+                Me.Contains(s.ResultsNote, "a.bui changed while this run was in progress", "an edit during the run stales its result")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(13)
+            Case 14
+                HarnessNeed(s.State = "passed", "run 13 passed: " + s.Detail)
+                Me.ExpectFresh("alpha")
+                Me.ExpectFresh("gamma*?[x]")
+                ' A new file matching gamma's lib/*.bui, and an unrelated file next to it.
+                Me.WriteProjectFile("lib/two.bui", "' added\n")
+                Me.WriteProjectFile("notes.txt", "not an input\n")
+                Me.HoldSuite = "gamma*?[x]"
+            Case 15
+                Me.Expect("gamma*?[x]", "", "(stale)")
+                Me.ExpectFresh("alpha")
+                Me.ExpectFresh("beta")
+                Me.Contains(s.ResultsNote, "lib/two.bui was added", "a new glob match stales the suite")
+                HarnessNeed(Not String.Contains(s.ResultsNote, "notes.txt", True), "unrelated files are not inputs")
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(14)
+            Case 16
+                HarnessNeed(s.State = "passed", "run 14 passed: " + s.Detail)
+                Me.ExpectFresh("gamma*?[x]")
+                Me.Contains(s.ResultsNote, "6 tracked input files are unchanged", "the new match is tracked by the next run")
+                HarnessNeed(Me.ProjectFile("lib/one.bui").Delete(False), "deleted lib/one.bui")
+                Me.HoldSuite = "gamma*?[x]"
+            Case 17
+                Me.Expect("gamma*?[x]", "", "(stale)")
+                Me.ExpectFresh("alpha")
+                Me.Contains(s.ResultsNote, "lib/one.bui was deleted", "a deleted input stales the suite")
+                w.Results.SelectedRow = -1
+                w.Render()
+                Me.Contains(w.DetailsText.Text, "Not tracked: the compiler and installed packages", "the window states what is not tracked")
+                Me.Contains(w.DetailsText.Text, "lib/one.bui was deleted after this run finished", "details list the changes")
+                Return True
+        End Select
+        Return False
+    End Function
+
+    Private Function MissingRunner() As Boolean
+        Dim s As StudioTestSession = Me.S()
+        Me.Window.RunAllButton.PerformClick()
+        HarnessNeed(s.State = "runner-failed" And Not s.IsRunning(), "missing runner fails without starting: " + s.State)
+        Me.Contains(s.Headline, "Test runner not found", "missing headline")
+        Me.Contains(s.Detail, "BUOY_STUDIO_TEST_RUNNER", "names the configuration")
+        HarnessNeed(s.RunNumber = 0 And s.Report = Nil, "no run and no results")
+        ' The owned view keeps its screen-fitted frame instead of being centred over Studio.
+        HarnessNeed(Me.Window.Owner = Me.Host, "the Tests view is owned by Studio")
+        Me.NeedFrameFits(Me.Window, "initial")
+        #If Not TargetLinux Then
+            HarnessNeed(Me.Window.X = Me.Window.PlaceLeft And Me.Window.Y = Me.Window.PlaceTop, "initial position is the fitted " + String.From(Me.Window.PlaceLeft) + "," + String.From(Me.Window.PlaceTop) + ": " + Me.FrameText(Me.Window))
+        #End If
+        Me.Checks += 1
+        Dim empty As New StudioTestSession("")
+        HarnessNeed(empty.State = "unavailable", "no project is unavailable")
+        Me.Contains(empty.Detail, "--project", "explains how to open a project")
+        Dim view As New StudioTestingWindow(empty)
+        HarnessNeed(Not view.RunAllButton.Enabled, "Run All disabled without a project")
+        view.Dispose()
+        Return True
+    End Function
+
+    Private Function FrameText(w As StudioTestingWindow) As String
+        Return "frame " + String.From(w.X) + "," + String.From(w.Y) + " " + String.From(w.Width) + "x" + String.From(w.Height) + " title " + String.From(w.TitleBarHeight) + " menu " + String.From(w.MenuBarHeight)
+    End Function
+
+    ''' The frame stays inside screen 0 less the fixed chrome reserve the constructor uses
+    ''' (no work-area API: 48 points at the bottom for a taskbar or Dock). Linux positions
+    ''' are not real, and GTK can impose a larger minimum, so Linux checks the width only.
+    Private Sub NeedFrameFits(w As StudioTestingWindow, label As String)
+        Dim display As Screen = System.Screen(0)
+        Dim screenLeft As Integer = Math.Round(display.Left)
+        Dim screenTop As Integer = Math.Round(display.Top)
+        Dim screenWidth As Integer = Math.Round(display.Width)
+        Dim screenHeight As Integer = Math.Round(display.Height)
+        Dim where As String = label + " " + Me.FrameText(w) + " on screen " + String.From(screenLeft) + "," + String.From(screenTop) + " " + String.From(screenWidth) + "x" + String.From(screenHeight)
+        HarnessNeed(w.Width <= Math.Max(720, screenWidth - 32), "Tests window width fits screen 0: " + where)
+        #If Not TargetLinux Then
+            HarnessNeed(w.Height <= Math.Max(480, screenHeight - 160), "Tests window height fits screen 0: " + where)
+            HarnessNeed(w.X >= screenLeft And w.Y >= screenTop, "Tests window starts on screen 0: " + where)
+            HarnessNeed(w.X + w.Width <= screenLeft + screenWidth, "Tests window right edge is on screen 0: " + where)
+            ' Outer bottom: title bar, then (Windows) the window's own menu bar, then content.
+            Dim bottom As Integer = w.Y + w.TitleBarHeight + w.Height
+            #If TargetWindows Then
+                bottom += w.MenuBarHeight
+            #End If
+            HarnessNeed(bottom <= screenTop + screenHeight - 48, "Tests window bottom clears the taskbar or Dock reserve: " + where)
+        #End If
+    End Sub
+
+    Private Function Real() As Boolean
+        Dim w As StudioTestingWindow = Me.Window
+        Dim s As StudioTestSession = Me.S()
+        Select Case Me.StepIndex
+            Case 0
+                HarnessNeed(Array.Count(s.Suites) = 3, "fixture suites: " + s.ConfigError)
+                Me.Mark("ok", "")
+                Me.Mark("bad", "")
+                w.RunSelectedButton.PerformClick()
+                Me.StartedRun(1)
+            Case 1
+                HarnessNeed(s.State = "failed", "selected run failed: " + s.Headline + " " + s.Detail)
+                Me.Expect("ok", "", "Passed")
+                Me.Expect("bad", "", "Failed")
+                Me.Expect("slow", "", "Not in this run")
+                Me.Highlight("bad", "")
+                Me.Contains(w.DetailsText.Text, "Phase run", "real run phase")
+                w.RerunButton.PerformClick()
+                Me.StartedRun(2)
+            Case 2
+                HarnessNeed(s.State = "failed", "rerun failed: " + s.Detail)
+                HarnessNeed(Array.Count(s.Report.Suites) = 1, "rerun ran only the failed suite")
+                Me.Expect("bad", "", "Failed")
+                Me.Expect("ok", "", "Not in this run")
+                ' Saving a source the real runner staged for "bad" stales only that suite.
+                Dim bad As Result Of String, String = Me.ProjectFile("bad.bui").ReadAllText()
+                HarnessNeed(bad.IsOk, "read bad.bui")
+                Me.WriteProjectFile("bad.bui", bad.Value + "' edited after the run\n")
+                Me.HoldSuite = "bad"
+            Case 3
+                Me.Expect("bad", "", "(stale) ✗ Failed")
+                Me.ExpectFresh("ok")
+                Me.Contains(s.ResultsNote, "bad.bui changed after this run finished", "real source edit")
+                w.ClearButton.PerformClick()
+                w.RunAllButton.PerformClick()
+                Me.StartedRun(3)
+                Me.StopAtTick = Me.Ticks + 20
+            Case 4
+                HarnessNeed(s.State = "cancelled" And Not s.ForcedStop, "real runner cancelled cooperatively: " + s.Headline + " " + s.Detail)
+                HarnessNeed(s.Report.Cancelled, "cancelled report shown")
+                Return True
+        End Select
+        Return False
+    End Function
+End Class

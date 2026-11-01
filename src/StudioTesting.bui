@@ -1,0 +1,1808 @@
+Import processkit
+
+#If TargetWindows Then
+Private Declare Function StudioInputAttributes Lib "kernel32" Alias "GetFileAttributesW" (filename As Ptr) As UInt32
+#Else
+Private Declare Function StudioInputReadLink Lib "c" Alias "readlink" (filename As String, buffer As Ptr, size As UInt64) As Integer
+#End If
+
+' Match buoy-dev's DevIsLink without following symlinks or Windows reparse points.
+Private Function InputIsLink(filename As String) As Boolean
+    #If TargetWindows Then
+        Dim wide As Bytes = Bytes.FromString(filename, Text.Encodings.UTF16LE)
+        wide.Append(0)
+        wide.Append(0)
+        Dim attributes As UInt32 = StudioInputAttributes(wide.DataPtr())
+        Return attributes <> 4294967295 And (attributes And 1024) <> 0
+    #Else
+        Dim buffer As New Bytes(1)
+        Return StudioInputReadLink(filename, buffer.DataPtr(), 1) >= 0
+    #End If
+End Function
+
+' Studio's view of the shared native test runner (`buoy-dev test`).
+'
+' Studio never runs tests itself and never falls back to Python. Each run is one
+' `buoy-dev test` process started with an explicit argument array (no shell), a
+' report path and cancel path unique to that run, and at most one active run per
+' session. Results come only from the runner's final schema-1 JSON report, read
+' after the process exits; stdout is drained and discarded, so Studio never claims
+' per-case progress. A new report replaces the shown results wholesale: results
+' from different runs are never merged.
+
+''' One configured suite from buoy.dev.json. Selection always uses the configured
+''' name; RuntimeSuite (testkit_suite) is what the TestKit record calls itself.
+Public Class StudioTestSuiteConfig
+    Public Property Name As String
+    Public Property Protocol As String = "exit"
+    Public Property RuntimeSuite As String
+End Class
+
+Public Class StudioTestCaseResult
+    Public Property Name As String
+    Public Property Status As String
+    Public Property Message As String
+    Public Property Duration As Double = 0.0
+    Public Property HasDuration As Boolean = False
+    ''' False only when the runner reported selected: false (filtered out, not a skip).
+    Public Property Selected As Boolean = True
+    ''' TestKit's per-case diagnostics (phase, exception type, message, code), formatted.
+    Public Property Diagnostics As Array Of String = []
+End Class
+
+Public Class StudioTestSuiteResult
+    Public Property Name As String
+    Public Property Status As String
+    Public Property Message As String
+    Public Property Duration As Double = 0.0
+    Public Property HasDuration As Boolean = False
+    Public Property Cancelled As Boolean = False
+    Public Property RuntimeSuite As String
+    Public Property Cases As Array Of StudioTestCaseResult = []
+    ''' Phase, return code, timing, diagnostics and logs, formatted once at parse time.
+    Public Property StepsText As String
+    Public Property DiagnosticCount As Integer = 0
+    Public Property Iterations As Integer = 0
+End Class
+
+''' A finalized runner report as Studio understood it.
+Public Class StudioTestReport
+    Public Property Path As String
+    Public Property RunNumber As Integer = 0
+    Public Property ModeTitle As String
+    Public Property Cancelled As Boolean = False
+    Public Property SelectionEmpty As Boolean = False
+    Public Property NotRun As Array Of String = []
+    Public Property Unmatched As Array Of String = []
+    Public Property Suites As Array Of StudioTestSuiteResult = []
+    Public Property RepeatSummary As String
+    Public Property ConfigStamp As String
+    ''' The run's inputs as recorded when it started, with any changes found since.
+    Public Property Inputs As StudioTestInputs
+    ''' Tracked inputs that had unsaved editor changes when the run started.
+    Public Property UnsavedInputs As Array Of String = []
+
+    Public Function SuiteNamed(name As String) As StudioTestSuiteResult
+        For Each suite As StudioTestSuiteResult In Me.Suites
+            If String.Compare(suite.Name, name, True) = 0 Then Return suite
+        Next
+        Return Nil
+    End Function
+
+    Public Function WasNotRun(name As String) As Boolean
+        For Each entry As String In Me.NotRun
+            If String.Compare(entry, name, True) = 0 Then Return True
+        Next
+        Return False
+    End Function
+
+    Public Function FailingSuites() As Integer
+        Dim count As Integer = 0
+        For Each suite As StudioTestSuiteResult In Me.Suites
+            If StudioTestIsBad(suite.Status) Or Not StudioTestKnownSuiteStatus(suite.Status) Then count += 1
+        Next
+        Return count
+    End Function
+
+    ''' Case tallies: passed, failed (incl. error), skipped, not selected.
+    Public Function CaseCount(kind As String) As Integer
+        Dim count As Integer = 0
+        For Each suite As StudioTestSuiteResult In Me.Suites
+            For Each entry As StudioTestCaseResult In suite.Cases
+                If StudioTestCaseKind(entry) = kind Then count += 1
+            Next
+        Next
+        Return count
+    End Function
+End Class
+
+''' Every outcome the schema-1 runner defines; anything else invalidates the report.
+Public Function StudioTestKnownSuiteStatus(status As String) As Boolean
+    If String.Compare(status, String.LCase(status), True) <> 0 Then Return False
+    Select Case status
+        Case "passed", "checked", "failed", "error", "compile_error", "crash", "timeout", "protocol_error"
+            Return True
+    End Select
+    Return False
+End Function
+
+Public Function StudioTestIsBad(status As String) As Boolean
+    Select Case status
+        Case "failed", "error", "compile_error", "crash", "timeout", "protocol_error"
+            Return True
+    End Select
+    Return False
+End Function
+
+''' "passed", "failed", "skipped" or "unselected" — a filtered case is never a skip.
+Public Function StudioTestCaseKind(entry As StudioTestCaseResult) As String
+    If String.Compare(entry.Status, "passed", True) = 0 Then Return "passed"
+    If String.Compare(entry.Status, "skipped", True) = 0 Then
+        If Not entry.Selected Then Return "unselected"
+        Return "skipped"
+    End If
+    ' failed, error and (defensively) anything unrecognised count as failures.
+    Return "failed"
+End Function
+
+''' Status words always carry the meaning; the symbol is only a scanning aid.
+Public Function StudioTestSuiteStatusText(suite As StudioTestSuiteResult) As String
+    If suite.Cancelled Then Return "■ Cancelled (interrupted)"
+    Select Case suite.Status
+        Case "passed"
+            Return "✓ Passed"
+        Case "checked"
+            Return "✓ Checked (compile only)"
+        Case "failed"
+            Return "✗ Failed"
+        Case "compile_error"
+            Return "✗ Compile error"
+        Case "crash"
+            Return "✗ Crashed"
+        Case "timeout"
+            Return "✗ Timed out"
+        Case "protocol_error"
+            Return "✗ Protocol error"
+        Case "error"
+            Return "✗ Runner error"
+    End Select
+    Return "? " + suite.Status
+End Function
+
+Public Function StudioTestCaseStatusText(entry As StudioTestCaseResult) As String
+    Select Case StudioTestCaseKind(entry)
+        Case "passed"
+            Return "✓ Passed"
+        Case "unselected"
+            Return "· Not selected"
+        Case "skipped"
+            Return "– Skipped"
+    End Select
+    If entry.Status = "error" Then Return "✗ Error"
+    Return "✗ Failed"
+End Function
+
+Public Function StudioTestDuration(seconds As Double, known As Boolean) As String
+    If Not known Then Return "—"
+    If seconds < 0.001 Then Return "<1 ms"
+    If seconds < 1.0 Then Return String.From(Math.Round(seconds * 1000.0)) + " ms"
+    If seconds < 60.0 Then Return String.Format("{0:0.00} s", seconds)
+    Dim whole As Integer = Math.Floor(seconds)
+    Return String.From(whole \ 60) + " m " + String.Format("{0:00}", whole Mod 60) + " s"
+End Function
+
+''' Names are data: newlines and control characters are made visible in one-line
+''' labels, while the exact original string is what selection files contain.
+Public Function StudioTestDisplayName(name As String) As String
+    Dim shown As String = ""
+    For Each ch As String In String.Chars(name)
+        Dim code As Integer = String.Asc(ch)
+        If code = 10 Then
+            shown += "⏎"
+        ElseIf code = 9 Then
+            shown += "⇥"
+        ElseIf code < 32 Or code = 127 Then
+            shown += "�"
+        Else
+            shown += ch
+        End If
+    Next
+    If shown = "" Then shown = "(empty name)"
+    If String.Len(shown) > 160 Then shown = String.Left(shown, 159) + "…"
+    Return shown
+End Function
+
+Private Function ReportString(value As JSONItem, label As String) As String
+    If Not value.IsString() Then Throw New InvalidArgumentException("report " + label + " must be a string")
+    Return value.AsString().Or("")
+End Function
+
+Private Function ReportNumber(value As JSONItem, ByRef known As Boolean) As Double
+    known = False
+    If Not value.IsNumber() Then Return 0.0
+    Dim number As Double = value.AsNumber().Or(-1.0)
+    If number < 0.0 Or number >= Double.Infinity Then Return 0.0
+    known = True
+    Return number
+End Function
+
+Private Function Tail(text As String, limit As Integer) As String
+    If String.Len(text) <= limit Then Return text
+    Return "…" + String.Right(text, limit)
+End Function
+
+Private Function StepsText(record As JSONItem, ByRef diagnosticCount As Integer) As String
+    Dim lines As Array Of String = []
+    diagnosticCount = 0
+    Dim steps As JSONItem = record.Value("steps")
+    If Not steps.IsArray() Then Return ""
+    For i As Integer = 0 To steps.Count() - 1
+        Dim item As JSONItem = steps.ValueAt(i)
+        Dim heading As String = "Phase " + item.Value("phase").AsString().Or("?")
+        If item.Value("target").IsString() Then heading += " (" + item.Value("target").AsString().Or("") + ")"
+        If item.Value("returncode").IsNumber() Then heading += " · exit " + String.From(Math.Round(item.Value("returncode").AsNumber().Or(0.0)))
+        Dim known As Boolean = False
+        Dim seconds As Double = ReportNumber(item.Value("seconds"), known)
+        If known Then heading += " · " + StudioTestDuration(seconds, True)
+        If item.Value("timeout").AsBoolean().Or(False) Then heading += " · TIMED OUT"
+        If item.Value("cancelled").AsBoolean().Or(False) Then heading += " · CANCELLED"
+        If item.Value("truncated").AsBoolean().Or(False) Then heading += " · log truncated"
+        lines.Append(heading)
+        Dim diagnostics As JSONItem = item.Value("diagnostics")
+        For Each kind As String In ["errors", "warnings"]
+            Dim entries As JSONItem = diagnostics.Value(kind)
+            If entries.IsArray() Then
+                For j As Integer = 0 To entries.Count() - 1
+                    Dim entry As JSONItem = entries.ValueAt(j)
+                    Dim where As String = entry.Value("file").AsString().Or("")
+                    If entry.Value("line").IsNumber() Then where += ":" + String.From(Math.Round(entry.Value("line").AsNumber().Or(0.0)))
+                    If entry.Value("character").IsNumber() Then where += ":" + String.From(Math.Round(entry.Value("character").AsNumber().Or(0.0)))
+                    Dim word As String = "error"
+                    If kind = "warnings" Then word = "warning"
+                    lines.Append("  " + word + " " + where + ": " + entry.Value("message").AsString().Or(Json.Stringify(entry)))
+                    If kind = "errors" Then diagnosticCount += 1
+                Next
+            End If
+        Next
+        For Each stream As String In ["stdout", "stderr"]
+            Dim text As String = String.Trim(item.Value(stream).AsString().Or(""))
+            If text <> "" Then
+                lines.Append("  " + stream + ":")
+                For Each line As String In String.Split(Tail(text, 16000), "\n")
+                    lines.Append("    " + line)
+                Next
+            End If
+        Next
+    Next
+    Return String.Join(lines, "\n")
+End Function
+
+Private Function ParseSuite(record As JSONItem) As StudioTestSuiteResult
+    If Not record.IsObject() Then Throw New InvalidArgumentException("report suite must be an object")
+    Dim suite As New StudioTestSuiteResult()
+    suite.Name = ReportString(record.Value("name"), "suite name")
+    If suite.Name = "" Then Throw New InvalidArgumentException("report suite name is empty")
+    suite.Status = ReportString(record.Value("status"), "suite status")
+    If Not StudioTestKnownSuiteStatus(suite.Status) Then Throw New InvalidArgumentException("unknown status \"" + suite.Status + "\" for suite " + suite.Name)
+    suite.Message = record.Value("message").AsString().Or("")
+    suite.Cancelled = record.Value("cancelled").AsBoolean().Or(False)
+    suite.RuntimeSuite = record.Value("testkit_suite").AsString().Or("")
+    Dim known As Boolean = False
+    suite.Duration = ReportNumber(record.Value("duration"), known)
+    suite.HasDuration = known
+    Dim count As Integer = 0
+    suite.StepsText = StepsText(record, count)
+    suite.DiagnosticCount = count
+    Dim cases As JSONItem = record.Value("cases")
+    If cases.IsArray() Then
+        Dim seen As New Map Of String, Boolean()
+        For i As Integer = 0 To cases.Count() - 1
+            Dim item As JSONItem = cases.ValueAt(i)
+            If Not item.IsObject() Then Throw New InvalidArgumentException("report case must be an object")
+            Dim entry As New StudioTestCaseResult()
+            entry.Name = ReportString(item.Value("name"), "case name")
+            If seen.ContainsKey(entry.Name) Then Throw New InvalidArgumentException("duplicate case in suite " + suite.Name)
+            seen.Set(entry.Name, True)
+            entry.Status = ReportString(item.Value("status"), "case status")
+            Dim known As Boolean = String.Compare(entry.Status, String.LCase(entry.Status), True) = 0
+            Select Case entry.Status
+                Case "passed", "failed", "error", "skipped"
+                Case Else
+                    known = False
+            End Select
+            If Not known Then Throw New InvalidArgumentException("unknown status \"" + entry.Status + "\" for case " + StudioTestDisplayName(entry.Name) + " in suite " + suite.Name)
+            If item.HasKey("selected") And Not item.Value("selected").IsBoolean() Then Throw New InvalidArgumentException("case selected must be a Boolean in suite " + suite.Name)
+            Dim details As JSONItem = item.Value("diagnostics")
+            If details.IsArray() Then
+                For d As Integer = 0 To details.Count() - 1
+                    Dim detail As JSONItem = details.ValueAt(d)
+                    Dim line As String = "[" + detail.Value("phase").AsString().Or("?") + "] " + detail.Value("type").AsString().Or("Exception")
+                    If detail.Value("code").IsNumber() Then line += " (code " + String.From(Math.Round(detail.Value("code").AsNumber().Or(0.0))) + ")"
+                    line += ": " + detail.Value("message").AsString().Or("")
+                    entry.Diagnostics.Append(line)
+                Next
+            End If
+            entry.Message = item.Value("message").AsString().Or("")
+            entry.Selected = item.Value("selected").AsBoolean().Or(True)
+            entry.Duration = ReportNumber(item.Value("duration"), known)
+            entry.HasDuration = known
+            suite.Cases.Append(entry)
+        Next
+    End If
+    Return suite
+End Function
+
+''' Structured unmatched entries ({suite, cases: null | [names]}) are shown exactly;
+''' older producers' plain strings are shown verbatim.
+Private Function UnmatchedText(item As JSONItem) As String
+    If item.IsString() Then Return item.AsString().Or("")
+    If Not item.IsObject() Then Return Json.Stringify(item)
+    Dim suite As String = StudioTestDisplayName(item.Value("suite").AsString().Or(""))
+    Dim cases As JSONItem = item.Value("cases")
+    If Not cases.IsArray() Then Return "suite “" + suite + "” is not configured"
+    Dim names As Array Of String = []
+    For i As Integer = 0 To cases.Count() - 1
+        names.Append("“" + StudioTestDisplayName(cases.ValueAt(i).AsString().Or("")) + "”")
+    Next
+    Return "suite “" + suite + "” has no case " + String.Join(names, ", ")
+End Function
+
+''' Parses a finalized schema-1 runner report. Throws with a readable reason when the
+''' file is not a complete report; nothing partial is ever displayed.
+Public Function StudioParseTestReport(text As String) As StudioTestReport
+    Dim parsed As Optional Of JSONItem = Json.TryParse(text)
+    If Not parsed.HasValue Then Throw New InvalidArgumentException("the report is not valid JSON")
+    Dim value As JSONItem = parsed.Value
+    If Not value.IsObject() Then Throw New InvalidArgumentException("the report is not a JSON object")
+    If Not value.Value("schema").IsNumber() Or value.Value("schema").AsNumber().Or(0.0) <> 1.0 Then Throw New InvalidArgumentException("the report is not schema 1")
+    If Not value.Value("complete").AsBoolean().Or(False) Then Throw New InvalidArgumentException("the report is not marked complete")
+    Dim suites As JSONItem = value.Value("suites")
+    If Not suites.IsArray() Then Throw New InvalidArgumentException("the report has no suites array")
+    Dim report As New StudioTestReport()
+    report.Cancelled = value.Value("cancelled").AsBoolean().Or(False)
+    ' Top-level suites are the runner's unique representative records (first failing,
+    ' else latest); iterations are evidence only and are not merged into them.
+    For i As Integer = 0 To suites.Count() - 1
+        Dim suite As StudioTestSuiteResult = ParseSuite(suites.ValueAt(i))
+        If report.SuiteNamed(suite.Name) <> Nil Then
+            If String.Compare(report.SuiteNamed(suite.Name).Name, suite.Name, True) = 0 Then Throw New InvalidArgumentException("the report repeats suite " + suite.Name)
+        End If
+        report.Suites.Append(suite)
+    Next
+    Dim notRun As JSONItem = value.Value("not_run")
+    If notRun.IsArray() Then
+        For i As Integer = 0 To notRun.Count() - 1
+            report.NotRun.Append(notRun.ValueAt(i).AsString().Or(""))
+        Next
+    End If
+    Dim selection As JSONItem = value.Value("selection")
+    If selection.IsObject() Then
+        report.SelectionEmpty = selection.Value("empty").AsBoolean().Or(False)
+        Dim unmatched As JSONItem = selection.Value("unmatched")
+        If unmatched.IsArray() Then
+            For i As Integer = 0 To unmatched.Count() - 1
+                report.Unmatched.Append(UnmatchedText(unmatched.ValueAt(i)))
+            Next
+        End If
+    End If
+    Dim iterations As JSONItem = value.Value("iterations")
+    If iterations.IsArray() Then
+        For i As Integer = 0 To iterations.Count() - 1
+            Dim recorded As JSONItem = iterations.ValueAt(i).Value("suites")
+            For j As Integer = 0 To recorded.Count() - 1
+                Dim suite As StudioTestSuiteResult = report.SuiteNamed(recorded.ValueAt(j).Value("name").AsString().Or(""))
+                If suite <> Nil Then suite.Iterations += 1
+            Next
+        Next
+    End If
+    Dim repeat As JSONItem = value.Value("repeat")
+    If repeat.IsObject() Then
+        Dim requested As Integer = Math.Round(repeat.Value("requested").AsNumber().Or(1.0))
+        If requested > 1 Then
+            report.RepeatSummary = "Repeated " + String.From(Math.Round(repeat.Value("completed").AsNumber().Or(0.0))) + " of " + String.From(requested) + " iterations · stopped by " + repeat.Value("stop_reason").AsString().Or("count") + ". Each suite shows its first failing iteration, otherwise its latest."
+        End If
+    End If
+    Return report
+End Function
+
+''' Reads buoy.dev.json's suite list as data; nothing in it is executed by Studio.
+Public Function StudioReadTestConfig(filename As String) As Array Of StudioTestSuiteConfig
+    Dim file As New FileSystemItem(filename)
+    If Not file.IsFile() Then Throw New InvalidArgumentException("No test configuration at " + filename + ". Add buoy.dev.json to the project.")
+    Dim loaded As Result Of String, String = file.ReadAllText()
+    If loaded.IsErr Then Throw New InvalidArgumentException("Could not read " + filename + ": " + loaded.Error)
+    Dim parsed As Optional Of JSONItem = Json.TryParse(loaded.Value)
+    If Not parsed.HasValue Then Throw New InvalidArgumentException(filename + " is not valid JSON.")
+    Dim tests As JSONItem = parsed.Value.Value("tests")
+    If Not tests.IsArray() Then Throw New InvalidArgumentException(filename + " has no tests array.")
+    Dim suites As Array Of StudioTestSuiteConfig = []
+    Dim seen As New Map Of String, Boolean()
+    For i As Integer = 0 To tests.Count() - 1
+        Dim item As JSONItem = tests.ValueAt(i)
+        Dim suite As New StudioTestSuiteConfig()
+        suite.Name = item.Value("name").AsString().Or("")
+        If suite.Name = "" Or seen.ContainsKey(suite.Name) Then Throw New InvalidArgumentException(filename + ": suite names must be nonempty and unique.")
+        seen.Set(suite.Name, True)
+        suite.Protocol = item.Value("protocol").AsString().Or("exit")
+        suite.RuntimeSuite = item.Value("testkit_suite").AsString().Or(suite.Name)
+        suites.Append(suite)
+    Next
+    Return suites
+End Function
+
+Public Function StudioTestConfigStamp(filename As String) As String
+    Dim file As New FileSystemItem(filename)
+    If Not file.IsFile() Then Return "missing"
+    Return String.From(file.Length()) + "@" + file.ModificationDate().ToString()
+End Function
+
+''' Joins in native separators. Buoy 0.72's Path.Join always inserts "/", which on
+''' Windows shows and passes mixed paths such as C:\project/buoy.dev.json.
+Public Function StudioNativeJoin(folder As String, relative As String) As String
+    Return New FileSystemItem(Path.Join(folder, relative)).NativePath
+End Function
+
+''' Explicit BUOY_STUDIO_TEST_RUNNER, otherwise the project's own native build.
+Public Function StudioTestRunnerPath(projectRoot As String) As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_TEST_RUNNER").Or("")
+    If configured <> "" Then Return configured
+    If projectRoot = "" Then Return ""
+    #If TargetWindows Then
+        Return StudioNativeJoin(projectRoot, "dist/buoy-dev.exe")
+    #Else
+        Return StudioNativeJoin(projectRoot, "dist/buoy-dev")
+    #End If
+End Function
+
+''' One requested suite: whole (Cases empty and Whole) or exact case names.
+Public Class StudioTestSelectionEntry
+    Public Property Suite As String
+    Public Property Whole As Boolean = False
+    Public Property Cases As Array Of String = []
+End Class
+
+''' The --selection file. Names are copied exactly; a whole-suite request wins.
+Public Function StudioTestSelectionJSON(entries As Array Of StudioTestSelectionEntry) As String
+    Dim suites As JSONItem = JSONItem.NewArray()
+    For Each entry As StudioTestSelectionEntry In entries
+        Dim item As JSONItem = JSONItem.NewObject()
+        item.Value("name") = entry.Suite
+        If entry.Whole Or Array.Count(entry.Cases) = 0 Then
+            item.Value("cases") = JSONItem.Null()
+        Else
+            Dim cases As JSONItem = JSONItem.NewArray()
+            For Each name As String In entry.Cases
+                cases.Add(name)
+            Next
+            item.Value("cases") = cases
+        End If
+        suites.Add(item)
+    Next
+    Dim root As JSONItem = JSONItem.NewObject()
+    root.Value("version") = 1
+    root.Value("suites") = suites
+    Return root.ToString() + "\n"
+End Function
+
+' ---- Input freshness -------------------------------------------------------------------
+'
+' A report is only as current as the files the runner staged for it. When a run starts,
+' Studio records what buoy-dev test would stage: buoy.dev.json, and for every configured
+' suite each file matched by its files and packages patterns plus its source. The
+' patterns use the runner's own rules ("/"-separated, *, ?, [set], [!set], "**" for any
+' folders). The stamp of a file is its size and whole-second modification time, because
+' that is all FileSystemItem reports. Later checks compare stamps, re-read files saved
+' within a few seconds of the run start (where a same-size rewrite keeps both stamps),
+' and re-expand the patterns only when a folder they listed changes. A change after the
+' run started marks results stale; it is never cleared until a new run replaces them.
+
+''' One tracked file or listed folder as it was when a run started.
+Public Class StudioTestInput
+    Public Property Path As String
+    Public Property Relative As String
+    Public Property IsFolder As Boolean = False
+    Public Property Size As Integer = -1
+    Public Property Seconds As Integer = 0
+    ''' Folders: the number of entries listed.
+    Public Property Entries As Integer = 0
+    ''' Saved within the timestamp's resolution of the run start; checked by content.
+    Public Property Racy As Boolean = False
+    Public Property Fingerprint As String
+    ''' Configured suites that stage this file; empty means every suite (buoy.dev.json).
+    Public Property Suites As Array Of String = []
+    Public Property Reported As Boolean = False
+End Class
+
+''' One detected difference and the suites whose results it affects (empty = every suite).
+Public Class StudioTestInputChange
+    Public Property Text As String
+    Public Property Suites As Array Of String = []
+    ''' Found before the runner exited (the run may or may not have staged the edit).
+    Public Property DuringRun As Boolean = False
+
+    Public Function Describe() As String
+        If Me.DuringRun Then Return Me.Text + " while this run was in progress"
+        Return Me.Text + " after this run finished"
+    End Function
+End Class
+
+Private Class StudioTestGlobToken
+    Public Property Kind As String
+    Public Property Text As String
+    Public Property Negated As Boolean = False
+End Class
+
+Private Function GlobTokens(pattern As String) As Array Of StudioTestGlobToken
+    Dim chars As Array Of String = String.Chars(pattern)
+    Dim tokens As Array Of StudioTestGlobToken = []
+    Dim index As Integer = 0
+    While index < Array.Count(chars)
+        Dim ch As String = chars(index)
+        Dim token As New StudioTestGlobToken()
+        token.Kind = "char"
+        token.Text = ch
+        If ch = "*" Then
+            token.Kind = "star"
+        ElseIf ch = "?" Then
+            token.Kind = "any"
+        ElseIf ch = "[" Then
+            ' Mirrors buoy-dev's DevGlob: a set needs a "]" after at least one character.
+            Dim ending As Integer = -1
+            For j As Integer = index + 1 To Array.Count(chars) - 1
+                If chars(j) = "]" Then
+                    ending = j
+                    Exit For
+                End If
+            Next
+            If ending > index + 1 Then
+                Dim body As String = ""
+                For j As Integer = index + 1 To ending - 1
+                    body += chars(j)
+                Next
+                token.Kind = "set"
+                If String.StartsWith(body, "!", True) Or String.StartsWith(body, "^", True) Then
+                    token.Negated = True
+                    body = String.Substring(body, 1)
+                End If
+                token.Text = body
+                index = ending
+            End If
+        End If
+        tokens.Append(token)
+        index += 1
+    End While
+    Return tokens
+End Function
+
+Private Function GlobSetHas(body As String, ch As String) As Boolean
+    Dim chars As Array Of String = String.Chars(body)
+    Dim code As Integer = String.Asc(ch)
+    Dim i As Integer = 0
+    While i < Array.Count(chars)
+        If i + 2 < Array.Count(chars) And chars(i + 1) = "-" Then
+            If code >= String.Asc(chars(i)) And code <= String.Asc(chars(i + 2)) Then Return True
+            i += 3
+        Else
+            If String.Compare(chars(i), ch, True) = 0 Then Return True
+            i += 1
+        End If
+    End While
+    Return False
+End Function
+
+Private Function GlobOne(token As StudioTestGlobToken, ch As String) As Boolean
+    Select Case token.Kind
+        Case "any"
+            Return True
+        Case "set"
+            Return GlobSetHas(token.Text, ch) <> token.Negated
+    End Select
+    Return String.Compare(token.Text, ch, True) = 0
+End Function
+
+''' Case-sensitive match of one path component, with backtracking only to the last "*".
+Public Function StudioTestGlob(name As String, pattern As String) As Boolean
+    Return GlobTokensMatch(String.Chars(name), GlobTokens(pattern))
+End Function
+
+Private Function GlobTokensMatch(value As Array Of String, tokens As Array Of StudioTestGlobToken) As Boolean
+    Dim v As Integer = 0
+    Dim t As Integer = 0
+    Dim starToken As Integer = -1
+    Dim starValue As Integer = 0
+    While v < Array.Count(value)
+        If t < Array.Count(tokens) And tokens(t).Kind = "star" Then
+            starToken = t
+            starValue = v
+            t += 1
+        ElseIf t < Array.Count(tokens) And GlobOne(tokens(t), value(v)) Then
+            v += 1
+            t += 1
+        ElseIf starToken >= 0 Then
+            t = starToken + 1
+            starValue += 1
+            v = starValue
+        Else
+            Return False
+        End If
+    End While
+    While t < Array.Count(tokens)
+        If tokens(t).Kind <> "star" Then Return False
+        t += 1
+    End While
+    Return True
+End Function
+
+Private Function StampSeconds(item As FileSystemItem) As Integer
+    Dim seconds As Integer = Math.Floor(item.ModificationDate().SecondsFrom1970)
+    Return seconds
+End Function
+
+Private Function ClockSeconds() As Integer
+    Dim seconds As Integer = Math.Floor(DateTime.Now().SecondsFrom1970)
+    Return seconds
+End Function
+
+''' Exact bytes as hex, or "" when the file cannot be read completely within the limit.
+Private Function InputFingerprint(filePath As String, limit As Integer) As String
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filePath), False)
+    If opened.IsErr Then Return ""
+    Dim stream As BinaryStream = opened.Value
+    Dim text As String = ""
+    Try
+        Dim size As Integer = stream.Length
+        If size = 0 Then
+            text = "bytes:"
+        ElseIf size > 0 And size <= limit Then
+            Dim raw As Bytes = stream.Read(size)
+            If raw <> Nil Then
+                If raw.Count = size Then text = "bytes:" + raw.ToHex()
+            End If
+        End If
+    Catch e As Exception
+        text = ""
+    Finally
+        stream.Close()
+    End Try
+    Return text
+End Function
+
+''' Files and listed folders found by expanding the configured patterns once.
+Private Class StudioTestInputScan
+    Public Const EntryLimit As Integer = 20000
+    Public Const ListingLimit As Integer = 100000
+    Public Const DepthLimit As Integer = 64
+    Public Property Files As Array Of StudioTestInput = []
+    Public Property Folders As Array Of StudioTestInput = []
+    Public Property FileIndex As Map Of String, Integer = New Map Of String, Integer()
+    Public Property Listings As Map Of String, Array Of FileSystemItem = New Map Of String, Array Of FileSystemItem()
+    Public Property Listed As Integer = 0
+    Public Property Problem As String
+
+    Public Function Full() As Boolean
+        If Me.Problem <> "" Then Return True
+        ' Reserve one entry for buoy.dev.json, adopted outside this scan.
+        If Me.Listed > StudioTestInputScan.ListingLimit Then
+            Me.Problem = "pattern expansion lists more than " + String.From(StudioTestInputScan.ListingLimit) + " directory entries"
+            Return True
+        End If
+        If Array.Count(Me.Files) + Array.Count(Me.Folders) >= StudioTestInputScan.EntryLimit - 1 Then
+            Me.Problem = "the patterns match more than " + String.From(StudioTestInputScan.EntryLimit) + " files and folders"
+            Return True
+        End If
+        Return False
+    End Function
+
+    Public Function ChildrenOf(folder As FileSystemItem, relative As String) As Array Of FileSystemItem
+        Dim key As String = folder.NativePath
+        If Me.Listings.ContainsKey(key) Then Return Me.Listings.Get(key).Value
+        If Me.Full() Then Return []
+        Dim children As Array Of FileSystemItem = folder.Children()
+        Me.Listed += Array.Count(children)
+        ' Children() itself materializes a listing; stop before retaining or statting it.
+        If Me.Full() Then Return []
+        Me.Listings.Set(key, children)
+        Dim entry As New StudioTestInput()
+        entry.Path = key
+        entry.Relative = relative
+        If entry.Relative = "" Then entry.Relative = "(project folder)"
+        entry.IsFolder = True
+        entry.Seconds = StampSeconds(folder)
+        entry.Entries = Array.Count(children)
+        Me.Folders.Append(entry)
+        Return children
+    End Function
+
+    Public Sub AddFile(item As FileSystemItem, relative As String, suite As String)
+        Dim key As String = item.NativePath
+        Dim index As Integer = Me.FileIndex.Get(key).Or(-1)
+        If index < 0 Then
+            If Me.Full() Then Return
+            Dim entry As New StudioTestInput()
+            entry.Path = key
+            entry.Relative = relative
+            entry.Size = item.Length()
+            entry.Seconds = StampSeconds(item)
+            Me.FileIndex.Set(key, Array.Count(Me.Files))
+            Me.Files.Append(entry)
+            index = Array.Count(Me.Files) - 1
+        End If
+        If suite = "" Then Return
+        For Each existing As String In Me.Files(index).Suites
+            If String.Compare(existing, suite, True) = 0 Then Return
+        Next
+        Me.Files(index).Suites.Append(suite)
+    End Sub
+
+    Public Sub Walk(folder As FileSystemItem, relative As String, parts As Array Of String, index As Integer, suite As String, depth As Integer)
+        If Me.Full() Then Return
+        If depth > StudioTestInputScan.DepthLimit Then
+            Me.Problem = "the patterns reach folders nested more than " + String.From(StudioTestInputScan.DepthLimit) + " deep"
+            Return
+        End If
+        Dim children As Array Of FileSystemItem = Me.ChildrenOf(folder, relative)
+        If Me.Full() Then Return
+        Dim part As String = parts(index)
+        Dim last As Boolean = index = Array.Count(parts) - 1
+        If part = "**" Then
+            ' Zero folders: the rest of the pattern applies here; then every subfolder.
+            If Not last Then Me.Walk(folder, relative, parts, index + 1, suite, depth)
+            For Each child As FileSystemItem In children
+                If Me.Full() Then Return
+                If Not InputIsLink(child.NativePath) And child.IsFolder() Then Me.Walk(child, StudioTestJoinRelative(relative, child.Name()), parts, index, suite, depth + 1)
+            Next
+            Return
+        End If
+        Dim tokens As Array Of StudioTestGlobToken = GlobTokens(part)
+        For Each child As FileSystemItem In children
+            If Me.Full() Then Return
+            If GlobTokensMatch(String.Chars(child.Name()), tokens) Then
+                If InputIsLink(child.NativePath) Then
+                    Me.Problem = "symlink in staged inputs: " + StudioTestJoinRelative(relative, child.Name())
+                    Return
+                End If
+                If last Then
+                    If child.IsFile() Then Me.AddFile(child, StudioTestJoinRelative(relative, child.Name()), suite)
+                ElseIf child.IsFolder() Then
+                    Me.Walk(child, StudioTestJoinRelative(relative, child.Name()), parts, index + 1, suite, depth + 1)
+                End If
+            End If
+        Next
+    End Sub
+End Class
+
+Public Function StudioTestJoinRelative(relative As String, name As String) As String
+    If relative = "" Then Return name
+    Return relative + "/" + name
+End Function
+
+''' One configured pattern: files, packages or source of a suite.
+Public Class StudioTestInputRule
+    Public Property Suite As String
+    Public Property Pattern As String
+End Class
+
+''' What a run's results depend on, and what has changed since the run started.
+Public Class StudioTestInputs
+    Public Const ContentLimit As Integer = 1048576
+    Public Const ContentBudget As Integer = 8388608
+    Public Const RacySeconds As Integer = 2
+    Public Property Root As String
+    Public Property Taken As Integer = 0
+    Public Property Rules As Array Of StudioTestInputRule = []
+    Public Property Files As Array Of StudioTestInput = []
+    Public Property Folders As Array Of StudioTestInput = []
+    ''' Why tracking is incomplete, or "" when every pattern was expanded.
+    Public Property Problem As String
+    ''' Files saved within a second of the start that were too large to compare by content.
+    Public Property Unverified As Integer = 0
+    Public Property Changes As Array Of StudioTestInputChange = []
+    Public Property ChangedSuites As Map Of String, Boolean = New Map Of String, Boolean()
+    Public Property EverySuiteChanged As Boolean = False
+    ''' Set when the run's process has exited; earlier changes happened during the run.
+    Public Property RunFinished As Boolean = False
+    Private Property mIndex As Map Of String, Integer = New Map Of String, Integer()
+    Private Property mCursor As Integer = 0
+    Private Property mContentUsed As Integer = 0
+    Private Property mRescan As Boolean = False
+    Private Property mRescanStopped As Boolean = False
+
+    Public Function TrackedFiles() As Integer
+        Return Array.Count(Me.Files)
+    End Function
+
+    Public Function FilesFor(suite As String) As Integer
+        Dim count As Integer = 0
+        For Each entry As StudioTestInput In Me.Files
+            If Me.Affects(entry.Suites, suite) Then count += 1
+        Next
+        Return count
+    End Function
+
+    Public Function ChangedFor(suite As String) As Boolean
+        Return Me.EverySuiteChanged Or Me.ChangedSuites.ContainsKey(suite)
+    End Function
+
+    Public Function ChangesFor(suite As String) As Array Of String
+        Dim texts As Array Of String = []
+        For Each change As StudioTestInputChange In Me.Changes
+            If Me.Affects(change.Suites, suite) Then texts.Append(change.Describe())
+        Next
+        Return texts
+    End Function
+
+    Private Function Affects(suites As Array Of String, suite As String) As Boolean
+        If Array.Count(suites) = 0 Then Return True
+        For Each name As String In suites
+            If String.Compare(name, suite, True) = 0 Then Return True
+        Next
+        Return False
+    End Function
+
+    ''' The project-relative name of a tracked file, or "" when it is not an input.
+    Public Function RelativeOf(filePath As String) As String
+        Dim key As String = New FileSystemItem(filePath).NativePath
+        Dim index As Integer = Me.mIndex.Get(key).Or(-1)
+        If index < 0 Then Return ""
+        Return Me.Files(index).Relative
+    End Function
+
+    Public Sub AddConfiguration(configPath As String)
+        Dim item As New FileSystemItem(configPath)
+        Dim entry As New StudioTestInput()
+        entry.Path = item.NativePath
+        entry.Relative = item.Name()
+        entry.Size = item.Length()
+        entry.Seconds = StampSeconds(item)
+        Me.Adopt(entry)
+    End Sub
+
+    Private Sub Adopt(entry As StudioTestInput)
+        If entry.Seconds >= Me.Taken - StudioTestInputs.RacySeconds Then
+            entry.Racy = True
+            If entry.Size >= 0 And entry.Size <= StudioTestInputs.ContentLimit And Me.mContentUsed + entry.Size <= StudioTestInputs.ContentBudget Then
+                entry.Fingerprint = InputFingerprint(entry.Path, StudioTestInputs.ContentLimit)
+                If entry.Fingerprint <> "" Then Me.mContentUsed += entry.Size
+            End If
+            If entry.Fingerprint = "" Then Me.Unverified += 1
+        End If
+        Me.mIndex.Set(entry.Path, Array.Count(Me.Files))
+        Me.Files.Append(entry)
+    End Sub
+
+    Public Function Scan() As StudioTestInputScan
+        Dim scan As New StudioTestInputScan()
+        Dim root As New FileSystemItem(Me.Root)
+        For Each rule As StudioTestInputRule In Me.Rules
+            Dim parts As Array Of String = []
+            For Each part As String In String.Split(rule.Pattern, "/")
+                If part <> "" And part <> "." Then parts.Append(part)
+            Next
+            If Array.Count(parts) > 0 Then scan.Walk(root, "", parts, 0, rule.Suite, 0)
+            If scan.Problem <> "" Then Exit For
+        Next
+        Return scan
+    End Function
+
+    Public Sub AdoptScan(scan As StudioTestInputScan)
+        For Each entry As StudioTestInput In scan.Files
+            If Not Me.mIndex.ContainsKey(entry.Path) Then Me.Adopt(entry)
+        Next
+        Me.AdoptFolders(scan)
+    End Sub
+
+    Private Sub AdoptFolders(scan As StudioTestInputScan)
+        Dim now As Integer = ClockSeconds()
+        For Each folder As StudioTestInput In scan.Folders
+            folder.Racy = folder.Seconds >= now - StudioTestInputs.RacySeconds
+        Next
+        Me.Folders = scan.Folders
+        If scan.Problem <> "" Then
+            Me.Problem = scan.Problem
+            Me.mRescanStopped = True
+        End If
+    End Sub
+
+    Private Sub Record(text As String, suites As Array Of String)
+        Dim change As New StudioTestInputChange()
+        change.Text = text
+        change.DuringRun = Not Me.RunFinished
+        change.Suites = suites
+        Me.Changes.Append(change)
+        If Array.Count(suites) = 0 Then Me.EverySuiteChanged = True
+        For Each suite As String In suites
+            Me.ChangedSuites.Set(suite, True)
+        Next
+    End Sub
+
+    Private Sub CheckFile(entry As StudioTestInput, now As Integer)
+        If entry.Reported Then Return
+        If InputIsLink(entry.Path) Then
+            entry.Reported = True
+            Me.Record(entry.Relative + " became a symlink", entry.Suites)
+            Return
+        End If
+        Dim item As New FileSystemItem(entry.Path)
+        If Not item.IsFile() Then
+            entry.Reported = True
+            Me.Record(entry.Relative + " was deleted", entry.Suites)
+            Return
+        End If
+        Dim different As Boolean = item.Length() <> entry.Size Or StampSeconds(item) <> entry.Seconds
+        If Not different And entry.Racy And entry.Fingerprint <> "" Then
+            different = String.Compare(InputFingerprint(entry.Path, StudioTestInputs.ContentLimit), entry.Fingerprint, True) <> 0
+        End If
+        If different Then
+            entry.Reported = True
+            entry.Fingerprint = ""
+            Me.Record(entry.Relative + " changed", entry.Suites)
+            Return
+        End If
+        ' Once the clock has moved past the saved second, any later write gets a later
+        ' timestamp, so the content no longer needs comparing.
+        If entry.Racy And now > entry.Seconds + StudioTestInputs.RacySeconds Then
+            entry.Racy = False
+            entry.Fingerprint = ""
+        End If
+    End Sub
+
+    Private Sub CheckFolder(entry As StudioTestInput, now As Integer)
+        If Me.mRescanStopped Then Return
+        Dim item As New FileSystemItem(entry.Path)
+        If InputIsLink(entry.Path) Or Not item.IsFolder() Then
+            Me.mRescan = True
+        ElseIf StampSeconds(item) <> entry.Seconds Or item.Count() <> entry.Entries Then
+            Me.mRescan = True
+        ElseIf entry.Racy Then
+            ' A same-second rename keeps both stamps; list it again until the clock moves on.
+            Me.mRescan = True
+            If now > entry.Seconds + StudioTestInputs.RacySeconds Then entry.Racy = False
+        End If
+    End Sub
+
+    Private Sub Rescan()
+        Me.mRescan = False
+        Dim scan As StudioTestInputScan = Me.Scan()
+        If scan.Problem <> "" Then
+            Me.Problem = scan.Problem
+            Me.mRescanStopped = True
+            Return
+        End If
+        For Each entry As StudioTestInput In scan.Files
+            If Not Me.mIndex.ContainsKey(entry.Path) Then
+                entry.Reported = True
+                Me.mIndex.Set(entry.Path, Array.Count(Me.Files))
+                Me.Files.Append(entry)
+                Me.Record(entry.Relative + " was added", entry.Suites)
+            End If
+        Next
+        Me.AdoptFolders(scan)
+    End Sub
+
+    ''' Checks up to budget stamps (rotating), every file still inside its racy window,
+    ''' and re-expands the patterns when a listed folder changed. True when this call
+    ''' found a new change.
+    Public Function Check(budget As Integer) As Boolean
+        If Me.EverySuiteChanged Then Return False
+        Dim before As Integer = Array.Count(Me.Changes)
+        Dim previousProblem As String = Me.Problem
+        Dim now As Integer = ClockSeconds()
+        For Each entry As StudioTestInput In Me.Files
+            If entry.Racy Then Me.CheckFile(entry, now)
+        Next
+        For Each folder As StudioTestInput In Me.Folders
+            If folder.Racy Then Me.CheckFolder(folder, now)
+        Next
+        Dim total As Integer = Array.Count(Me.Files) + Array.Count(Me.Folders)
+        For i As Integer = 1 To Math.Min(budget, total)
+            If Me.mCursor >= total Then Me.mCursor = 0
+            If Me.mCursor < Array.Count(Me.Files) Then
+                Me.CheckFile(Me.Files(Me.mCursor), now)
+            Else
+                Me.CheckFolder(Me.Folders(Me.mCursor - Array.Count(Me.Files)), now)
+            End If
+            Me.mCursor += 1
+        Next
+        If Me.mRescan And Not Me.EverySuiteChanged Then Me.Rescan()
+        Return Array.Count(Me.Changes) > before Or Me.Problem <> previousProblem
+    End Function
+
+    ''' Every stamp once (used when the run exits, so edits during it are attributed).
+    Public Function CheckAll() As Boolean
+        Return Me.Check(Array.Count(Me.Files) + Array.Count(Me.Folders))
+    End Function
+End Class
+
+''' Records the runner's inputs for every configured suite. It never throws: a pattern
+''' it cannot read is left out and named in Problem. Called synchronously at run start.
+Public Function StudioCaptureTestInputs(projectRoot As String, configPath As String) As StudioTestInputs
+    Dim inputs As New StudioTestInputs()
+    inputs.Root = projectRoot
+    inputs.Taken = ClockSeconds()
+    Try
+        inputs.AddConfiguration(configPath)
+        Dim loaded As Result Of String, String = New FileSystemItem(configPath).ReadAllText()
+        If loaded.IsErr Then Throw New InvalidArgumentException("buoy.dev.json could not be read")
+        Dim parsed As Optional Of JSONItem = Json.TryParse(loaded.Value)
+        If Not parsed.HasValue Then Throw New InvalidArgumentException("buoy.dev.json is not valid JSON")
+        Dim tests As JSONItem = parsed.Value.Value("tests")
+        If tests.IsArray() Then
+            For i As Integer = 0 To tests.Count() - 1
+                Dim item As JSONItem = tests.ValueAt(i)
+                Dim name As String = item.Value("name").AsString().Or("")
+                Dim patterns As Array Of String = []
+                For Each field As String In ["files", "packages"]
+                    Dim values As JSONItem = item.Value(field)
+                    If values.IsArray() Then
+                        For j As Integer = 0 To values.Count() - 1
+                            If values.ValueAt(j).IsString() Then patterns.Append(values.ValueAt(j).AsString().Or(""))
+                        Next
+                    End If
+                Next
+                If item.Value("source").IsString() Then patterns.Append(item.Value("source").AsString().Or(""))
+                For Each pattern As String In patterns
+                    ' The runner rejects these patterns, so they cannot name an input.
+                    Dim usable As Boolean = pattern <> "" And Not String.StartsWith(pattern, "/", True) And Not String.Contains(pattern, ":", True) And Not String.Contains(pattern, "\\", True)
+                    For Each part As String In String.Split(pattern, "/")
+                        If part = ".." Then usable = False
+                    Next
+                    If usable Then
+                        Dim rule As New StudioTestInputRule()
+                        rule.Suite = name
+                        rule.Pattern = pattern
+                        inputs.Rules.Append(rule)
+                    End If
+                Next
+            Next
+        End If
+        inputs.AdoptScan(inputs.Scan())
+    Catch e As Exception
+        inputs.Problem = e.Message
+    End Try
+    Return inputs
+End Function
+
+''' Optional host hook: files with unsaved editor changes. Runs always test the saved
+''' files; this only lets the Tests window say which edits a run did not include.
+Public Interface StudioTestUnsavedSource
+    Function UnsavedTestPaths() As Array Of String
+End Interface
+
+Public Class StudioTestUnsavedLink
+    Public Property Source As StudioTestUnsavedSource
+End Class
+
+''' "a.bui, b.bui and 2 more" for notes; the details list every name.
+Public Function StudioTestNameList(names As Array Of String, limit As Integer) As String
+    Dim shown As Array Of String = []
+    For i As Integer = 0 To Math.Min(limit, Array.Count(names)) - 1
+        shown.Append(StudioTestDisplayName(names(i)))
+    Next
+    Dim text As String = String.Join(shown, ", ")
+    If Array.Count(names) > limit Then text += " and " + String.From(Array.Count(names) - limit) + " more"
+    Return text
+End Function
+
+Public Sub StudioTestRemoveFolder(folder As String)
+    Dim item As New FileSystemItem(folder)
+    If item.Exists() Then item.Delete(True)
+End Sub
+
+''' Callbacks from the session; implementations must tolerate calls at any time.
+Public Interface StudioTestListener
+    Sub TestSessionChanged()
+    Sub TestSessionMessage(message As String)
+End Interface
+
+''' Holder for a weak listener; Buoy interfaces cannot be declared Weak directly.
+Public Class StudioTestLink
+    Public Property Listener As StudioTestListener
+End Class
+
+Private Class StudioTestPoller Inherits Timer
+    Public Property Owner As Weak StudioTestSession
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioTestSession = Me.Owner
+        If target <> Nil Then target.Poll()
+    End Sub
+End Class
+
+Private Class StudioTestFreshnessPoller Inherits Timer
+    Public Property Owner As Weak StudioTestSession
+    Public Overrides Sub NotifyTick()
+        Dim target As StudioTestSession = Me.Owner
+        If target <> Nil Then target.CheckFreshness()
+    End Sub
+End Class
+
+''' The single test job of a Studio window plus the results it currently shows.
+''' State is one of idle, unavailable, running, stopping, passed, failed, cancelled
+''' and runner-failed.
+Public Class StudioTestSession
+    Public Const OutputLimit As Integer = 65536
+    Public Const ReportLimit As Integer = 268435456
+    Public Property ProjectRoot As String
+    Public Property ConfigPath As String
+    Public Property RunnerPath As String
+    Public Property Suites As Array Of StudioTestSuiteConfig = []
+    Public Property ConfigError As String
+    Public Property State As String = "idle"
+    Public Property Headline As String
+    Public Property Detail As String
+    ''' The results shown; replaced only by a later finalized report.
+    Public Property Report As StudioTestReport
+    Public Property ResultsNote As String
+    Public Property RunNumber As Integer = 0
+    Public Property ActiveMode As String
+    Public Property ActiveReportPath As String
+    Public Property ActiveCancelPath As String
+    Public Property ActiveSelectionPath As String
+    Public Property LastArguments As Array Of String = []
+    Public Property ActiveConfigStamp As String
+    ''' Grace period between the cooperative cancel request and the hard kill.
+    Public Property StopGraceMilliseconds As Integer = 10000
+    Public Property ForcedStop As Boolean = False
+    Public Property UILink As Weak StudioTestLink
+    Public Property HostLink As Weak StudioTestLink
+    ''' Optional; when set, a run names the tracked inputs that had unsaved editor changes.
+    Public Property UnsavedLink As Weak StudioTestUnsavedLink
+    ''' Inputs recorded when the active run started.
+    Public Property ActiveInputs As StudioTestInputs
+    Public Property ActiveUnsaved As Array Of String = []
+    ''' Stamps checked per freshness tick (rotating), on top of recently saved files.
+    Public Property FreshnessBudget As Integer = 400
+    Private Property mProcess As PipeProcess
+    Private Property mFolder As String
+    Private Property mShownFolder As String
+    Private Property mOutput As String
+    Private Property mErrors As String
+    Private Property mStarted As Integer = 0
+    Private Property mStopRequested As Integer = 0
+    Private Property mExited As Integer = 0
+    Private Property mLastSecond As Integer = -1
+    Private Property mPoller As StudioTestPoller = New StudioTestPoller()
+    Private Property mFreshness As StudioTestFreshnessPoller = New StudioTestFreshnessPoller()
+
+    Public Sub Constructor(projectRoot As String)
+        Me.ProjectRoot = projectRoot
+        Me.mPoller.Owner = Me
+        Me.mPoller.Period = 100
+        Me.mFreshness.Owner = Me
+        Me.mFreshness.Period = 1000
+        Me.ReloadConfiguration()
+    End Sub
+
+    Public Function IsRunning() As Boolean
+        Return Me.mProcess <> Nil
+    End Function
+
+    Public Function ConfigurationChanged() As Boolean
+        If Me.Report = Nil Then Return False
+        Return Me.Report.ConfigStamp <> StudioTestConfigStamp(Me.ConfigPath)
+    End Function
+
+    ''' The inputs being watched: the active run's while one runs, else the shown report's.
+    Public Function WatchedInputs() As StudioTestInputs
+        If Me.IsRunning() Then Return Me.ActiveInputs
+        If Me.Report = Nil Then Return Nil
+        Return Me.Report.Inputs
+    End Function
+
+    ''' True when a tracked input of this suite changed after the shown run started.
+    Public Function InputsChangedFor(suiteName As String) As Boolean
+        If Me.Report = Nil Then Return False
+        If Me.Report.Inputs = Nil Then Return False
+        Return Me.Report.Inputs.ChangedFor(suiteName)
+    End Function
+
+    ''' Every shown result is stale: a run is in progress or produced nothing, or a shared
+    ''' input (buoy.dev.json) changed.
+    Public Function AllResultsStale() As Boolean
+        If Me.Report = Nil Then Return False
+        If Me.IsRunning() Or Me.Report.RunNumber <> Me.RunNumber Or Me.ConfigurationChanged() Then Return True
+        If Me.Report.Inputs = Nil Then Return False
+        Return Me.Report.Inputs.EverySuiteChanged
+    End Function
+
+    Public Function ResultsStaleFor(suiteName As String) As Boolean
+        Return Me.AllResultsStale() Or Me.InputsChangedFor(suiteName)
+    End Function
+
+    ''' One freshness step from the 1 s timer: bounded stat work, and a pattern walk only
+    ''' when a listed folder changed.
+    Public Sub CheckFreshness()
+        Dim watched As StudioTestInputs = Me.WatchedInputs()
+        If watched = Nil Then
+            Me.mFreshness.Stop()
+            Return
+        End If
+        Try
+            If watched.Check(Me.FreshnessBudget) Then
+                Me.UpdateResultsNote()
+                Me.Changed()
+            End If
+        Catch e As Exception
+            watched.Problem = "checking failed: " + e.Message
+            Me.mFreshness.Stop()
+            Me.UpdateResultsNote()
+            Me.Changed()
+            Return
+        End Try
+        ' Nothing more can make the shown results staler.
+        If Not Me.IsRunning() And watched.EverySuiteChanged Then Me.mFreshness.Stop()
+    End Sub
+
+    Private Sub WatchFreshness()
+        If Me.WatchedInputs() = Nil Then
+            Me.mFreshness.Stop()
+        Else
+            Me.mFreshness.Start()
+        End If
+    End Sub
+
+    Public Function CanRerunFailed() As Boolean
+        If Me.IsRunning() Or Me.Report = Nil Then Return False
+        If Not New FileSystemItem(Me.Report.Path).IsFile() Then Return False
+        Return Me.Report.FailingSuites() > 0 Or Array.Count(Me.Report.NotRun) > 0
+    End Function
+
+    Public Function ProtocolOf(suiteName As String) As String
+        For Each suite As StudioTestSuiteConfig In Me.Suites
+            If String.Compare(suite.Name, suiteName, True) = 0 Then Return suite.Protocol
+        Next
+        Return ""
+    End Function
+
+    Public Function ConfigNamed(suiteName As String) As StudioTestSuiteConfig
+        For Each suite As StudioTestSuiteConfig In Me.Suites
+            If String.Compare(suite.Name, suiteName, True) = 0 Then Return suite
+        Next
+        Return Nil
+    End Function
+
+    Public Sub ReloadConfiguration()
+        Me.Suites = []
+        Me.ConfigError = ""
+        If Me.ProjectRoot = "" Then
+            Me.ConfigPath = ""
+            Me.ConfigError = "No project folder is open. Start Studio with --project FOLDER (or set BUOY_STUDIO_PROJECT) for a folder containing buoy.dev.json."
+        Else
+            Me.ConfigPath = StudioNativeJoin(Me.ProjectRoot, "buoy.dev.json")
+            Try
+                Me.Suites = StudioReadTestConfig(Me.ConfigPath)
+            Catch e As Exception
+                Me.ConfigError = e.Message
+            End Try
+        End If
+        If Not Me.IsRunning() Then
+            If Me.ConfigError <> "" Then
+                Me.SetState("unavailable", "Tests are unavailable", Me.ConfigError)
+            ElseIf Me.State = "unavailable" Or Me.State = "idle" Then
+                Me.SetState("idle", "Ready", String.From(Array.Count(Me.Suites)) + " configured suites. Choose Run All, or mark suites or cases and choose Run Selected.")
+            End If
+        End If
+        Me.Changed()
+    End Sub
+
+    Private Sub SetState(state As String, headline As String, detail As String)
+        Me.State = state
+        Me.Headline = headline
+        Me.Detail = detail
+    End Sub
+
+    Private Sub Changed()
+        Dim link As StudioTestLink = Me.UILink
+        If link <> Nil Then
+            If link.Listener <> Nil Then link.Listener.TestSessionChanged()
+        End If
+    End Sub
+
+    Private Sub Announce(message As String)
+        Dim link As StudioTestLink = Me.HostLink
+        If link <> Nil Then
+            If link.Listener <> Nil Then link.Listener.TestSessionMessage(message)
+        End If
+        link = Me.UILink
+        If link <> Nil Then
+            If link.Listener <> Nil Then link.Listener.TestSessionMessage(message)
+        End If
+    End Sub
+
+    Public Sub RunAll()
+        Dim noArguments As Array Of String = []
+        Me.Start("Run All", noArguments, "")
+    End Sub
+
+    Public Sub RunSelection(entries As Array Of StudioTestSelectionEntry)
+        If Array.Count(entries) = 0 Then
+            Me.Refuse("Nothing is selected. Select a suite or case, or mark several, then choose Run Selected.")
+            Return
+        End If
+        Dim suites As Integer = Array.Count(entries)
+        Dim title As String = "Run Selected (" + String.From(suites) + " suite"
+        If suites <> 1 Then title += "s"
+        Dim noArguments As Array Of String = []
+        Me.Start(title + ")", noArguments, StudioTestSelectionJSON(entries))
+    End Sub
+
+    Public Sub RerunFailed()
+        If Not Me.CanRerunFailed() Then
+            Me.Refuse("There is no finished report with failures to rerun.")
+            Return
+        End If
+        Dim extra As Array Of String = ["--rerun-failed", Me.Report.Path]
+        Me.Start("Rerun Failed (from run #" + String.From(Me.Report.RunNumber) + ")", extra, "")
+    End Sub
+
+    ''' Rejections before a process starts leave the state and results untouched.
+    Private Sub Refuse(message As String)
+        Me.Announce("Tests: " + message)
+        Me.Changed()
+    End Sub
+
+    Private Function NewRunFolder() As String
+        Dim temporary As FileSystemItem = System.Folders.Temporary()
+        If temporary = Nil Then Throw New InvalidArgumentException("No temporary folder is available for test reports.")
+        Dim parent As FileSystemItem = temporary.Child("buoy-studio-tests")
+        If Not parent.CreateFolder(True) Then Throw New InvalidArgumentException("Could not create " + parent.FullPath())
+        For attempt As Integer = 1 To 20
+            Dim folder As FileSystemItem = parent.Child("run-" + String.From(Me.RunNumber + 1) + "-" + String.From(Random.RandomInteger(100000000, 999999999)) + "-" + String.From(Random.RandomInteger(100000000, 999999999)))
+            If Not folder.Exists() Then
+                If folder.CreateFolder(False) Then Return folder.NativePath
+            End If
+        Next
+        Throw New InvalidArgumentException("Could not create a unique folder for the test report.")
+    End Function
+
+    Private Sub Start(modeTitle As String, extra As Array Of String, selection As String)
+        If Me.IsRunning() Then
+            Me.Refuse("A test run is already in progress. Stop it or wait for it to finish.")
+            Return
+        End If
+        Me.ReloadConfiguration()
+        Me.ActiveConfigStamp = StudioTestConfigStamp(Me.ConfigPath)
+        If Me.ConfigError <> "" Then
+            Me.Refuse(Me.ConfigError)
+            Return
+        End If
+        Me.RunnerPath = StudioTestRunnerPath(Me.ProjectRoot)
+        If Not New FileSystemItem(Me.RunnerPath).IsFile() Then
+            Dim message As String = "The native test runner was not found at " + Me.RunnerPath + ". Build it with python3 tools/build_buoy_dev.py, or set BUOY_STUDIO_TEST_RUNNER to a buoy-dev executable."
+            If System.EnvironmentVariable("BUOY_STUDIO_TEST_RUNNER").Or("") <> "" Then message = "BUOY_STUDIO_TEST_RUNNER is set to " + Me.RunnerPath + ", which is not an executable file."
+            Me.SetState("runner-failed", "Test runner not found", message)
+            Me.Announce("Tests: " + message)
+            Me.Changed()
+            Return
+        End If
+        ' Recorded before the runner starts: it stages each suite only when it reaches it,
+        ' so any edit from here on may or may not be in the results.
+        Me.ActiveInputs = StudioCaptureTestInputs(Me.ProjectRoot, Me.ConfigPath)
+        Me.ActiveUnsaved = Me.UnsavedInputs(Me.ActiveInputs)
+        Dim folder As String = ""
+        Try
+            folder = Me.NewRunFolder()
+            Dim arguments As Array Of String = Array.AsResizable(["test", "--config", Me.ConfigPath, "--json", StudioNativeJoin(folder, "report.json"), "--cancel-file", StudioNativeJoin(folder, "cancel")])
+            For Each argument As String In extra
+                arguments.Append(argument)
+            Next
+            Me.ActiveSelectionPath = ""
+            If selection <> "" Then
+                Me.ActiveSelectionPath = StudioNativeJoin(folder, "selection.json")
+                Dim written As Result Of Integer, String = New FileSystemItem(Me.ActiveSelectionPath).WriteAllText(selection)
+                If written.IsErr Then Throw New InvalidArgumentException("Could not write the selection file: " + written.Error)
+                arguments.Append("--selection")
+                arguments.Append(Me.ActiveSelectionPath)
+            End If
+            Me.mOutput = ""
+            Me.mErrors = ""
+            Me.mProcess = New PipeProcess(Me.RunnerPath, arguments, Me.ProjectRoot, True)
+            Me.mProcess.CloseInput()
+            Me.mFolder = folder
+            Me.LastArguments = arguments
+        Catch e As Exception
+            If Me.mProcess <> Nil Then
+                Me.mProcess.Close()
+                Me.mProcess = Nil
+            End If
+            If folder <> "" Then StudioTestRemoveFolder(folder)
+            Me.SetState("runner-failed", "The test runner could not start", e.Message)
+            Me.Announce("Tests: the runner could not start: " + e.Message)
+            Me.Changed()
+            Return
+        End Try
+        Me.RunNumber += 1
+        Me.ActiveMode = modeTitle
+        Me.ActiveReportPath = StudioNativeJoin(folder, "report.json")
+        Me.ActiveCancelPath = StudioNativeJoin(folder, "cancel")
+        Me.ForcedStop = False
+        Me.mStarted = System.Microseconds()
+        Me.mStopRequested = 0
+        Me.mExited = 0
+        Me.mLastSecond = -1
+        Dim detail As String = "Results appear when the runner finishes. Studio does not show per-case progress. The runner tests the saved files on disk."
+        If Array.Count(Me.ActiveUnsaved) > 0 Then detail += " Unsaved editor changes to " + StudioTestNameList(Me.ActiveUnsaved, 3) + " are not part of this run."
+        Me.SetState("running", "Running run #" + String.From(Me.RunNumber) + " · " + modeTitle, detail)
+        Me.UpdateResultsNote()
+        Me.mPoller.Start()
+        Me.WatchFreshness()
+        Me.Changed()
+    End Sub
+
+    ''' Tracked inputs the host reports as having unsaved editor changes.
+    Private Function UnsavedInputs(inputs As StudioTestInputs) As Array Of String
+        Dim names As Array Of String = []
+        Dim link As StudioTestUnsavedLink = Me.UnsavedLink
+        If link = Nil Or inputs = Nil Then Return names
+        If link.Source = Nil Then Return names
+        Try
+            For Each filePath As String In link.Source.UnsavedTestPaths()
+                Dim relative As String = inputs.RelativeOf(filePath)
+                If relative <> "" Then names.Append(relative)
+            Next
+        Catch e As Exception
+            ' The hook is advisory; a failing host never blocks a run.
+        End Try
+        Return names
+    End Function
+
+    ''' The freshness clause of the results note for the shown, otherwise current report.
+    Private Function InputsNote(inputs As StudioTestInputs) As String
+        If inputs = Nil Then Return " (latest run; source edits are not tracked)"
+        If inputs.Problem <> "" Then Return " (latest run; input freshness is unknown: tracking is incomplete: " + inputs.Problem + ")"
+        Dim count As Integer = inputs.TrackedFiles()
+        Dim text As String = " (latest run; its " + String.From(count) + " tracked input files are unchanged since it started"
+        If count = 1 Then text = " (latest run; its 1 tracked input file is unchanged since it started"
+        Return text + ")"
+    End Function
+
+    Private Function ChangesNote(inputs As StudioTestInputs) As String
+        Dim more As Integer = Array.Count(inputs.Changes) - 1
+        Dim text As String = inputs.Changes(0).Describe()
+        If more = 1 Then text += " (and 1 more change)"
+        If more > 1 Then text += " (and " + String.From(more) + " more changes)"
+        text += "."
+        If inputs.EverySuiteChanged Then Return text + " Every suite is affected."
+        Dim affected As Array Of String = []
+        For Each suite As StudioTestSuiteConfig In Me.Suites
+            If inputs.ChangedFor(suite.Name) Then affected.Append("“" + StudioTestDisplayName(suite.Name) + "”")
+        Next
+        If Array.Count(affected) = 0 Then Return text
+        Dim word As String = " Affects suite "
+        If Array.Count(affected) > 1 Then word = " Affects suites "
+        If inputs.Problem <> "" Then Return text + word + String.Join(affected, ", ") + "; freshness of the other suites is unknown because tracking is incomplete."
+        Return text + word + String.Join(affected, ", ") + "; the other suites' inputs are unchanged."
+    End Function
+
+    Private Sub UpdateResultsNote()
+        If Me.Report = Nil Then
+            Me.ResultsNote = ""
+            If Me.IsRunning() Then Me.ResultsNote = "No results yet. Run #" + String.From(Me.RunNumber) + " is in progress."
+            Return
+        End If
+        Dim note As String = "Results of run #" + String.From(Me.Report.RunNumber) + " · " + Me.Report.ModeTitle
+        If Me.IsRunning() Then
+            note = "STALE — " + note + ". Run #" + String.From(Me.RunNumber) + " is in progress; these results will be replaced, not merged."
+        ElseIf Me.Report.RunNumber <> Me.RunNumber Then
+            note = "STALE — " + note + ". Run #" + String.From(Me.RunNumber) + " produced no results."
+        ElseIf Me.ConfigurationChanged() Then
+            note = "STALE — " + note + ". buoy.dev.json changed after this run."
+        ElseIf Me.Report.Inputs <> Nil And Array.Count(Me.Report.Inputs.Changes) > 0 Then
+            note = "STALE — " + note + ". " + Me.ChangesNote(Me.Report.Inputs)
+        Else
+            note += Me.InputsNote(Me.Report.Inputs)
+        End If
+        If Me.Report.Cancelled Then note += " Cancelled before completion."
+        If Array.Count(Me.Report.UnsavedInputs) > 0 Then note += " Not tested: unsaved editor changes to " + StudioTestNameList(Me.Report.UnsavedInputs, 3) + "."
+        Me.ResultsNote = note
+    End Sub
+
+    ''' Cooperative cancellation first; a second request (or the grace period) kills
+    ''' the runner's process tree.
+    Public Sub StopRun()
+        If Not Me.IsRunning() Then Return
+        If Me.mStopRequested <> 0 Then
+            Me.ForceStop()
+            Return
+        End If
+        Me.mStopRequested = System.Microseconds()
+        Dim written As Result Of Integer, String = New FileSystemItem(Me.ActiveCancelPath).WriteAllText("cancel\n")
+        If written.IsErr Then
+            Me.ForceStop()
+            Return
+        End If
+        Me.SetState("stopping", "Stopping run #" + String.From(Me.RunNumber) + "…", "Asked the runner to cancel. It stops between suites and kills its own test processes; it is force-stopped if it has not exited within " + String.From(Me.StopGraceMilliseconds \ 1000) + " s. Choose Stop again to force-stop now.")
+        Me.Changed()
+    End Sub
+
+    Private Sub ForceStop()
+        If Me.mProcess = Nil Or Me.ForcedStop Then Return
+        Me.ForcedStop = True
+        Try
+            Me.mProcess.TerminateTree()
+        Catch e As Exception
+            Try
+                Me.mProcess.Terminate()
+            Catch inner As Exception
+                ' It may already have exited.
+            End Try
+        End Try
+        Me.SetState("stopping", "Force-stopping run #" + String.From(Me.RunNumber) + "…", "")
+        Me.Changed()
+    End Sub
+
+    Private Sub Drain()
+        For i As Integer = 1 To 32
+            Dim read As Boolean = False
+            Dim chunk As Bytes = Me.mProcess.ReadOutput(65536)
+            If chunk <> Nil Then
+                If chunk.Count > 0 Then
+                    read = True
+                    Me.mOutput = Tail(Me.mOutput + chunk.ToString(Text.Encodings.UTF8), StudioTestSession.OutputLimit)
+                End If
+            End If
+            Dim errorChunk As Bytes = Me.mProcess.ReadError(65536)
+            If errorChunk <> Nil Then
+                If errorChunk.Count > 0 Then
+                    read = True
+                    Me.mErrors = Tail(Me.mErrors + errorChunk.ToString(Text.Encodings.UTF8), StudioTestSession.OutputLimit)
+                End If
+            End If
+            If Not read Then Exit For
+        Next
+    End Sub
+
+    Public Function ElapsedSeconds() As Integer
+        If Me.mStarted = 0 Then Return 0
+        Return (System.Microseconds() - Me.mStarted) \ 1000000
+    End Function
+
+    ''' Advances the job from the UI timer without blocking.
+    Public Sub Poll()
+        If Me.mProcess = Nil Then
+            Me.mPoller.Stop()
+            Return
+        End If
+        Try
+            Me.Drain()
+            If Me.mStopRequested <> 0 And Not Me.ForcedStop Then
+                If System.Microseconds() - Me.mStopRequested > Me.StopGraceMilliseconds * 1000 Then Me.ForceStop()
+            End If
+            If Me.mProcess.Poll() Then
+                Dim second As Integer = Me.ElapsedSeconds()
+                If second <> Me.mLastSecond Then
+                    Me.mLastSecond = second
+                    Me.Changed()
+                End If
+                Return
+            End If
+            Me.Drain()
+            If Me.mExited = 0 Then Me.mExited = System.Microseconds()
+            ' Pipes normally close with the runner; a lingering descendant cannot hold
+            ' the result hostage for more than two seconds.
+            If (Not Me.mProcess.OutputClosed Or Not Me.mProcess.ErrorClosed) And System.Microseconds() - Me.mExited < 2000000 Then Return
+            Dim code As Integer = Me.mProcess.ExitCode
+            Dim signal As Integer = Me.mProcess.TerminationSignal
+            Me.mProcess.Close()
+            Me.mProcess = Nil
+            Me.mPoller.Stop()
+            Me.Finish(code, signal)
+        Catch e As Exception
+            If Me.mProcess <> Nil Then
+                Try
+                    Me.mProcess.TerminateTree()
+                Catch inner As Exception
+                    ' Already gone.
+                End Try
+                Me.mProcess.Close()
+                Me.mProcess = Nil
+            End If
+            Me.mPoller.Stop()
+            Me.WatchFreshness()
+            Me.SetState("runner-failed", "Run #" + String.From(Me.RunNumber) + " failed in Studio", e.Message)
+            Me.DiscardFolder(Me.mFolder)
+            Me.UpdateResultsNote()
+            Me.Announce("Tests: run #" + String.From(Me.RunNumber) + " failed: " + e.Message)
+            Me.Changed()
+        End Try
+    End Sub
+
+    Private Function ErrorTail() As String
+        Dim text As String = String.Trim(Me.mErrors)
+        If text = "" Then Return ""
+        Return Tail(text, 2000)
+    End Function
+
+    Private Function ReadActiveReport(ByRef problem As String) As StudioTestReport
+        problem = ""
+        Dim file As New FileSystemItem(Me.ActiveReportPath)
+        If Not file.IsFile() Then
+            problem = "the runner wrote no report"
+            Return Nil
+        End If
+        If file.Length() > StudioTestSession.ReportLimit Then
+            problem = "the report is larger than 256 MiB"
+            Return Nil
+        End If
+        Dim loaded As Result Of String, String = file.ReadAllText()
+        If loaded.IsErr Then
+            problem = "the report could not be read: " + loaded.Error
+            Return Nil
+        End If
+        Try
+            Dim report As StudioTestReport = StudioParseTestReport(loaded.Value)
+            report.Path = Me.ActiveReportPath
+            report.RunNumber = Me.RunNumber
+            report.ModeTitle = Me.ActiveMode
+            ' Captured when the run started, so an edit during the run marks it stale.
+            report.ConfigStamp = Me.ActiveConfigStamp
+            report.Inputs = Me.ActiveInputs
+            report.UnsavedInputs = Me.ActiveUnsaved
+            Return report
+        Catch e As Exception
+            problem = e.Message
+        End Try
+        Return Nil
+    End Function
+
+    Private Sub Show(report As StudioTestReport)
+        Dim previous As String = Me.mShownFolder
+        Me.mShownFolder = Me.mFolder
+        Me.Report = report
+        If previous <> "" And previous <> Me.mFolder Then Me.DiscardFolder(previous)
+    End Sub
+
+    Private Sub DiscardFolder(folder As String)
+        If folder = "" Or folder = Me.mShownFolder Then Return
+        StudioTestRemoveFolder(folder)
+    End Sub
+
+    Private Function Summary(report As StudioTestReport) As String
+        Dim parts As Array Of String = []
+        parts.Append(String.From(Array.Count(report.Suites)) + " suites run")
+        Dim failing As Integer = report.FailingSuites()
+        If failing > 0 Then parts.Append(String.From(failing) + " failing")
+        parts.Append(String.From(report.CaseCount("passed")) + " cases passed")
+        Dim failedCases As Integer = report.CaseCount("failed")
+        If failedCases > 0 Then parts.Append(String.From(failedCases) + " failed")
+        Dim skipped As Integer = report.CaseCount("skipped")
+        If skipped > 0 Then parts.Append(String.From(skipped) + " skipped")
+        Dim unselected As Integer = report.CaseCount("unselected")
+        If unselected > 0 Then parts.Append(String.From(unselected) + " not selected")
+        If Array.Count(report.NotRun) > 0 Then parts.Append(String.From(Array.Count(report.NotRun)) + " suites not run")
+        Return String.Join(parts, " · ")
+    End Function
+
+    Private Sub Finish(code As Integer, signal As Integer)
+        ' Every stamp once more, so an edit made while the runner worked is attributed to
+        ' the run even if the rotating check had not reached it yet.
+        If Me.ActiveInputs <> Nil Then
+            Try
+                Me.ActiveInputs.CheckAll()
+            Catch e As Exception
+                Me.ActiveInputs.Problem = "checking failed: " + e.Message
+            End Try
+            Me.ActiveInputs.RunFinished = True
+        End If
+        Me.FinishRun(code, signal)
+        Me.WatchFreshness()
+    End Sub
+
+    Private Sub FinishRun(code As Integer, signal As Integer)
+        Dim run As String = "Run #" + String.From(Me.RunNumber)
+        Dim elapsed As String = StudioTestDuration((System.Microseconds() - Me.mStarted) / 1000000.0, True)
+        Dim problem As String = ""
+        Dim stderrText As String = Me.ErrorTail()
+        If Me.ForcedStop Then
+            Me.SetState("cancelled", run + " was force-stopped", "The runner did not stop after the cancel request and was killed with its process group. Test processes it started in their own sessions may still be running, and temporary buoy-test-* folders may remain. No report was used.")
+            Me.DiscardFolder(Me.mFolder)
+            Me.UpdateResultsNote()
+            Me.Announce("Tests: " + run + " was force-stopped. Check for leftover test processes started by buoy-dev.")
+            Me.Changed()
+            Return
+        End If
+        Dim report As StudioTestReport = Nil
+        If code = 0 Or code = 1 Or code = 3 Then report = Me.ReadActiveReport(problem)
+        Dim headline As String = ""
+        Dim detail As String = ""
+        Dim state As String = "runner-failed"
+        If signal > 0 Then
+            headline = run + ": the runner was killed by signal " + String.From(signal)
+            detail = stderrText
+        ElseIf code = 2 Then
+            headline = run + " was rejected by the runner"
+            Dim rejected As StudioTestReport = Me.ReadActiveReport(problem)
+            Dim lines As Array Of String = []
+            If stderrText <> "" Then lines.Append(stderrText)
+            If rejected <> Nil Then
+                If Array.Count(rejected.Unmatched) > 0 Then lines.Append("Names that no longer match: " + String.Join(rejected.Unmatched, "; ") + ".")
+                If rejected.SelectionEmpty Then lines.Append("The selection matched no cases.")
+                If Array.Count(rejected.Suites) > 0 Then
+                    report = rejected
+                    state = "failed"
+                    lines.Append(Me.Summary(report))
+                End If
+            End If
+            If report = Nil Then lines.Append("No tests ran; the shown results are unchanged.")
+            detail = String.Join(lines, "\n")
+        ElseIf report = Nil And (code = 0 Or code = 1 Or code = 3) Then
+            headline = run + ": results are unavailable"
+            detail = "The runner exited with status " + String.From(code) + " but " + problem + "."
+            If stderrText <> "" Then detail += "\n" + stderrText
+        ElseIf code = 3 Then
+            If report.Cancelled Then
+                state = "cancelled"
+                headline = run + " was cancelled · " + elapsed
+                detail = Me.Summary(report) + ". Results are partial."
+            Else
+                headline = run + ": the runner exited as cancelled without a cancelled report"
+            End If
+        ElseIf code = 0 Then
+            If report.Cancelled Or report.FailingSuites() > 0 Then
+                headline = run + ": the report disagrees with the runner's success status"
+            Else
+                state = "passed"
+                headline = run + " passed · " + elapsed
+                detail = Me.Summary(report)
+            End If
+        ElseIf code = 1 Then
+            If report.Cancelled Then
+                headline = run + ": the report is cancelled but the runner reported failure"
+            Else
+                state = "failed"
+                headline = run + " failed · " + elapsed
+                detail = Me.Summary(report)
+            End If
+        Else
+            headline = run + ": the runner exited with status " + String.From(code)
+            detail = stderrText
+        End If
+        If state = "runner-failed" And detail = "" Then detail = stderrText
+        If report <> Nil And state <> "runner-failed" Then
+            Me.Show(report)
+        Else
+            Me.DiscardFolder(Me.mFolder)
+        End If
+        Me.SetState(state, headline, detail)
+        Me.UpdateResultsNote()
+        Dim message As String = "Tests: " + headline
+        If state <> "passed" And detail <> "" Then message += " — " + String.Split(detail, "\n")(0)
+        Me.Announce(message)
+        Me.Changed()
+    End Sub
+
+    ''' Called when the owning Studio window closes: cooperative cancel, a bounded
+    ''' wait, then a hard kill. Returns a warning when processes may remain.
+    Public Function Shutdown(waitMilliseconds As Integer) As String
+        Me.mPoller.Stop()
+        Me.mFreshness.Stop()
+        Dim warning As String = ""
+        If Me.mProcess <> Nil Then
+            Try
+                If Me.mStopRequested = 0 Then
+                    Me.mStopRequested = System.Microseconds()
+                    Dim cancelFile As New FileSystemItem(Me.ActiveCancelPath)
+                    cancelFile.WriteAllText("cancel\n")
+                End If
+                Dim started As Integer = System.Microseconds()
+                While Me.mProcess.Poll() And System.Microseconds() - started < waitMilliseconds * 1000
+                    Me.Drain()
+                    Sleep(20)
+                End While
+                If Me.mProcess.Poll() Then
+                    Me.mProcess.TerminateTree()
+                    warning = "Buoy Studio: the test runner did not stop within " + String.From(waitMilliseconds) + " ms and was killed; test processes it started may still be running."
+                End If
+            Catch e As Exception
+                warning = "Buoy Studio: the test runner could not be stopped cleanly: " + e.Message
+            End Try
+            Me.mProcess.Close()
+            Me.mProcess = Nil
+        End If
+        Me.DiscardFolder(Me.mFolder)
+        Me.mFolder = ""
+        Dim shown As String = Me.mShownFolder
+        Me.mShownFolder = ""
+        If shown <> "" Then StudioTestRemoveFolder(shown)
+        Return warning
+    End Function
+End Class

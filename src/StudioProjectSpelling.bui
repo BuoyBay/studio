@@ -1,0 +1,74 @@
+Import StudioSpelling
+Import StudioSyntax
+
+Public Class StudioProjectSpellingHit
+    Public Property Start As Integer
+    Public Property Length As Integer
+    Public Property Line As Integer
+    Public Property Column As Integer
+    Public Property Word As String
+    Public Property Context As String
+End Class
+
+''' Incremental immutable snapshot scan. Coordinates count codepoints in the original
+''' source (including CRLF); at most 40 logical lines are checked per timer tick.
+Public Class StudioProjectSpellingScan
+    Public Property Complete As Boolean = False
+    Public Property LimitedLines As Integer = 0
+    Private Property Chars As Array Of String = []
+    Private Property Offset As Integer = 0
+    Private Property Line As Integer = 1
+    Private Property State As Boolean = False
+    Private Property Mode As String
+    Private Property Checker As StudioSpelling = New StudioSpelling()
+
+    Public Sub Constructor(source As String, filePath As String)
+        Me.Chars = String.Chars(source)
+        Me.Mode = StudioLanguageModeForPath(filePath)
+    End Sub
+
+    Public Function Step() As Array Of StudioProjectSpellingHit
+        Dim hits As Array Of StudioProjectSpellingHit = []
+        For row As Integer = 1 To 40
+            If Me.Offset >= Array.Count(Me.Chars) Then
+                Me.Complete = True
+                Exit For
+            End If
+            Dim first As Integer = Me.Offset
+            Dim pieces As Array Of String = []
+            While Me.Offset < Array.Count(Me.Chars)
+                Dim c As String = Me.Chars(Me.Offset)
+                If c = "\r" Or c = "\n" Then Exit While
+                pieces.Append(c)
+                Me.Offset += 1
+            Wend
+            Dim text As String = String.Join(pieces, "")
+            Dim info As StudioSyntaxLine = StudioTokenizeLineFor(Me.Mode, text, Me.State)
+            Me.State = StudioLineStateAfter(Me.Mode, text, Me.State)
+            Dim words As Array Of StudioSpellingWord = Me.Checker.Check(info)
+            For Each word As StudioSpellingWord In words
+                Dim hit As New StudioProjectSpellingHit()
+                hit.Start = first + word.Start
+                hit.Length = word.Length
+                hit.Line = Me.Line
+                hit.Column = word.Start + 1
+                hit.Word = word.Word
+                ' A short context centred on the word, rather than just its spelling.
+                Dim contextStart As Integer = Math.Max(0, word.Start - 45)
+                hit.Context = String.Substring(text, contextStart, Math.Min(140, String.Len(text) - contextStart))
+                hits.Append(hit)
+            Next
+            If Me.Offset < Array.Count(Me.Chars) Then
+                Dim ending As String = Me.Chars(Me.Offset)
+                Me.Offset += 1
+                If ending = "\r" And Me.Offset < Array.Count(Me.Chars) Then
+                    If Me.Chars(Me.Offset) = "\n" Then Me.Offset += 1
+                End If
+            End If
+            Me.Line += 1
+        Next
+        If Me.Offset >= Array.Count(Me.Chars) Then Me.Complete = True
+        If Me.Complete Then Me.Chars = []
+        Return hits
+    End Function
+End Class

@@ -1,0 +1,227 @@
+Package Regex
+
+' PCRE2 is supplied by the toolchain's Regex package. Keep matching on the full
+' subject: slicing at the caret would change anchors, lookbehind and boundaries.
+Declare Function FindCompile Lib "regex" Alias "pcre2_compile_8" (pattern As Ptr, length As Int64, options As UInt32, ByRef error As Int32, ByRef offset As Int64, context As Ptr) As Ptr
+Declare Sub FindFree Lib "regex" Alias "pcre2_code_free_8" (code As Ptr)
+Declare Function FindData Lib "regex" Alias "pcre2_match_data_create_from_pattern_8" (code As Ptr, context As Ptr) As Ptr
+Declare Sub FindDataFree Lib "regex" Alias "pcre2_match_data_free_8" (data As Ptr)
+Declare Function FindRun Lib "regex" Alias "pcre2_match_8" (code As Ptr, subject As Ptr, length As Int64, offset As Int64, options As UInt32, data As Ptr, context As Ptr) As Int32
+Declare Function FindVector Lib "regex" Alias "pcre2_get_ovector_pointer_8" (data As Ptr) As Ptr
+Declare Function FindGroup Lib "regex" Alias "pcre2_substring_get_bynumber_8" (data As Ptr, number As UInt32, ByRef buffer As Ptr, ByRef length As Int64) As Int32
+Declare Function FindNamedGroup Lib "regex" Alias "pcre2_substring_get_byname_8" (data As Ptr, name As String, ByRef buffer As Ptr, ByRef length As Int64) As Int32
+Declare Sub FindGroupFree Lib "regex" Alias "pcre2_substring_free_8" (buffer As Ptr)
+Declare Function FindError Lib "regex" Alias "pcre2_get_error_message_8" (error As Int32, buffer As Ptr, length As Int64) As Int32
+
+Declare Function FindContext Lib "regex" Alias "pcre2_match_context_create_8" (context As Ptr) As Ptr
+Declare Sub FindContextFree Lib "regex" Alias "pcre2_match_context_free_8" (context As Ptr)
+Declare Function FindMatchLimit Lib "regex" Alias "pcre2_set_match_limit_8" (context As Ptr, limit As UInt32) As Int32
+Declare Function FindDepthLimit Lib "regex" Alias "pcre2_set_depth_limit_8" (context As Ptr, limit As UInt32) As Int32
+
+' Shared by current-document, frozen-selection and project literal searches.
+Public Function StudioFindPattern(query As String, regex As Boolean) As String
+    If regex Then Return query
+    Dim pattern As String = ""
+    For Each c As String In String.Chars(query)
+        If String.Contains("\\.^$|?*+()[]{}", c, True) Then pattern += "\\"
+        pattern += c
+    Next
+    Return pattern
+End Function
+
+Public Function StudioFindHits(source As String, query As String, regex As Boolean, matchCase As Boolean, wholeWord As Boolean, multiline As Boolean, dotAll As Boolean, replacement As String = "", expand As Boolean = False) As Array Of StudioFindHit
+    Dim hits As Array Of StudioFindHit = StudioRegexHits(source, StudioFindPattern(query, regex), matchCase, wholeWord, multiline, dotAll, replacement, expand And regex)
+    If expand And Not regex Then
+        For Each hit As StudioFindHit In hits
+            hit.Replacement = replacement
+        Next
+    End If
+    Return hits
+End Function
+
+Public Class StudioFindHit
+    Public Property Start As Integer
+    Public Property Length As Integer
+    Public Property Replacement As String
+End Class
+
+Private Function FindMessage(code As Int32) As String
+    Dim buffer As New Bytes()
+    For i As Integer = 1 To 256
+        buffer.Append(0)
+    Next
+    Dim length As Integer = FindError(code, buffer.DataPtr(), buffer.Count)
+    If length < 0 Then Return "PCRE2 error " + String.From(code)
+    Return String.LeftBytes(buffer.ToString(Text.Encodings.UTF8), length)
+End Function
+
+' Supported Studio targets all use little-endian 64-bit size_t.
+Private Function FindOffset(vector As Bytes, start As Integer) As Integer
+    Dim value As Integer = 0
+    Dim factor As Integer = 1
+    For i As Integer = 0 To 7
+        value += vector.Item(start + i) * factor
+        If i < 7 Then factor *= 256
+    Next
+    Return value
+End Function
+
+Private Function FindCapture(data As Ptr, name As String, numbered As Boolean) As String
+    Dim buffer As Ptr
+    Dim length As Int64 = 0
+    Dim rc As Int32 = 0
+    If numbered Then
+        Dim number As Result Of Integer, String = Integer.Parse(name)
+        If number.IsErr Then Throw New InvalidArgumentException("Invalid capture: " + name)
+        rc = FindGroup(data, number.Value, buffer, length)
+    Else
+        rc = FindNamedGroup(data, name, buffer, length)
+    End If
+    If rc = -55 Then Return "" ' optional group did not participate
+    If rc < 0 Then Throw New InvalidArgumentException("Unknown capture: " + name)
+    Dim bytes As New Bytes()
+    bytes.Append(buffer, length)
+    FindGroupFree(buffer)
+    Return bytes.ToString(Text.Encodings.UTF8)
+End Function
+
+Private Function FindExpand(data As Ptr, template As String) As String
+    Dim chars As Array Of String = String.Chars(template)
+    Dim pieces As Array Of String = []
+    Dim mode As String = ""
+    Dim once As String = ""
+    Dim i As Integer = 0
+    While i < Array.Count(chars)
+        Dim piece As String = chars(i)
+        If piece = "$" Or piece = "\\" Then
+            Dim marker As String = piece
+            i += 1
+            If i >= Array.Count(chars) Then Throw New InvalidArgumentException("Incomplete replacement escape.")
+            piece = chars(i)
+            If marker = "$" And piece = "$" Then
+                piece = "$"
+            ElseIf marker = "$" And piece = "{" Then
+                Dim name As String = ""
+                i += 1
+                While i < Array.Count(chars) And chars(i) <> "}"
+                    name += chars(i)
+                    i += 1
+                Wend
+                If i >= Array.Count(chars) Or name = "" Then Throw New InvalidArgumentException("Expected ${captureName}.")
+                piece = FindCapture(data, name, False)
+            ElseIf String.Contains("0123456789", piece, True) Then
+                Dim name As String = piece
+                While i + 1 < Array.Count(chars)
+                    If Not String.Contains("0123456789", chars(i + 1), True) Then Exit While
+                    i += 1
+                    name += chars(i)
+                Wend
+                piece = FindCapture(data, name, True)
+            ElseIf marker = "\\" Then
+                Select Case String.Asc(piece)
+                    Case 85, 76
+                        mode = piece
+                        piece = ""
+                    Case 117, 108
+                        once = piece
+                        piece = ""
+                    Case 69
+                        mode = ""
+                        once = ""
+                        piece = ""
+                    Case 110
+                        piece = "\n"
+                    Case 114
+                        piece = "\r"
+                    Case 116
+                        piece = "\t"
+                    Case 92, 36
+                    Case Else
+                        Throw New InvalidArgumentException("Unknown replacement escape: \\" + piece)
+                End Select
+            Else
+                Throw New InvalidArgumentException("Use $$ for a literal dollar, $1 or ${name} for captures.")
+            End If
+        End If
+        If String.Compare(mode, "U", True) = 0 Then piece = String.UCase(piece)
+        If String.Compare(mode, "L", True) = 0 Then piece = String.LCase(piece)
+        If piece <> "" And once <> "" Then
+            Dim head As String = String.Left(piece, 1)
+            If String.Compare(once, "u", True) = 0 Then head = String.UCase(head)
+            If String.Compare(once, "l", True) = 0 Then head = String.LCase(head)
+            piece = head + String.Substring(piece, 1)
+            once = ""
+        End If
+        pieces.Append(piece)
+        i += 1
+    Wend
+    Return String.Join(pieces, "")
+End Function
+
+''' Full-document PCRE2 matches, returned in editor codepoint coordinates.
+''' Empty matches retry a nonempty alternative at the same position, then advance
+''' by one UTF-8 character. This also preserves ^/$ and lookaround context.
+Public Function StudioRegexHits(source As String, query As String, matchCase As Boolean, wholeWord As Boolean, multiline As Boolean, dotAll As Boolean, replacement As String = "", expand As Boolean = False) As Array Of StudioFindHit
+    Dim hits As Array Of StudioFindHit = []
+    If query = "" Then Return hits
+    Dim prefix As String = "(*ANYCRLF)"
+    ' Native compile compileOptions leave start-of-pattern verbs available in the query.
+    Dim compileOptions As UInt32 = &h001A0000 ' UTF | UCP | NEVER_BACKSLASH_C
+    If Not matchCase Then compileOptions = compileOptions Or &h8
+    If multiline Then compileOptions = compileOptions Or &h400
+    If dotAll Then compileOptions = compileOptions Or &h20
+    If wholeWord Then query = "(?<!\\w)(?:" + query + ")(?!\\w)"
+    Dim pattern As Bytes = Bytes.FromString(prefix + query, Text.Encodings.UTF8)
+    Dim error As Int32 = 0
+    Dim offset As Int64 = 0
+    Dim noContext As Ptr
+    Dim code As Ptr = FindCompile(pattern.DataPtr(), pattern.Count, compileOptions, error, offset, noContext)
+    If CType(code, Integer) = 0 Then Throw New InvalidArgumentException("Regex: " + FindMessage(error) + " (pattern byte " + String.From(Math.Max(0, offset - String.LenBytes(prefix))) + ")")
+    Dim data As Ptr = FindData(code, noContext)
+    Dim context As Ptr = FindContext(noContext)
+    Try
+        If CType(context, Integer) = 0 Then Throw New InvalidArgumentException("Unable to allocate regex match context.")
+        ' Pattern verbs may lower these limits, but cannot raise the host limits.
+        If FindMatchLimit(context, 100000) <> 0 Or FindDepthLimit(context, 1000) <> 0 Then Throw New InvalidArgumentException("Unable to configure regex limits.")
+        If CType(data, Integer) = 0 Then Throw New InvalidArgumentException("Unable to allocate regex match data.")
+        Dim subject As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+        Dim position As Integer = 0
+        Dim options As UInt32 = 0
+        Dim previousByte As Integer = 0
+        Dim previousCharacter As Integer = 0
+        While position <= subject.Count
+            Dim rc As Int32 = FindRun(code, subject.DataPtr(), subject.Count, position, options, data, context)
+            If rc = -1 Then
+                If options = 0 Or position >= subject.Count Then Exit While
+                position += 1
+                While position < subject.Count
+                    If subject.Item(position) < 128 Or subject.Item(position) >= 192 Then Exit While
+                    position += 1
+                Wend
+                options = 0
+                Continue While
+            End If
+            If rc < 0 Then Throw New InvalidArgumentException("Regex: " + FindMessage(rc))
+            Dim vector As New Bytes()
+            vector.Append(FindVector(data), 16)
+            Dim first As Integer = FindOffset(vector, 0)
+            Dim last As Integer = FindOffset(vector, 8)
+            Dim hit As New StudioFindHit()
+            hit.Start = previousCharacter + String.Len(String.SubstringBytes(source, previousByte, first - previousByte))
+            hit.Length = String.Len(String.SubstringBytes(source, first, last - first))
+            If expand Then hit.Replacement = FindExpand(data, replacement)
+            hits.Append(hit)
+            If Array.Count(hits) > 100000 Then Throw New InvalidArgumentException("More than 100,000 matches. Narrow the pattern.")
+            previousByte = first
+            previousCharacter = hit.Start
+            position = last
+            options = 0
+            If first = last Then options = &h80000008 ' PCRE2_ANCHORED | PCRE2_NOTEMPTY_ATSTART
+        Wend
+    Finally
+        If CType(data, Integer) <> 0 Then FindDataFree(data)
+        If CType(context, Integer) <> 0 Then FindContextFree(context)
+        FindFree(code)
+    End Try
+    Return hits
+End Function

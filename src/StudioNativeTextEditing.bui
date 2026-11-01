@@ -1,0 +1,99 @@
+' Native text controls keep their own selection and undo state. Route Edit commands
+' to that responder before considering the source editor or design canvas.
+#If TargetMac Then
+Private Declare Function SNClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function SNResponder Lib "AppKit" Selector "firstResponder" (window As Ptr) As Ptr
+Private Declare Function SNIsKind Lib "Foundation" Selector "isKindOfClass:" (object As Ptr, cls As Ptr) As Boolean
+Private Declare Function SNEditable Lib "AppKit" Selector "isEditable" (view As Ptr) As Boolean
+Private Declare Function SNSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Sub SNAction Lib "objc" Alias "objc_msgSend" (view As Ptr, action As Ptr, sender As Ptr)
+#ElseIf TargetWindows Then
+Private Declare Function SNFocus Lib "user32" Alias "GetFocus" () As Ptr
+' IsChild is missing from Buoy 0.72's Windows user32 import stub; GetParent is present.
+Private Declare Function SNParent Lib "user32" Alias "GetParent" (view As Ptr) As Ptr
+Private Declare Function SNMessage Lib "user32" Alias "SendMessageW" (view As Ptr, message As UInt32, wparam As Integer, lparam As Integer) As Integer
+Private Declare Function SNStyle Lib "user32" Alias "GetWindowLongW" (view As Ptr, index As Int32) As Int32
+#ElseIf TargetLinux Then
+Private Optional Declare Function SNFocus Lib "libgtk-4.so.1" Alias "gtk_root_get_focus" (root As Ptr) As Ptr
+Private Optional Declare Function SNTextViewType Lib "libgtk-4.so.1" Alias "gtk_text_view_get_type" () As UInt64
+Private Optional Declare Function SNEditableType Lib "libgtk-4.so.1" Alias "gtk_editable_get_type" () As UInt64
+Private Optional Declare Function SNIsType Lib "libgobject-2.0.so.0" Alias "g_type_check_instance_is_a" (view As Ptr, nativeType As UInt64) As Int32
+Private Optional Declare Function SNTextEditable Lib "libgtk-4.so.1" Alias "gtk_text_view_get_editable" (view As Ptr) As Int32
+Private Optional Declare Function SNEntryEditable Lib "libgtk-4.so.1" Alias "gtk_editable_get_editable" (view As Ptr) As Int32
+Private Optional Declare Function SNActivate Lib "libgtk-4.so.1" Alias "gtk_widget_activate_action_variant" (view As Ptr, action As String, arguments As Ptr) As Int32
+#End If
+
+''' Only native text responders qualify; custom source/design canvases do not.
+Public Function StudioNativeTextFocused(window As Window) As Ptr
+    If window = Nil Then Return Nil
+    If window.NativeWidget = Nil Then Return Nil
+    #If TargetMac Then
+        Dim focus As Ptr = SNResponder(window.NativeWidget)
+        If focus = Nil Then Return Nil
+        If SNIsKind(focus, SNClass("NSTextView")) Then Return focus
+    #ElseIf TargetWindows Then
+        Dim focus As Ptr = SNFocus()
+        If focus = Nil Then Return Nil
+        ' Equivalent of IsChild(window, focus): walk up the parent chain.
+        Dim ancestor As Ptr = SNParent(focus)
+        Dim depth As Integer = 0
+        While ancestor <> Nil And ancestor <> window.NativeWidget And depth < 64
+            ancestor = SNParent(ancestor)
+            depth += 1
+        Wend
+        If ancestor <> window.NativeWidget Then Return Nil
+        ' DLGC_HASSETSEL: native EDIT/RichEdit responders accept EM_SETSEL.
+        If (SNMessage(focus, 135, 0, 0) And 8) <> 0 Then Return focus
+    #ElseIf TargetLinux Then
+        Dim focus As Ptr = SNFocus(window.NativeWidget)
+        If focus = Nil Then Return Nil
+        If SNIsType(focus, SNTextViewType()) <> 0 Or SNIsType(focus, SNEditableType()) <> 0 Then Return focus
+    #End If
+    Return Nil
+End Function
+
+Public Function StudioNativeTextCanEdit(window As Window, command As String) As Boolean
+    Dim focus As Ptr = StudioNativeTextFocused(window)
+    If focus = Nil Then Return False
+    If command = "copy" Or command = "select-all" Then Return True
+    If command <> "cut" And command <> "paste" Then Return False
+    #If TargetMac Then
+        Return SNEditable(focus)
+    #ElseIf TargetWindows Then
+        ' GWL_STYLE / ES_READONLY.
+        Return (SNStyle(focus, -16) And 2048) = 0
+    #ElseIf TargetLinux Then
+        If SNIsType(focus, SNTextViewType()) <> 0 Then Return SNTextEditable(focus) <> 0
+        Return SNEntryEditable(focus) <> 0
+    #End If
+End Function
+
+''' A native read-only responder still owns rejected mutations: never fall through
+''' to editing an unrelated document behind the agent transcript.
+Public Function StudioPerformNativeTextEdit(window As Window, command As String) As Boolean
+    Dim focus As Ptr = StudioNativeTextFocused(window)
+    If focus = Nil Then Return False
+    If Not StudioNativeTextCanEdit(window, command) Then Return False
+    #If TargetMac Then
+        Dim action As String = command + ":"
+        If command = "select-all" Then action = "selectAll:"
+        SNAction(focus, SNSelector(action), Nil)
+        Return True
+    #ElseIf TargetWindows Then
+        Select Case command
+            Case "cut"
+                SNMessage(focus, 768, 0, 0)
+            Case "copy"
+                SNMessage(focus, 769, 0, 0)
+            Case "paste"
+                SNMessage(focus, 770, 0, 0)
+            Case "select-all"
+                SNMessage(focus, 177, 0, -1)
+        End Select
+        Return True
+    #ElseIf TargetLinux Then
+        Dim action As String = "clipboard." + command
+        If command = "select-all" Then action = "selection.select-all"
+        Return SNActivate(focus, action, Nil) <> 0
+    #End If
+End Function

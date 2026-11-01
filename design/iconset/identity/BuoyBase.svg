@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="title">
+  <title id="title">BuoyBase application icon proposal</title>
+  <!-- Review proposal only; follows the shared rounded tile and ivory glyph style. -->
+  <defs>
+    <linearGradient id="tile" x2="0.3" y2="1"><stop stop-color="#238c85"/><stop offset="1" stop-color="#12525d"/></linearGradient>
+    <linearGradient id="ivory" x2="0" y2="1"><stop stop-color="#fffdf7"/><stop offset="1" stop-color="#e9e2d2"/></linearGradient>
+  </defs>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#tile)"/>
+  <rect x="64" y="64" width="896" height="896" rx="206" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="4"/>
+  <rect x="215" y="260" width="594" height="530" rx="62" fill="#082e3a" opacity=".28"/>
+  <rect x="215" y="238" width="594" height="530" rx="62" fill="url(#ivory)"/>
+  <path d="M215 362h594" stroke="#d6cdb9" stroke-width="10"/>
+  <circle cx="275" cy="301" r="17" fill="#c7bea8"/>
+  <circle cx="329" cy="301" r="17" fill="#c7bea8"/>
+  <g fill="none" stroke="#1b7777" stroke-width="22" stroke-linecap="round">
+    <rect x="280" y="420" width="464" height="274" rx="22"/>
+    <path d="M280 510h464M280 602h464M438 420v274"/>
+  </g>
+</svg>

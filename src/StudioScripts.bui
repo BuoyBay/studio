@@ -1,0 +1,187 @@
+Import StudioProject
+Import StudioShellFiles
+Import StudioDocumentIO
+Import atomicfilekit
+
+''' Portable script names double as stable project-relative references.
+Public Function StudioScriptName(name As String) As String
+    If String.Len(name) < 1 Or String.Len(name) > 100 Then Throw New InvalidArgumentException("Use a script name of 1..100 letters, digits, hyphens or underscores")
+    For Each character As String In String.Chars(name)
+        Dim code As Integer = String.Asc(character)
+        If Not ((code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or (code >= 48 And code <= 57) Or character = "-" Or character = "_") Then Throw New InvalidArgumentException("Names may contain letters, digits, hyphens and underscores")
+    Next
+    Dim upper As String = String.UCase(name)
+    If upper = "CON" Or upper = "PRN" Or upper = "AUX" Or upper = "NUL"  Then Throw New InvalidArgumentException("Choose a portable filename")
+    If String.Len(upper) = 4 And (String.Left(upper, 3) = "COM" Or String.Left(upper, 3) = "LPT") Then
+        Dim last As String = String.Right(upper, 1)
+        If String.Contains("123456789", last, True) Then Throw New InvalidArgumentException("Choose a portable filename")
+    End If
+    Return name
+End Function
+
+Public Function StudioScriptRead(filePath As String, limit As Integer = 65536) As String
+    If limit < 0 Or limit > 65536 Then Throw New InvalidArgumentException("Script read limit must be 0..65536 bytes")
+    ' SPRoot validates every existing path component, including this leaf. The
+    ' synthetic child is never opened and lets the shared save-path guard inspect it.
+    StudioProjectCheckSaveDestination(filePath + "/unused")
+    Dim file As New FileSystemItem(filePath)
+    If Not file.IsFile() Then Throw New InvalidArgumentException("Script file missing: " + filePath)
+    Return StudioDocumentReadUTF8(filePath, limit)
+End Function
+
+Public Sub StudioScriptExportConfirmed(filePath As String, source As String)
+    If String.LenBytes(source) > 65536 Then Throw New InvalidArgumentException("Script export exceeds 64 KiB")
+    StudioProjectCheckSaveDestination(filePath)
+    Dim expected As String = ""
+    If New FileSystemItem(filePath).Exists() Then
+        expected = StudioScriptRead(filePath)
+    Else
+        StudioShellReserveFile(filePath)
+    End If
+    AtomicWriteText(filePath, source, expected)
+End Sub
+
+''' Script source is data, excluded from the compiler's .bui source inventory.
+Public Class StudioScriptLibrary
+    Public Property Root As String
+    Public Sub Constructor(root As String)
+        Me.Root = root
+    End Sub
+    Public Function FilePath(name As String) As String
+        If Me.Root = "" Then Throw New InvalidArgumentException("Open a project for project scripts")
+        Return Me.Root + "/" + StudioScriptName(name) + ".buoyscript"
+    End Function
+    Private Sub EnsureFolder()
+        If Me.Root = "" Then Throw New InvalidArgumentException("Open a project for project scripts")
+        Dim folder As New FileSystemItem(Me.Root)
+        If Not folder.Exists() Then
+            Dim parent As FileSystemItem = folder.Parent
+            If Not parent.Exists() Then
+                StudioProjectCheckSaveDestination(parent.FullPath())
+                If Not parent.CreateFolder(False) Then Throw New InvalidArgumentException("Cannot create script library parent")
+            End If
+            StudioProjectCheckSaveDestination(Me.Root)
+            If Not folder.CreateFolder(False) Then Throw New InvalidArgumentException("Cannot create script library")
+        End If
+        StudioProjectCheckSaveDestination(Me.Root + "/unused")
+        If Not folder.IsFolder() Then Throw New InvalidArgumentException("Script library is not a directory")
+    End Sub
+    Public Function Names() As Array Of String
+        Dim names As Array Of String = []
+        If Me.Root = "" Then Return names
+        Dim folder As New FileSystemItem(Me.Root)
+        If Not folder.Exists() Then Return names
+        StudioProjectCheckSaveDestination(Me.Root + "/unused")
+        If Not folder.IsFolder() Then Throw New InvalidArgumentException("Script library is not a directory")
+        For Each file As FileSystemItem In folder.Children()
+            If String.EndsWith(file.Name(), ".buoyscript", True) Then
+                Dim name As String = String.Left(file.Name(), String.Len(file.Name()) - 11)
+                Try
+                    StudioScriptName(name)
+                Catch e As InvalidArgumentException
+                    Continue For
+                End Try
+                StudioProjectCheckSaveDestination(file.FullPath() + "/unused")
+                If Not file.IsFile() Then Throw New InvalidArgumentException("Script entry is not a regular file")
+                For Each existing As String In names
+                    If String.Compare(existing, name, False) = 0 Then Throw New InvalidArgumentException("Script names differ only by case; choose portable unique names")
+                Next
+                names.Append(name)
+                If Array.Count(names) > 512 Then Throw New InvalidArgumentException("Script library exceeds 512 files")
+            End If
+        Next
+        Array.Sort(names)
+        Return names
+    End Function
+    Public Function Read(name As String) As String
+        Return StudioScriptRead(Me.FilePath(name))
+    End Function
+    Public Sub Save(name As String, source As String, expected As String, create As Boolean)
+        If String.LenBytes(source) < 1 Or String.LenBytes(source) > 65536 Then Throw New InvalidArgumentException("Script source must contain 1..65536 UTF-8 bytes")
+        Me.EnsureFolder()
+        Dim filePath As String = Me.FilePath(name)
+        StudioProjectCheckSaveDestination(filePath)
+        If create Then
+            Dim names As Array Of String = Me.Names()
+            If Array.Count(names) >= 512 Then Throw New InvalidArgumentException("Script library exceeds 512 files")
+            For Each existing As String In names
+                If String.Compare(existing, name, False) = 0 Then Throw New InvalidArgumentException("A script with that name already exists")
+            Next
+            StudioShellReserveFile(filePath)
+        End If
+        AtomicWriteText(filePath, source, expected)
+    End Sub
+    Private Function ReadReferences(source As String) As JSONItem
+        Dim tasks As JSONItem = Json.Parse(source)
+        If Not tasks.IsObject() Then Throw New InvalidArgumentException("tasks.buoytasks must be an object of task names to script names")
+        If tasks.Count() > 512 Then Throw New InvalidArgumentException("Project task references exceed 512 entries")
+        Dim names As Array Of String = []
+        For Each key As String In tasks.Keys()
+            StudioScriptName(key)
+            If Not tasks.Value(key).IsString() Then Throw New InvalidArgumentException("Task references must be script names")
+            StudioScriptName(tasks.Value(key).AsString().Value)
+            For Each existing As String In names
+                If String.Compare(existing, key, False) = 0 Then Throw New InvalidArgumentException("Task names differ only by case; choose portable unique names")
+            Next
+            names.Append(key)
+        Next
+        Return tasks
+    End Function
+    Public Function References() As JSONItem
+        If Me.Root = "" Then Return JSONItem.NewObject()
+        Dim filePath As String = Me.Root + "/tasks.buoytasks"
+        If Not New FileSystemItem(filePath).Exists() Then Return JSONItem.NewObject()
+        Return Me.ReadReferences(StudioScriptRead(filePath))
+    End Function
+    Private Sub SaveReferences(tasks As JSONItem, expected As String, create As Boolean)
+        Dim source As String = tasks.ToString()
+        If String.LenBytes(source) > 65536 Then Throw New InvalidArgumentException("Project task references exceed 64 KiB")
+        Me.ReadReferences(source)
+        Dim filePath As String = Me.Root + "/tasks.buoytasks"
+        StudioProjectCheckSaveDestination(filePath)
+        If create Then StudioShellReserveFile(filePath)
+        AtomicWriteText(filePath, source, expected)
+    End Sub
+    Public Sub Bind(taskName As String, name As String)
+        StudioScriptName(taskName)
+        If Me.Read(name) = "" Then Throw New InvalidArgumentException("Cannot bind an empty script")
+        Me.EnsureFolder()
+        Dim filePath As String = Me.Root + "/tasks.buoytasks"
+        Dim expected As String = ""
+        Dim exists As Boolean = New FileSystemItem(filePath).Exists()
+        Dim tasks As JSONItem = JSONItem.NewObject()
+        If exists Then
+            expected = StudioScriptRead(filePath)
+            tasks = Me.ReadReferences(expected)
+        End If
+        tasks.Value(taskName) = StudioScriptName(name)
+        Me.SaveReferences(tasks, expected, Not exists)
+    End Sub
+    Public Sub Unbind(taskName As String)
+        StudioScriptName(taskName)
+        If Me.Root = "" Then Throw New InvalidArgumentException("Open a project for project tasks")
+        Dim filePath As String = Me.Root + "/tasks.buoytasks"
+        If Not New FileSystemItem(filePath).Exists() Then Return
+        Dim expected As String = StudioScriptRead(filePath)
+        Dim tasks As JSONItem = Me.ReadReferences(expected)
+        If Not tasks.HasKey(taskName) Then Return
+        tasks.Remove(taskName)
+        Me.SaveReferences(tasks, expected, False)
+    End Sub
+    Public Function TaskSource(taskName As String) As String
+        StudioScriptName(taskName)
+        Dim tasks As JSONItem = Me.References()
+        If Not tasks.HasKey(taskName) Then Return ""
+        Dim source As String = Me.Read(tasks.Value(taskName).AsString().Value)
+        If source = "" Then Throw New InvalidArgumentException("Referenced script is empty: " + taskName)
+        Return source
+    End Function
+    Public Sub Delete(name As String, expected As String)
+        Dim tasks As JSONItem = Me.References()
+        For Each key As String In tasks.Keys()
+            If String.Compare(tasks.Value(key).AsString().Value, name, False) = 0 Then Throw New InvalidArgumentException("Script is referenced by task " + key + "; unbind the task before deleting")
+        Next
+        If String.Compare(Me.Read(name), expected, True) <> 0 Then Throw New InvalidArgumentException("Script changed on disk; reopen before deleting")
+        If Not New FileSystemItem(Me.FilePath(name)).Delete() Then Throw New InvalidArgumentException("Cannot delete script")
+    End Sub
+End Class

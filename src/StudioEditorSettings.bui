@@ -1,0 +1,443 @@
+' Source editor preferences for Buoy Studio: font, size, indentation, ligatures,
+' folding, minimap and soft wrap. Loaded from and saved to Studio's Prefs domain, applied to
+' every StudioCodeEditor, and exposed as View > Editor menu items whose tags start
+' with "editor:" (StudioEditorSettings.Perform handles them).
+Import StudioSyntax
+Import StudioCodeEditor
+Import fontkit
+Import StudioEditorCommands
+
+Public Class StudioEditorSettings
+    Public Const DefaultFontSize As Double = 12.0
+    Public Const MinFontSize As Double = 8.0
+    Public Const MaxFontSize As Double = 32.0
+
+    ''' "" = the platform default (Menlo, Consolas, monospace).
+    Public Property FontName As String = ""
+    Public Property FontSize As Double = 12.0
+    Public Property IndentStyle As String = "auto"
+    ' 0 inherits the effective indent width; otherwise display stops use 1..16 cells.
+    Public Property TabWidth As Integer = 0
+    Public Property IndentWidth As Integer = 2
+    Public Property DetectIndentation As Boolean = True
+    Public Property FontLigatures As Boolean = False
+    Public Property ShowsFolding As Boolean = True
+    ''' Keep collapsed folds across closing a file and restarting Studio (saved in the
+    ''' workspace session state, never in the source file). Default on.
+    Public Property RememberFolds As Boolean = True
+    ''' Collapse comment blocks when a file is opened with no remembered folds.
+    Public Property FoldCommentsOnOpen As Boolean = False
+    Public Property ShowsMinimap As Boolean = False
+    Public Property MinimapWidth As Double = 96.0
+    ''' "none", "boundary", "selection", "trailing" or "all" (StudioCodeEditor.RenderWhitespace).
+    Public Property RenderWhitespace As String = "selection"
+    Public Property ShowsIndentGuides As Boolean = True
+    Public Property ShowsStickyScopes As Boolean = True
+    Public Property HighlightsOccurrences As Boolean = True
+    Public Property AutoClosePairs As Boolean = True
+    Public Property WrapSelectionInPairs As Boolean = True
+    Public Property DedentOnType As Boolean = True
+    Public Property SnippetTabTrigger As Boolean = True
+    Public Property CompletionOnType As Boolean = True
+    ''' StudioCodeEditor.CaretStyle: "line", "line-thin", "block", "block-outline",
+    ''' "underline" or "underline-thin".
+    Public Property CaretStyle As String = "line"
+    Public Property CaretBlinks As Boolean = True
+    ''' Soft wrap (StudioCodeEditor.WordWrap; view only). Default off.
+    Public Property WordWrap As Boolean = False
+    Public Property SpellCheckEnabled As Boolean = True
+    Private Property mItems As Array Of MenuItem = []
+
+    ''' The candidate families from CandidateFonts that are installed (FontKit's native
+    ''' enumeration, one snapshot). When enumeration fails every candidate is offered;
+    ''' a missing family then falls back to the system monospace.
+    Public Shared Function FontChoices() As Array Of String
+        Dim installed As Map Of String, Boolean = New Map Of String, Boolean()
+        Try
+            For Each face As FontFaceInfo In FontKitFaces()
+                installed.Set(String.LCase(face.FamilyName), True)
+            Next
+        Catch e As Exception
+            Return StudioEditorSettings.CandidateFonts()
+        End Try
+        If installed.Count = 0 Then Return StudioEditorSettings.CandidateFonts()
+        Dim found As Array Of String = []
+        For Each family As String In StudioEditorSettings.CandidateFonts()
+            If installed.ContainsKey(String.LCase(family)) Then Array.Append(found, family)
+        Next
+        Return found
+    End Function
+
+    ''' Monospaced families worth offering, ligature-capable ones included.
+    Public Shared Function CandidateFonts() As Array Of String
+        #If TargetMac Then
+            Return ["SF Mono", "Menlo", "Monaco", "JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", "Iosevka"]
+        #ElseIf TargetWindows Then
+            Return ["Cascadia Code", "Cascadia Mono", "Consolas", "JetBrains Mono", "Fira Code", "Source Code Pro", "Courier New"]
+        #Else
+            Return ["DejaVu Sans Mono", "Noto Sans Mono", "Ubuntu Mono", "Liberation Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", "Iosevka"]
+        #End If
+    End Function
+
+    Public Sub Load(domain As String)
+        Me.FontName = Prefs.Get(domain, "editor.fontName", Me.FontName)
+        Me.FontSize = Math.Max(StudioEditorSettings.MinFontSize, Math.Min(StudioEditorSettings.MaxFontSize, Prefs.Get(domain, "editor.fontSize", Me.FontSize)))
+        Me.IndentStyle = StudioCodeEditor.IndentStyleName(Prefs.Get(domain, "editor.indentStyle", Me.IndentStyle))
+        Me.TabWidth = Math.Max(0, Math.Min(16, Prefs.Get(domain, "editor.tabWidth", Me.TabWidth)))
+        Me.IndentWidth = Math.Max(1, Math.Min(16, Prefs.Get(domain, "editor.indentWidth", Me.IndentWidth)))
+        Me.DetectIndentation = Prefs.Get(domain, "editor.detectIndentation", Me.DetectIndentation)
+        Me.FontLigatures = Prefs.Get(domain, "editor.fontLigatures", Me.FontLigatures)
+        Me.ShowsFolding = Prefs.Get(domain, "editor.folding", Me.ShowsFolding)
+        Me.RememberFolds = Prefs.Get(domain, "editor.rememberFolds", Me.RememberFolds)
+        Me.FoldCommentsOnOpen = Prefs.Get(domain, "editor.foldCommentsOnOpen", Me.FoldCommentsOnOpen)
+        Me.ShowsMinimap = Prefs.Get(domain, "editor.minimap", Me.ShowsMinimap)
+        Me.MinimapWidth = Math.Max(40.0, Math.Min(240.0, Prefs.Get(domain, "editor.minimapWidth", Me.MinimapWidth)))
+        Me.RenderWhitespace = StudioEditorSettings.WhitespaceMode(Prefs.Get(domain, "editor.renderWhitespace", Me.RenderWhitespace))
+        Me.ShowsIndentGuides = Prefs.Get(domain, "editor.indentGuides", Me.ShowsIndentGuides)
+        Me.ShowsStickyScopes = Prefs.Get(domain, "editor.stickyScopes", Me.ShowsStickyScopes)
+        Me.HighlightsOccurrences = Prefs.Get(domain, "editor.occurrences", Me.HighlightsOccurrences)
+        Me.AutoClosePairs = Prefs.Get(domain, "editor.autoClosePairs", Me.AutoClosePairs)
+        Me.WrapSelectionInPairs = Prefs.Get(domain, "editor.wrapSelection", Me.WrapSelectionInPairs)
+        Me.DedentOnType = Prefs.Get(domain, "editor.dedentOnType", Me.DedentOnType)
+        Me.SnippetTabTrigger = Prefs.Get(domain, "editor.snippetTab", Me.SnippetTabTrigger)
+        Me.CompletionOnType = Prefs.Get(domain, "editor.completionOnType", Me.CompletionOnType)
+        Me.CaretStyle = StudioCodeEditor.CaretStyleName(Prefs.Get(domain, "editor.cursorStyle", Me.CaretStyle))
+        Me.CaretBlinks = Prefs.Get(domain, "editor.cursorBlink", Me.CaretBlinks)
+        Me.WordWrap = Prefs.Get(domain, "editor.wordWrap", Me.WordWrap)
+        Me.SpellCheckEnabled = Prefs.Get(domain, "editor.spellCheck", Me.SpellCheckEnabled)
+    End Sub
+
+    ''' A valid RenderWhitespace mode ("none" for anything else).
+    Public Shared Function WhitespaceMode(value As String) As String
+        Select Case value
+        Case "none", "boundary", "selection", "trailing", "all"
+            Return value
+        End Select
+        Return "none"
+    End Function
+
+    Public Sub Save(domain As String)
+        Prefs.Set(domain, "editor.fontName", Me.FontName)
+        Prefs.Set(domain, "editor.fontSize", Me.FontSize)
+        Prefs.Set(domain, "editor.indentStyle", StudioCodeEditor.IndentStyleName(Me.IndentStyle))
+        Prefs.Set(domain, "editor.tabWidth", Math.Max(0, Math.Min(16, Me.TabWidth)))
+        Prefs.Set(domain, "editor.indentWidth", Me.IndentWidth)
+        Prefs.Set(domain, "editor.detectIndentation", Me.DetectIndentation)
+        Prefs.Set(domain, "editor.fontLigatures", Me.FontLigatures)
+        Prefs.Set(domain, "editor.folding", Me.ShowsFolding)
+        Prefs.Set(domain, "editor.rememberFolds", Me.RememberFolds)
+        Prefs.Set(domain, "editor.foldCommentsOnOpen", Me.FoldCommentsOnOpen)
+        Prefs.Set(domain, "editor.minimap", Me.ShowsMinimap)
+        Prefs.Set(domain, "editor.minimapWidth", Me.MinimapWidth)
+        Prefs.Set(domain, "editor.renderWhitespace", Me.RenderWhitespace)
+        Prefs.Set(domain, "editor.indentGuides", Me.ShowsIndentGuides)
+        Prefs.Set(domain, "editor.stickyScopes", Me.ShowsStickyScopes)
+        Prefs.Set(domain, "editor.occurrences", Me.HighlightsOccurrences)
+        Prefs.Set(domain, "editor.autoClosePairs", Me.AutoClosePairs)
+        Prefs.Set(domain, "editor.wrapSelection", Me.WrapSelectionInPairs)
+        Prefs.Set(domain, "editor.dedentOnType", Me.DedentOnType)
+        Prefs.Set(domain, "editor.snippetTab", Me.SnippetTabTrigger)
+        Prefs.Set(domain, "editor.completionOnType", Me.CompletionOnType)
+        Prefs.Set(domain, "editor.cursorStyle", Me.CaretStyle)
+        Prefs.Set(domain, "editor.cursorBlink", Me.CaretBlinks)
+        Prefs.Set(domain, "editor.wordWrap", Me.WordWrap)
+        Prefs.Set(domain, "editor.spellCheck", Me.SpellCheckEnabled)
+    End Sub
+
+    Public Sub Apply(editor As StudioCodeEditor)
+        If editor = Nil Then Return
+        editor.FontName = Me.FontName
+        editor.FontSize = Me.FontSize
+        editor.IndentStyle = Me.IndentStyle
+        editor.TabWidth = Me.TabWidth
+        editor.IndentWidth = Me.IndentWidth
+        editor.DetectIndentation = Me.DetectIndentation
+        editor.FontLigatures = Me.FontLigatures
+        ' Folding and minimap setters are idempotent: re-applying unchanged settings keeps
+        ' collapsed folds and the cached minimap.
+        editor.ShowsFolding = Me.ShowsFolding
+        editor.ShowsMinimap = Me.ShowsMinimap
+        editor.MinimapWidth = Me.MinimapWidth
+        editor.RenderWhitespace = Me.RenderWhitespace
+        editor.ShowsIndentGuides = Me.ShowsIndentGuides
+        editor.ShowsStickyScopes = Me.ShowsStickyScopes
+        editor.HighlightsWordOccurrences = Me.HighlightsOccurrences
+        editor.AutoClosePairs = Me.AutoClosePairs
+        editor.WrapSelectionInPairs = Me.WrapSelectionInPairs
+        editor.DedentOnType = Me.DedentOnType
+        editor.SnippetTabTrigger = Me.SnippetTabTrigger
+        editor.CompletionOnType = Me.CompletionOnType
+        editor.CaretStyle = Me.CaretStyle
+        editor.CaretBlinks = Me.CaretBlinks
+        ' Idempotent: re-applying the same value keeps the layout and scroll position.
+        editor.WordWrap = Me.WordWrap
+        editor.SpellCheckEnabled = Me.SpellCheckEnabled
+        editor.Invalidate()
+    End Sub
+
+    ''' Applies the settings to every editor (split views, auxiliary windows).
+    Public Sub ApplyAll(editors As Array Of StudioCodeEditor)
+        For Each editor As StudioCodeEditor In editors
+            Me.Apply(editor)
+        Next
+    End Sub
+
+    ''' Reads the settings back from an editor whose view commands (toggleMinimap,
+    ''' toggleFolding, toggleWhitespace, ...) changed them, so they persist.
+    Public Sub CaptureFrom(editor As StudioCodeEditor)
+        If editor = Nil Then Return
+        Me.IndentStyle = editor.IndentStyle
+        Me.TabWidth = editor.TabWidth
+        Me.IndentWidth = editor.IndentWidth
+        Me.DetectIndentation = editor.DetectIndentation
+        Me.ShowsFolding = editor.ShowsFolding
+        Me.ShowsMinimap = editor.ShowsMinimap
+        Me.MinimapWidth = editor.MinimapWidth
+        Me.RenderWhitespace = editor.RenderWhitespace
+        Me.ShowsIndentGuides = editor.ShowsIndentGuides
+        Me.ShowsStickyScopes = editor.ShowsStickyScopes
+        Me.HighlightsOccurrences = editor.HighlightsWordOccurrences
+        Me.WordWrap = editor.WordWrap
+        Me.SpellCheckEnabled = editor.SpellCheckEnabled
+        Me.RefreshChecks()
+    End Sub
+
+    ''' Adds one "source:<id>" item per catalog command of `category` (StudioEditorCommandList)
+    ''' to `parent`; the host routes "source:<id>" to editor.PerformCommand(<id>).
+    ''' `primary` replaces "Primary" in shortcut hints ("Cmd"/"Ctrl"); hints are shown
+    ''' only when `withShortcuts`.
+    Public Sub AddCommandItems(parent As MenuItem, category As String, primary As String, withShortcuts As Boolean)
+        For Each command As StudioEditorCommandInfo In StudioEditorCommandList()
+            If command.Category <> category Then Continue For
+            Dim shortcut As String = ""
+            If withShortcuts And command.Shortcut <> "" And String.Contains(command.Shortcut, "+") Then shortcut = String.Replace(command.Shortcut, "Primary", primary)
+            Me.Entry(parent, command.Title, "source:" + command.Id, shortcut)
+        Next
+    End Sub
+
+    ' ---- Menu ----------------------------------------------------------------------------
+
+    Private Function Entry(parent As MenuItem, caption As String, tag As String, shortcut As String) As MenuItem
+        Dim item As New MenuItem()
+        item.Caption = caption
+        item.Tag = tag
+        If shortcut <> "" Then item.Shortcut = shortcut
+        parent.AddMenuItem(item)
+        Array.Append(Me.mItems, item)
+        Return item
+    End Function
+
+    ''' Adds the "Editor" submenu to a menu. `primary` is the platform shortcut prefix
+    ''' ("Cmd" or "Ctrl").
+    Public Sub BuildMenu(menu As Menu, primary As String)
+        Me.mItems = []
+        Dim root As New MenuItem()
+        root.Caption = "Editor"
+        root.Tag = "editor:menu"
+        ' Primary+=/-/0 belong to the designer's canvas zoom in the same View menu.
+        Me.Entry(root, "Bigger Text", "editor:font-bigger", primary + "+Alt+=")
+        Me.Entry(root, "Smaller Text", "editor:font-smaller", primary + "+Alt+-")
+        Me.Entry(root, "Actual Size", "editor:font-reset", primary + "+Alt+0")
+        root.AddSeparator()
+        Dim fonts As New MenuItem()
+        fonts.Caption = "Font"
+        fonts.Tag = "editor:font-menu"
+        Me.Entry(fonts, "System Default", "editor:font:", "")
+        fonts.AddSeparator()
+        Dim listed As Boolean = Me.FontName = ""
+        For Each family As String In StudioEditorSettings.FontChoices()
+            Me.Entry(fonts, family, "editor:font:" + family, "")
+            If String.Compare(family, Me.FontName, True) = 0 Then listed = True
+        Next
+        ' Keep a saved family that enumeration did not report selectable and checked.
+        If Not listed Then Me.Entry(fonts, Me.FontName, "editor:font:" + Me.FontName, "")
+        root.AddMenuItem(fonts)
+        Me.Entry(root, "Font Ligatures", "editor:ligatures", "")
+        root.AddSeparator()
+        Dim style As New MenuItem()
+        style.Caption = "Indent Style"
+        style.Tag = "editor:indent-style-menu"
+        Me.Entry(style, "Automatic", "editor:indent-style:auto", "")
+        Me.Entry(style, "Spaces", "editor:indent-style:space", "")
+        Me.Entry(style, "Tabs", "editor:indent-style:tab", "")
+        root.AddMenuItem(style)
+        Dim tabs As New MenuItem()
+        tabs.Caption = "Tab Display Width"
+        tabs.Tag = "editor:tab-width-menu"
+        Me.Entry(tabs, "Follow Indent Width", "editor:tab-width:0", "")
+        For Each width As Integer In [1, 2, 3, 4, 6, 8, 16]
+            Me.Entry(tabs, String.From(width) + " Columns", "editor:tab-width:" + String.From(width), "")
+        Next
+        root.AddMenuItem(tabs)
+        Dim indent As New MenuItem()
+        indent.Caption = "Default Indent Width"
+        indent.Tag = "editor:indent-menu"
+        For Each width As Integer In [2, 3, 4, 8]
+            Me.Entry(indent, String.From(width) + " Columns", "editor:indent:" + String.From(width), "")
+        Next
+        root.AddMenuItem(indent)
+        Me.Entry(root, "Detect Indentation from File", "editor:detect-indent", "")
+        root.AddSeparator()
+        Me.Entry(root, "Word Wrap", "editor:word-wrap", "")
+        Me.Entry(root, "Live Spell Check", "editor:spell-check", "")
+        Me.Entry(root, "Code Folding", "editor:folding", "")
+        Me.Entry(root, "Remember Folds", "editor:remember-folds", "")
+        Me.Entry(root, "Fold Comments on Open", "editor:fold-comments-on-open", "")
+        Me.Entry(root, "Minimap", "editor:minimap", "")
+        Me.Entry(root, "Indent Guides", "editor:indent-guides", "")
+        Me.Entry(root, "Sticky Scopes", "editor:sticky", "")
+        Me.Entry(root, "Highlight Occurrences", "editor:occurrences", "")
+        Dim whitespace As New MenuItem()
+        whitespace.Caption = "Render Whitespace"
+        whitespace.Tag = "editor:whitespace-menu"
+        For Each mode As String In ["none", "boundary", "selection", "trailing", "all"]
+            Me.Entry(whitespace, String.UCase(String.Left(mode, 1)) + String.Substring(mode, 1), "editor:whitespace:" + mode, "")
+        Next
+        root.AddMenuItem(whitespace)
+        Dim cursor As New MenuItem()
+        cursor.Caption = "Cursor"
+        cursor.Tag = "editor:cursor-menu"
+        Me.Entry(cursor, "Line", "editor:cursor:line", "")
+        Me.Entry(cursor, "Thin Line", "editor:cursor:line-thin", "")
+        Me.Entry(cursor, "Block", "editor:cursor:block", "")
+        Me.Entry(cursor, "Block Outline", "editor:cursor:block-outline", "")
+        Me.Entry(cursor, "Underline", "editor:cursor:underline", "")
+        Me.Entry(cursor, "Thin Underline", "editor:cursor:underline-thin", "")
+        cursor.AddSeparator()
+        Me.Entry(cursor, "Blink", "editor:cursor-blink", "")
+        root.AddMenuItem(cursor)
+        root.AddSeparator()
+        Me.Entry(root, "Auto-Close Brackets and Quotes", "editor:auto-pairs", "")
+        Me.Entry(root, "Wrap Selection in Brackets", "editor:wrap-pairs", "")
+        Me.Entry(root, "Re-indent Closing Lines While Typing", "editor:dedent", "")
+        Me.Entry(root, "Expand Snippets with Tab", "editor:snippet-tab", "")
+        Me.Entry(root, "Language Completion While Typing", "editor:completion-on-type", "")
+        menu.AddItem(root)
+        Me.RefreshChecks()
+    End Sub
+
+    Public Sub RefreshChecks()
+        For Each item As MenuItem In Me.mItems
+            Dim checked As Boolean = False
+            Dim tag As String = item.Tag
+            If String.StartsWith(tag, "editor:font:") Then
+                checked = String.Compare(String.Substring(tag, 12), Me.FontName, True) = 0
+            ElseIf String.StartsWith(tag, "editor:indent-style:") Then
+                checked = String.Substring(tag, 20) = Me.IndentStyle
+            ElseIf String.StartsWith(tag, "editor:tab-width:") Then
+                checked = Integer.Parse(String.Substring(tag, 17)).Or(-1) = Me.TabWidth
+            ElseIf String.StartsWith(tag, "editor:indent:") Then
+                checked = Integer.Parse(String.Substring(tag, 14)).Or(0) = Me.IndentWidth
+            ElseIf String.StartsWith(tag, "editor:whitespace:") Then
+                checked = String.Substring(tag, 18) = Me.RenderWhitespace
+            ElseIf String.StartsWith(tag, "editor:cursor:") Then
+                checked = String.Substring(tag, 14) = Me.CaretStyle
+            Else
+                Select Case tag
+                Case "editor:ligatures"
+                    checked = Me.FontLigatures
+                Case "editor:detect-indent"
+                    checked = Me.DetectIndentation
+                Case "editor:spell-check"
+                    checked = Me.SpellCheckEnabled
+                Case "editor:word-wrap"
+                    checked = Me.WordWrap
+                Case "editor:folding"
+                    checked = Me.ShowsFolding
+                Case "editor:remember-folds"
+                    checked = Me.RememberFolds
+                Case "editor:fold-comments-on-open"
+                    checked = Me.FoldCommentsOnOpen
+                Case "editor:minimap"
+                    checked = Me.ShowsMinimap
+                Case "editor:indent-guides"
+                    checked = Me.ShowsIndentGuides
+                Case "editor:sticky"
+                    checked = Me.ShowsStickyScopes
+                Case "editor:occurrences"
+                    checked = Me.HighlightsOccurrences
+                Case "editor:auto-pairs"
+                    checked = Me.AutoClosePairs
+                Case "editor:wrap-pairs"
+                    checked = Me.WrapSelectionInPairs
+                Case "editor:dedent"
+                    checked = Me.DedentOnType
+                Case "editor:snippet-tab"
+                    checked = Me.SnippetTabTrigger
+                Case "editor:completion-on-type"
+                    checked = Me.CompletionOnType
+                Case "editor:cursor-blink"
+                    checked = Me.CaretBlinks
+                Case Else
+                    Continue For
+                End Select
+            End If
+            If item.Checked <> checked Then item.Checked = checked
+        Next
+    End Sub
+
+    ''' Applies an "editor:" menu tag. Returns False for tags it does not own.
+    Public Function Perform(tag As String) As Boolean
+        If Not String.StartsWith(tag, "editor:") Then Return False
+        If String.StartsWith(tag, "editor:font:") Then
+            Me.FontName = String.Substring(tag, 12)
+        ElseIf String.StartsWith(tag, "editor:indent-style:") Then
+            Me.IndentStyle = StudioCodeEditor.IndentStyleName(String.Substring(tag, 20))
+        ElseIf String.StartsWith(tag, "editor:tab-width:") Then
+            Me.TabWidth = Math.Max(0, Math.Min(16, Integer.Parse(String.Substring(tag, 17)).Or(0)))
+        ElseIf String.StartsWith(tag, "editor:indent:") Then
+            Me.IndentWidth = Math.Max(1, Math.Min(16, Integer.Parse(String.Substring(tag, 14)).Or(2)))
+        ElseIf String.StartsWith(tag, "editor:whitespace:") Then
+            Me.RenderWhitespace = StudioEditorSettings.WhitespaceMode(String.Substring(tag, 18))
+        ElseIf String.StartsWith(tag, "editor:cursor:") Then
+            Me.CaretStyle = StudioCodeEditor.CaretStyleName(String.Substring(tag, 14))
+        Else
+            Select Case tag
+            Case "editor:font-bigger"
+                Me.FontSize = Math.Min(StudioEditorSettings.MaxFontSize, Me.FontSize + 1.0)
+            Case "editor:font-smaller"
+                Me.FontSize = Math.Max(StudioEditorSettings.MinFontSize, Me.FontSize - 1.0)
+            Case "editor:font-reset"
+                Me.FontSize = StudioEditorSettings.DefaultFontSize
+            Case "editor:ligatures"
+                Me.FontLigatures = Not Me.FontLigatures
+            Case "editor:detect-indent"
+                Me.DetectIndentation = Not Me.DetectIndentation
+            Case "editor:spell-check"
+                Me.SpellCheckEnabled = Not Me.SpellCheckEnabled
+            Case "editor:word-wrap"
+                Me.WordWrap = Not Me.WordWrap
+            Case "editor:folding"
+                Me.ShowsFolding = Not Me.ShowsFolding
+            Case "editor:remember-folds"
+                Me.RememberFolds = Not Me.RememberFolds
+            Case "editor:fold-comments-on-open"
+                Me.FoldCommentsOnOpen = Not Me.FoldCommentsOnOpen
+            Case "editor:minimap"
+                Me.ShowsMinimap = Not Me.ShowsMinimap
+            Case "editor:indent-guides"
+                Me.ShowsIndentGuides = Not Me.ShowsIndentGuides
+            Case "editor:sticky"
+                Me.ShowsStickyScopes = Not Me.ShowsStickyScopes
+            Case "editor:occurrences"
+                Me.HighlightsOccurrences = Not Me.HighlightsOccurrences
+            Case "editor:auto-pairs"
+                Me.AutoClosePairs = Not Me.AutoClosePairs
+            Case "editor:wrap-pairs"
+                Me.WrapSelectionInPairs = Not Me.WrapSelectionInPairs
+            Case "editor:dedent"
+                Me.DedentOnType = Not Me.DedentOnType
+            Case "editor:snippet-tab"
+                Me.SnippetTabTrigger = Not Me.SnippetTabTrigger
+            Case "editor:completion-on-type"
+                Me.CompletionOnType = Not Me.CompletionOnType
+            Case "editor:cursor-blink"
+                Me.CaretBlinks = Not Me.CaretBlinks
+            Case Else
+                Return False
+            End Select
+        End If
+        Me.RefreshChecks()
+        Return True
+    End Function
+End Class

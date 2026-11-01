@@ -1,0 +1,70 @@
+Import StudioGit
+Import StudioDiff
+
+Private Class StudioGitButton Inherits Button
+    Public Property Owner As Weak StudioGitWindow
+    Public Property ActionName As String
+    Handle Action()
+        Dim owner As StudioGitWindow = Me.Owner
+        If owner <> Nil Then owner.Command(Me.ActionName)
+    End Handle
+End Class
+
+Public Class StudioGitWindow Inherits Window
+    Private Property Controller As StudioGitController
+    Public Property Output As TextArea = New TextArea()
+    Private Property Buttons As Array Of StudioGitButton
+    Private Property Disposing As Boolean = False
+    Public Property IsClosed As Boolean = False
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.Title = "Local Git · Read only"
+        Me.Move(180, 140, 960, 640)
+        Me.SetMinSize(640.0, 400.0)
+        Me.Output.IsReadOnly = True
+        Me.Output.AccessibleLabel = "Local Git status and patches"
+        Me.AddSubview(Me.Output)
+        Dim captions As Array Of String = ["Refresh status", "Working diff", "Staged diff"]
+        Dim actions As Array Of String = ["status", "working", "staged"]
+        For i As Integer = 0 To 2
+            Dim button As New StudioGitButton()
+            button.Owner = Me
+            button.Caption = captions(i)
+            button.ActionName = actions(i)
+            button.Move(12 + i * 180, 12, 168, 30)
+            Me.Buttons.Append(button)
+            Me.AddSubview(button)
+        Next
+        Me.Output.Move(12, 56, 936, 572)
+    End Sub
+    Public Sub Present(controller As StudioGitController)
+        Me.Controller = controller
+        Me.Command("status")
+        Me.Show()
+    End Sub
+    Public Sub Command(action As String)
+        If Me.Controller = Nil Then Return
+        If action = "status" Then
+            Me.Controller.Refresh()
+            Me.Output.Text = StudioDiffDisplay(Me.Controller.Summary())
+        Else
+            Me.Output.Text = StudioDiffDisplay(Me.Controller.Patch(action = "staged"))
+        End If
+    End Sub
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.Output.Move(12, 56, Math.Round(width) - 24, Math.Round(height) - 68)
+    End Handle
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+    Handle Closed()
+        Me.IsClosed = True
+    End Handle
+    Public Sub Dispose()
+        Me.Controller = Nil
+        Me.Disposing = True
+        If Not Me.IsClosed Then Me.Close()
+    End Sub
+End Class

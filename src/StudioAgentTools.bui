@@ -1,0 +1,341 @@
+Import projectkit
+Import StudioAgentDocs
+Import StudioDiagnostics
+Import StudioAgentScript
+Import StudioScriptHelp
+Import StudioScriptSettings
+
+Private Sub STKeys(input As JSONItem, allowed As Array Of String)
+    If input = Nil Or Not input.IsObject() Then Throw New InvalidArgumentException("Agent tool arguments must be an object")
+    For Each key As String In input.Keys()
+        Dim known As Boolean = False
+        For Each candidate As String In allowed
+            If String.Compare(key, candidate, True) = 0 Then known = True
+        Next
+        If Not known Then Throw New InvalidArgumentException("Unknown agent tool argument: " + key + ". Read inputSchema; argument names are case sensitive.")
+    Next
+End Sub
+
+Private Function STSource(item As ProjectItem) As Boolean
+    Return String.EndsWith(item.RelativePath, ".bui", False)
+End Function
+
+' Keep a cancelling diagnostics job alive until its owned process has been reaped
+' and its private source snapshot removed. Closing a session never waits on it.
+Private Class StudioAgentCheckReaper
+    Private Property Job As StudioDiagnosticsJob
+    Private Property Poller As StudioAgentCheckReaperTimer = New StudioAgentCheckReaperTimer()
+    Private Property KeepAlive As StudioAgentCheckReaper
+
+    Public Sub Constructor(job As StudioDiagnosticsJob)
+        Me.Job = job
+        Me.KeepAlive = Me
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 40
+        Me.Poller.Start()
+    End Sub
+
+    Public Sub Poll()
+        Me.Job.Poll()
+        If Me.Job.IsActive() Then Return
+        Try
+            Me.Job.Shutdown()
+        Finally
+            Me.Poller.Stop()
+            Me.Job = Nil
+            Me.KeepAlive = Nil
+        End Try
+    End Sub
+End Class
+
+Private Class StudioAgentCheckReaperTimer Inherits Timer
+    Public Property Owner As Weak StudioAgentCheckReaper
+    Public Overrides Sub NotifyTick()
+        Dim reaper As StudioAgentCheckReaper = Me.Owner
+        If reaper <> Nil Then reaper.Poll()
+    End Sub
+End Class
+
+''' Session-scoped, main-thread tools over authoritative unsaved project buffers.
+''' The selected compiler/docs binding is immutable. Recreate on toolchain changes.
+Public Class StudioAgentTools Implements ProjectToolExtension, ProjectToolLifecycle
+    Public Property Access As ProjectToolAccess = New ProjectToolAccess()
+    Private Property Workspace As ProjectWorkspace
+    Private Property ProjectRoot As String
+    Private Property Compiler As String
+    Private Property Version As String
+    Private Property Docs As StudioAgentDocs
+    Private Property Job As StudioDiagnosticsJob
+    Private Property CheckId As String
+    Private Property Sequence As Integer = 0
+    Private Property Snapshot As Array Of ProjectItem = []
+    Private Property Versions As JSONItem = JSONItem.NewArray()
+    Private Property AllTargets As Boolean = False
+    Private Property Closed As Boolean = False
+    Private Property Script As StudioAgentScript
+    ''' Optional host-supplied tools (for example StudioAgentRenderTools), listed after
+    ''' the built-in tools and shut down with this session. Names must not repeat built-in
+    ''' or documentation tool names: extra tools are dispatched before documentation tools.
+    Public Property Extra As ProjectToolExtension
+
+    Public Sub Constructor(workspace As ProjectWorkspace, projectRoot As String, compilerPath As String, toolchainRoot As String, compilerVersion As String)
+        If workspace = Nil Then Throw New InvalidArgumentException("Agent tools require a project workspace")
+        Me.Workspace = workspace
+        Me.ProjectRoot = projectRoot
+        Me.Compiler = compilerPath
+        Me.Version = compilerVersion
+        Me.Docs = New StudioAgentDocs(toolchainRoot, compilerVersion)
+    End Sub
+
+    Public Function Tools() As JSONItem
+        Dim tools As JSONItem = JSONItem.NewArray()
+        If Me.Closed Then Return tools
+        Dim help As JSONItem = JSONItem.NewObject()
+        help.Value("name") = "project_script_help"
+        help.Value("description") = "Read the BuoyScript primer: chaining commands, revision-checked undoable text edits, auto-allow, runtime setup, examples and error recovery. Available even without a runner. Read before project_script."
+        help.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}")
+        help.Value("annotations") = Json.Parse("{\"readOnlyHint\":true,\"openWorldHint\":false}")
+        tools.Add(help)
+        ' Keep the registry stable when settings change or a runner is missing.
+        Dim run As JSONItem = JSONItem.NewObject()
+        run.Value("name") = "project_script"
+        run.Value("description") = "Edit project buffers or automate tasks using a native BuoyScript function body returning String. Use ProjectTool(\"project_read_item\", ...) and ProjectTool(\"project_propose_edits\", ...) for revision-checked edits. Scripting is enabled by default; help reports disabled settings or a missing runner. Read project_script_help first. ProjectTool chains registered-buffer tools; edits use shared undo/redo with host review or user-enabled auto-allow. No sandbox. Returns scriptId immediately; poll project_script_result."
+        run.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"source\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":65536},\"timeoutMs\":{\"type\":\"integer\",\"minimum\":100,\"maximum\":60000,\"default\":30000}},\"required\":[\"source\"],\"additionalProperties\":false}")
+        run.Value("annotations") = Json.Parse("{\"readOnlyHint\":false,\"destructiveHint\":true,\"openWorldHint\":true}")
+        tools.Add(run)
+        For Each name As String In ["project_script_result", "project_script_cancel"]
+            Dim tool As JSONItem = JSONItem.NewObject()
+            tool.Value("name") = name
+            tool.Value("description") = "Read progress/result or cancel the current scriptId. Earlier proposals and edits remain after cancellation/failure; applied edits can be undone."
+            tool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"scriptId\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128}},\"required\":[\"scriptId\"],\"additionalProperties\":false}")
+            tool.Value("annotations") = Json.Parse("{\"readOnlyHint\":false,\"openWorldHint\":false}")
+            tools.Add(tool)
+        Next
+        Dim docs As JSONItem = Me.Docs.Tools()
+        For i As Integer = 0 To docs.Count() - 1
+            tools.Add(docs.ValueAt(i))
+        Next
+        Dim start As JSONItem = JSONItem.NewObject()
+        start.Value("name") = "project_check"
+        start.Value("description") = "Start a compiler --check of the current registered .bui buffers, including unsaved edits, in a private snapshot. Returns checkId and captured revisions immediately; use project_check_result for results. Does not compile unapplied proposals. allTargets checks six platform/architecture targets. Never links or runs code; only one check can be active in this session."
+        start.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"allTargets\":{\"type\":\"boolean\"}},\"additionalProperties\":false}")
+        start.Value("annotations") = Json.Parse("{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":false,\"openWorldHint\":false}")
+        tools.Add(start)
+        Dim read As JSONItem = JSONItem.NewObject()
+        read.Value("name") = "project_check_result"
+        read.Value("description") = "Read nonblocking compiler-check progress/results for this session's latest checkId. Includes exact captured buffer revisions, stale flag, per-target status and up to 200 diagnostics. clean is true only after a complete successful check whose source revisions still match the workspace."
+        read.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"checkId\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128}},\"required\":[\"checkId\"],\"additionalProperties\":false}")
+        read.Value("annotations") = Json.Parse("{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}")
+        tools.Add(read)
+        If Me.Extra <> Nil Then
+            Dim added As JSONItem = Me.Extra.Tools()
+            For i As Integer = 0 To added.Count() - 1
+                tools.Add(added.ValueAt(i))
+            Next
+        End If
+        Return tools
+    End Function
+
+    Private Function Stale() As Boolean
+        Dim count As Integer = 0
+        For Each current As ProjectItem In Me.Workspace.Items()
+            If STSource(current) Then count += 1
+        Next
+        If count <> Array.Count(Me.Snapshot) Then Return True
+        For Each captured As ProjectItem In Me.Snapshot
+            Try
+                Dim current As ProjectItem = Me.Workspace.ReadItem(captured.Id)
+                If current.Version <> captured.Version Or String.Compare(current.RelativePath, captured.RelativePath, True) <> 0 Then Return True
+            Catch e As Exception
+                Return True
+            End Try
+        Next
+        Return False
+    End Function
+
+    Private Function CheckState() As JSONItem
+        Me.Job.Poll()
+        Dim output As JSONItem = JSONItem.NewObject()
+        output.Value("checkId") = Me.CheckId
+        output.Value("state") = Me.Job.State
+        output.Value("scope") = "current registered .bui buffer snapshot"
+        output.Value("compilerVersion") = Me.Version
+        output.Value("compilerPath") = Me.Compiler
+        output.Value("allTargets") = Me.AllTargets
+        output.Value("versions") = Json.Parse(Me.Versions.ToString())
+        output.Value("errors") = Me.Job.ErrorCount
+        output.Value("warnings") = Me.Job.WarningCount
+        output.Value("summary") = String.Left(Me.Job.Summary, 512)
+        Dim complete As Boolean = Not Me.Job.IsActive() And Me.Job.State <> "idle"
+        Dim snapshotClean As Boolean = complete And Me.Job.State = "finished" And Me.Job.ErrorCount = 0 And Array.Count(Me.Job.TargetResults) > 0
+        Dim targets As JSONItem = JSONItem.NewArray()
+        For Each target As StudioTargetResult In Me.Job.TargetResults
+            Dim entry As JSONItem = JSONItem.NewObject()
+            Dim targetName As String = target.Target
+            If targetName = "" Then targetName = "host-default"
+            entry.Value("target") = targetName
+            entry.Value("state") = target.State
+            entry.Value("checkedFiles") = target.CheckedFiles
+            entry.Value("errors") = target.ErrorCount
+            entry.Value("warnings") = target.WarningCount
+            entry.Value("message") = String.Left(target.Message, 512)
+            targets.Add(entry)
+            If target.State <> "passed" Or target.CheckedFiles <> Array.Count(Me.Snapshot) Then snapshotClean = False
+        Next
+        Dim stale As Boolean = Me.Stale()
+        output.Value("complete") = complete
+        output.Value("stale") = stale
+        output.Value("snapshotClean") = snapshotClean
+        output.Value("clean") = snapshotClean And Not stale
+        output.Value("targets") = targets
+        Dim diagnostics As JSONItem = JSONItem.NewArray()
+        Dim bytes As Integer = 0
+        For Each diagnostic As StudioDiagnostic In Me.Job.Items
+            If diagnostics.Count() >= 200 Then Exit For
+            Dim entry As JSONItem = JSONItem.NewObject()
+            entry.Value("source") = String.Left(diagnostic.FileName, 1024)
+            Dim targetName As String = diagnostic.Target
+            If targetName = "" Then targetName = "host-default"
+            entry.Value("target") = targetName
+            entry.Value("line") = diagnostic.Line
+            entry.Value("character") = diagnostic.Character
+            entry.Value("severity") = diagnostic.Severity
+            entry.Value("message") = String.Left(diagnostic.Message, 4096)
+            Dim length As Integer = String.LenBytes(entry.ToString())
+            If bytes + length > 65536 Then Exit For
+            bytes += length
+            diagnostics.Add(entry)
+        Next
+        output.Value("diagnostics") = diagnostics
+        output.Value("diagnosticsTruncated") = diagnostics.Count() < Array.Count(Me.Job.Items)
+        Return output
+    End Function
+
+    Private Function StartCheck(input As JSONItem) As JSONItem
+        STKeys(input, ["allTargets"])
+        Dim allTargets As Boolean = False
+        If input.HasKey("allTargets") Then
+            If Not input.Value("allTargets").IsBoolean() Then Throw New InvalidArgumentException("allTargets must be a boolean")
+            allTargets = input.Value("allTargets").AsBoolean().Or(False)
+        End If
+        If Me.Job <> Nil Then
+            If Me.Job.IsActive() Then Throw New InvalidArgumentException("A project check is already active; read its result first")
+        End If
+        Dim snapshot As Array Of ProjectItem = []
+        Dim versions As JSONItem = JSONItem.NewArray()
+        Dim sources As Array Of StudioDiagnosticSource = []
+        For Each item As ProjectItem In Me.Workspace.Items()
+            If Not STSource(item) Then Continue For
+            If Array.Count(snapshot) >= 512 Then Throw New InvalidArgumentException("Compiler checks support at most 512 registered .bui buffers")
+            snapshot.Append(item)
+            sources.Append(New StudioDiagnosticSource(item.RelativePath, item.Text))
+            Dim version As JSONItem = JSONItem.NewObject()
+            version.Value("itemId") = item.Id
+            version.Value("source") = item.RelativePath
+            version.Value("version") = item.Version
+            version.Value("dirty") = item.IsDirty
+            versions.Add(version)
+        Next
+        If Me.Job <> Nil Then Me.Job.Shutdown()
+        Me.Snapshot = snapshot
+        Me.Versions = versions
+        Me.Sequence += 1
+        Me.CheckId = "check-" + String.From(System.Microseconds()) + "-" + String.From(Me.Sequence)
+        Me.AllTargets = allTargets
+        Me.Job = New StudioDiagnosticsJob()
+        If allTargets Then
+            Me.Job.StartAllTargets(Me.Compiler, Me.ProjectRoot, sources)
+        Else
+            Me.Job.Start(Me.Compiler, Me.ProjectRoot, sources)
+        End If
+        Return Me.CheckState()
+    End Function
+
+    Public Function Call(name As String, input As JSONItem) As JSONItem
+        If Me.Closed Then Throw New InvalidArgumentException("Agent tool session is closed")
+        If name = "project_script_help" Then
+            Dim noKeys As Array Of String = []
+            STKeys(input, noKeys)
+            Dim output As JSONItem = JSONItem.NewObject()
+            output.Value("primer") = StudioScriptPrimer()
+            Dim runner As String = StudioScriptRunnerPath()
+            output.Value("enabled") = StudioScriptSettings.Enabled
+            output.Value("runnerConfigured") = runner <> ""
+            output.Value("runnerAvailable") = StudioScriptRunnerAvailable(runner)
+            Dim status As String = "ready-unverified"
+            If Not StudioScriptRunnerAvailable(runner) Then status = "runner-unavailable"
+            If Not StudioScriptSettings.Enabled Then status = "disabled-in-preferences"
+            output.Value("status") = status
+            output.Value("setup") = "Settings / Preferences: enable BuoyScript and optionally select a matching runner. Studio discovers its bundled helper automatically. project_script executes scripts; project_check only checks application sources."
+            output.Value("smokeTest") = "Return ProjectTool(\"project_list_items\", \"{}\")"
+            output.Value("autoAllowAgentEdits") = Me.Workspace.AutoAllowAgentEdits
+            Return output
+        End If
+        If name = "project_script" Then
+            STKeys(input, ["source", "timeoutMs"])
+            If Not StudioScriptSettings.Enabled Then Throw New InvalidArgumentException("BuoyScript is disabled in Settings / Preferences. Enable BuoyScript to run scripts.")
+            Dim runner As String = StudioScriptRunnerPath()
+            If Not StudioScriptRunnerAvailable(runner) Then Throw New InvalidArgumentException("BuoyScript runner is unavailable. Open Settings / Preferences to select a matching helper, or read project_script_help for setup.")
+            If Me.Script <> Nil Then
+                If Me.Script.IsActive() Then Throw New InvalidArgumentException("A script is already running; read its result or cancel it before starting another")
+            End If
+            If Not input.Value("source").IsString() Then Throw New InvalidArgumentException("source must be a String function body; read project_script_help")
+            Dim source As String = input.Value("source").AsString().Or("")
+            If String.LenBytes(source) < 1 Or String.LenBytes(source) > 65536 Then Throw New InvalidArgumentException("source must contain 1..65536 UTF-8 bytes")
+            Dim timeoutMs As Integer = 30000
+            If input.HasKey("timeoutMs") Then
+                If Not input.Value("timeoutMs").IsNumber() Then Throw New InvalidArgumentException("timeoutMs must be an integer in 100..60000")
+                Dim number As Double = input.Value("timeoutMs").AsNumber().Or(0.0)
+                If number < 100 Or number > 60000 Or number <> Math.Floor(number) Then Throw New InvalidArgumentException("timeoutMs must be an integer in 100..60000")
+                timeoutMs = number
+            End If
+            Me.Script = New StudioAgentScript(Me.Workspace, runner, Me.ProjectRoot, source, timeoutMs, False, Some(Me.Access))
+            Return Me.Script.Result()
+        End If
+        If name = "project_script_result" Or name = "project_script_cancel" Then
+            STKeys(input, ["scriptId"])
+            If Me.Script = Nil Then Throw New InvalidArgumentException("No script has been started in this session")
+            If Not input.Value("scriptId").IsString() Then Throw New InvalidArgumentException("scriptId is required; use the ID returned by project_script")
+            If input.Value("scriptId").AsString().Or("") <> Me.Script.Id Then Throw New InvalidArgumentException("Unknown scriptId for this session; use the latest project_script result")
+            If name = "project_script_cancel" Then Me.Script.Cancel()
+            Return Me.Script.Result()
+        End If
+        If String.Compare(name, "project_check", True) = 0 Then Return Me.StartCheck(input)
+        If String.Compare(name, "project_check_result", True) = 0 Then
+            STKeys(input, ["checkId"])
+            If Not input.Value("checkId").IsString() Then Throw New InvalidArgumentException("checkId is required")
+            Dim requested As String = input.Value("checkId").AsString().Or("")
+            If Me.Job = Nil Or requested = "" Or String.LenBytes(requested) > 128 Or String.Compare(requested, Me.CheckId, True) <> 0 Then Throw New InvalidArgumentException("Unknown checkId for this agent session")
+            Return Me.CheckState()
+        End If
+        If Me.Extra <> Nil Then
+            Dim added As JSONItem = Me.Extra.Tools()
+            For i As Integer = 0 To added.Count() - 1
+                If String.Compare(added.ValueAt(i).Value("name").AsString().Or(""), name, True) = 0 Then Return Me.Extra.Call(name, input)
+            Next
+        End If
+        Return Me.Docs.Call(name, input)
+    End Function
+
+    Public Sub Shutdown()
+        If Me.Closed Then Return
+        Me.Closed = True
+        If Me.Script <> Nil Then Me.Script.Shutdown()
+        Me.Script = Nil
+        If Me.Extra IsA ProjectToolLifecycle Then
+            Dim lifecycle As ProjectToolLifecycle = CType(Me.Extra, ProjectToolLifecycle)
+            lifecycle.Shutdown()
+        End If
+        Me.Extra = Nil
+        If Me.Job = Nil Then Return
+        Me.Job.Shutdown()
+        If Me.Job.IsActive() Then
+            Dim reaper As New StudioAgentCheckReaper(Me.Job)
+        End If
+        Me.Job = Nil
+    End Sub
+
+    Public Sub Destructor()
+        Me.Shutdown()
+    End Sub
+End Class

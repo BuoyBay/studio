@@ -1,0 +1,192 @@
+Import StudioNavigation
+Import StudioQuickOpen
+
+Public Class StudioCommand
+    Public Property ID As String
+    Public Property Caption As String
+    Public Property Context As String = "global"
+    Public Property Shortcut As String
+End Class
+
+Public Function StudioCanonicalShortcut(text As String) As String
+    Dim parts As Array Of String = String.Split(String.LCase(String.Replace(String.Trim(text), " ", "")), "+")
+    Dim primary As Boolean = False
+    Dim shift As Boolean = False
+    Dim alt As Boolean = False
+    Dim key As String
+    For Each part As String In parts
+        Select Case part
+        Case "cmd", "ctrl", "primary", "command", "control"
+            primary = True
+        Case "shift"
+            shift = True
+        Case "alt", "option"
+            alt = True
+        Case Else
+            If part = "" Or key <> "" Then Return ""
+            key = part
+        End Select
+    Next
+    If key = "" Then Return ""
+    Dim chord As String
+    If primary Then chord += "Primary+"
+    If alt Then chord += "Alt+"
+    If shift Then chord += "Shift+"
+    Return chord + String.UCase(key)
+End Function
+
+' Returns the exact StudioCodeEditor.PerformCommand name, or empty for shell tags.
+Public Function StudioEditorCommand(id As String) As String
+    Select Case id
+    Case "source:copy"
+        Return "copy"
+    Case "source:cut"
+        Return "cut"
+    Case "source:paste"
+        Return "paste"
+    Case "source:duplicate"
+        Return "duplicateLines"
+    Case "source:comment"
+        Return "toggleComment"
+    Case "source:next"
+        Return "findNext"
+    Case "source:previous"
+        Return "findPrevious"
+    Case "source:fold"
+        Return "fold"
+    Case "source:unfold"
+        Return "unfold"
+    Case "source:fold-all"
+        Return "foldAll"
+    Case "source:unfold-all"
+        Return "unfoldAll"
+    End Select
+    Return ""
+End Function
+
+Public Class StudioCommands
+    Private Property Values As Array Of StudioCommand = []
+    Public Sub Register(id As String, caption As String, context As String = "global", shortcut As String = "")
+        If id = "" Or caption = "" Then Throw New InvalidArgumentException("Command identity and caption required")
+        For Each item As StudioCommand In Me.Values
+            If item.ID = id Then Throw New InvalidArgumentException("Duplicate command ID: " + id)
+        Next
+        Dim item As New StudioCommand()
+        item.ID = id
+        item.Caption = caption
+        item.Context = context
+        Me.Values.Append(item)
+        Dim failure As String = Me.Bind(id, shortcut, False)
+        If failure <> "" Then Throw New InvalidArgumentException(failure)
+    End Sub
+    Public Function Binding(id As String) As String
+        For Each item As StudioCommand In Me.Values
+            If item.ID = id Then Return item.Shortcut
+        Next
+        Return ""
+    End Function
+    ''' Linux native primary+shift accelerators are unsupported: reject explicitly.
+    Public Function Bind(id As String, shortcut As String, linuxNative As Boolean) As String
+        Dim target As StudioCommand
+        For Each item As StudioCommand In Me.Values
+            If item.ID = id Then target = item
+        Next
+        If target = Nil Then Return "Unknown command: " + id
+        Dim chord As String = StudioCanonicalShortcut(shortcut)
+        If shortcut <> "" And chord = "" Then Return "Use one key with Primary, Alt and/or Shift modifiers"
+        If linuxNative And String.Contains(chord, "Primary+") And String.Contains(chord, "Shift+") Then Return "Linux native menus cannot distinguish Primary+Shift; choose another shortcut"
+        For Each item As StudioCommand In Me.Values
+            If item.ID = id Or chord = "" Then Continue For
+            If item.Shortcut = chord And (item.Context = target.Context Or item.Context = "global" Or target.Context = "global") Then Return "Shortcut conflicts with " + item.Caption
+        Next
+        target.Shortcut = chord
+        Return ""
+    End Function
+    Public Function Resolve(shortcut As String, context As String) As String
+        Dim chord As String = StudioCanonicalShortcut(shortcut)
+        If chord = "" Then Return ""
+        For Each item As StudioCommand In Me.Values
+            If item.Shortcut = chord And (item.Context = "global" Or item.Context = context) Then Return item.ID
+        Next
+        Return ""
+    End Function
+    Public Function Search(query As String, context As String) As Array Of StudioCommand
+        Dim found As Array Of StudioCommand = []
+        Dim scores As Array Of Integer = []
+        For Each item As StudioCommand In Me.Values
+            If item.Context <> "global" And item.Context <> context Then Continue For
+            Dim rank As Integer = StudioFuzzyRank(query, item.Caption)
+            If rank < 0 Then Continue For
+            found.Append(item)
+            scores.Append(rank)
+            Dim index As Integer = Array.Count(found) - 1
+            While index > 0
+                If scores(index) <= scores(index - 1) Then Exit While
+                Dim old As StudioCommand = found(index - 1)
+                Dim score As Integer = scores(index - 1)
+                found(index - 1) = found(index)
+                scores(index - 1) = scores(index)
+                found(index) = old
+                scores(index) = score
+                index -= 1
+            End While
+        Next
+        Return found
+    End Function
+    Public Function NativeShortcut(id As String, primary As String) As String
+        Return String.Replace(Me.Binding(id), "Primary+", primary + "+")
+    End Function
+    Public Sub Defaults()
+        Me.Register("navigation:quick-open", "Quick Open", "global", "Primary+P")
+        Me.Register("navigation:commands", "Command Palette", "global", "Primary+Alt+P")
+        Me.Register("navigation:line", "Go To Line:Column", "source", "Primary+Alt+G")
+        Me.Register("navigation:back", "Navigate Back", "global", "Alt+Left")
+        Me.Register("navigation:forward", "Navigate Forward", "global", "Alt+Right")
+        Me.Register("navigation:last-edit", "Go To Last Edit", "source", "Primary+Alt+L")
+        Me.Register("navigation:bookmark", "Toggle Source Bookmark", "source", "Primary+Alt+M")
+        Me.Register("navigation:bookmarks", "Source Bookmarks")
+        Me.Register("navigation:clipboard", "Clipboard History", "source", "Primary+Alt+V")
+        Me.Register("navigation:bindings", "Customize Keybindings")
+        Me.Register("navigation:clipboard-clear", "Clear Clipboard History", "source")
+        Me.Register("save", "Save", "global", "Primary+S")
+        Me.Register("save-all", "Save All", "global", "Primary+Alt+S")
+        Me.Register("open", "Open File", "global", "Primary+O")
+        Me.Register("undo", "Undo", "source", "Primary+Z")
+        Me.Register("redo", "Redo", "source")
+        Me.Register("source:find", "Find and Replace", "source", "Primary+F")
+        Me.Register("source:comment", "Toggle Comment", "source", "Primary+/")
+        Me.Register("source:duplicate", "Duplicate Lines", "source")
+        Me.Register("source:copy", "Copy", "source", "Primary+C")
+        Me.Register("source:cut", "Cut", "source", "Primary+X")
+        Me.Register("source:paste", "Paste", "source", "Primary+V")
+        Me.Register("source:fold", "Fold", "source", "Primary+Alt+[")
+        Me.Register("source:unfold", "Unfold", "source", "Primary+Alt+]")
+        Me.Register("check-project", "Check Project")
+        Me.Register("terminal", "Show Terminal")
+    End Sub
+    Public Sub Save(domain As String)
+        For Each item As StudioCommand In Me.Values
+            Prefs.Set(domain, "navigation.binding." + item.ID, item.Shortcut)
+        Next
+    End Sub
+    ''' Atomic load permits swaps; conflicts or unsupported chords preserve prior bindings.
+    Public Function Load(domain As String, linuxNative As Boolean) As String
+        Dim old As Array Of String = []
+        For Each item As StudioCommand In Me.Values
+            old.Append(item.Shortcut)
+            item.Shortcut = ""
+        Next
+        Dim failure As String
+        For i As Integer = 0 To Array.Count(Me.Values) - 1
+            Dim item As StudioCommand = Me.Values(i)
+            failure = Me.Bind(item.ID, Prefs.Get(domain, "navigation.binding." + item.ID, old(i)), linuxNative)
+            If failure <> "" Then Exit For
+        Next
+        If failure <> "" Then
+            For i As Integer = 0 To Array.Count(Me.Values) - 1
+                Me.Values(i).Shortcut = old(i)
+            Next
+        End If
+        Return failure
+    End Function
+End Class

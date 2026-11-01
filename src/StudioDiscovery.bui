@@ -1,0 +1,194 @@
+Import processkit
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutDiscovery
+Import StudioMaskEditor
+
+''' Package control discovery for one explicitly configured project folder.
+''' Only the helper shipped with Studio (or an explicitly configured trusted path) is
+''' executed; the project folder is passed as a data argument and nothing inside the
+''' project or its packages is ever run.
+''' The data-only helper runs as a child process with explicit argv (no shell),
+''' polled from the UI timer. Only a zero exit plus a parsed index produces a new
+''' catalog; any failure leaves the editor's current catalog untouched.
+Public Class StudioDiscoveryJob
+    Public Const OutputLimit As Integer = 65536
+    Public Const ErrorLimit As Integer = 16384
+    Public Const TimeoutTicks As Integer = 2000
+    Private Property mProcess As PipeProcess
+    Private Property mOutput As String
+    Private Property mErrors As String
+    Private Property mTicks As Integer = 0
+    Public Property ProjectRoot As String
+    Public Property IsComplete As Boolean = False
+    Public Property Succeeded As Boolean = False
+    Public Property Summary As String
+    Public Property Problems As Array Of String = []
+    Public Property Catalog As LayoutCatalog
+    Public Property LoadedControls As Integer = 0
+    Public Property LoadedPackages As Integer = 0
+
+    ''' Starts the helper. A missing interpreter or helper fails immediately with a
+    ''' readable requirement instead of starting a process.
+    Public Sub Constructor(pythonPath As String, helperPath As String, projectRoot As String)
+        Me.ProjectRoot = projectRoot
+        If projectRoot = "" Then
+            Me.Fail("No project folder is configured. Start Studio with --project FOLDER or set BUOY_STUDIO_PROJECT.")
+            Return
+        End If
+        If Not New FileSystemItem(projectRoot).IsFolder() Then
+            Me.Fail("Project folder not found: " + projectRoot)
+            Return
+        End If
+        If pythonPath = "" Or Not New FileSystemItem(pythonPath).IsFile() Then
+            Me.Fail("Package discovery needs Python 3. Install it or set BUOY_STUDIO_PYTHON to its full path.")
+            Return
+        End If
+        If helperPath = "" Or Not New FileSystemItem(helperPath).IsFile() Then
+            Me.Fail("Package discovery helper is missing from this build. Set BUOY_STUDIO_DISCOVERY_HELPER to discover_layout_packages.py.")
+            Return
+        End If
+        Try
+            Dim arguments As Array Of String = [helperPath, "--project", projectRoot]
+            Me.mProcess = New PipeProcess(pythonPath, arguments, projectRoot)
+            Me.mProcess.CloseInput()
+        Catch e As Exception
+            Me.Fail("Could not start package discovery: " + e.Message)
+        End Try
+    End Sub
+
+    Private Sub Fail(message As String)
+        Me.IsComplete = True
+        Me.Succeeded = False
+        Me.Summary = message
+        If Me.mProcess <> Nil Then
+            Try
+                Me.mProcess.Terminate()
+            Catch e As Exception
+                ' The process may already have exited.
+            End Try
+            Me.mProcess.Close()
+            Me.mProcess = Nil
+        End If
+    End Sub
+
+    Private Sub Drain()
+        Dim chunk As Bytes = Me.mProcess.ReadOutput(4096)
+        If chunk <> Nil Then
+            If chunk.Count > 0 And String.LenBytes(Me.mOutput) < StudioDiscoveryJob.OutputLimit Then Me.mOutput += chunk.ToString(Text.Encodings.UTF8)
+        End If
+        Dim errorChunk As Bytes = Me.mProcess.ReadError(4096)
+        If errorChunk <> Nil Then
+            If errorChunk.Count > 0 And String.LenBytes(Me.mErrors) < StudioDiscoveryJob.ErrorLimit Then Me.mErrors += errorChunk.ToString(Text.Encodings.UTF8)
+        End If
+    End Sub
+
+    ''' Advances the job; call from the UI timer until IsComplete.
+    Public Sub Poll()
+        If Me.IsComplete Or Me.mProcess = Nil Then Return
+        Try
+            Me.mTicks += 1
+            Me.Drain()
+            If Me.mProcess.Poll() Then
+                If Me.mTicks > StudioDiscoveryJob.TimeoutTicks Then Me.Fail("Package discovery timed out and was stopped.")
+                Return
+            End If
+            Me.Drain()
+            If Not Me.mProcess.OutputClosed Or Not Me.mProcess.ErrorClosed Then Return
+            Dim code As Integer = Me.mProcess.ExitCode
+            Me.mProcess.Close()
+            Me.mProcess = Nil
+            If code <> 0 Then
+                Dim detail As String = String.Trim(Me.mErrors)
+                If detail = "" Then detail = "exit status " + String.From(code)
+                Me.Fail("Package discovery failed: " + detail)
+                Return
+            End If
+            Me.Finish()
+        Catch e As Exception
+            Me.Fail("Package discovery failed: " + e.Message)
+        End Try
+    End Sub
+
+    ''' Builds a fresh catalog (builtins registered exactly once) from the new index.
+    Private Sub Finish()
+        Dim index As New FileSystemItem(Path.Join(Me.ProjectRoot, ".buoy/designer/index-v1.json"))
+        If Not index.IsFile() Then
+            Me.Fail("Package discovery did not produce .buoy/designer/index-v1.json.")
+            Return
+        End If
+        ' Success requires this run's own report naming the index it rebuilt, so a
+        ' stale index from an earlier run is never presented as fresh discovery.
+        Dim reported As Optional Of JSONItem = Json.TryParse(String.Trim(Me.mOutput))
+        If Not reported.HasValue Then
+            Me.Fail("Package discovery returned no report; the previous catalog was kept.")
+            Return
+        End If
+        If Not reported.Value.IsObject() Or Not reported.Value.Value("index").IsString() Then
+            Me.Fail("Package discovery returned an unexpected report; the previous catalog was kept.")
+            Return
+        End If
+        Dim reportedIndex As String = reported.Value.Value("index").AsString().Or("")
+        Dim normalized As String = String.Replace(reportedIndex, "\\", "/", True)
+        If Not String.EndsWith(normalized, ".buoy/designer/index-v1.json") Or Not String.Contains(normalized, New FileSystemItem(Me.ProjectRoot).Name()) Then
+            Me.Fail("Package discovery wrote an unexpected index: " + reportedIndex)
+            Return
+        End If
+        Dim fresh As New LayoutCatalog()
+        fresh.RegisterBuiltinControls()
+        Dim report As JSONItem = New LayoutDiscovery().DiscoverDirectory(Me.ProjectRoot, fresh)
+        RegisterStudioMaskEditors(fresh)
+        Dim problems As Array Of String = []
+        Dim errors As JSONItem = report.Value("errors")
+        If errors.IsArray() Then
+            For i As Integer = 0 To errors.Count() - 1
+                Dim entry As JSONItem = errors.ValueAt(i)
+                Dim message As String = entry.Value("message").AsString().Or(Json.Stringify(entry))
+                Dim location As String = entry.Value("path").AsString().Or("")
+                If location <> "" Then message += " (" + location + ")"
+                problems.Append(message)
+            Next
+        End If
+        Me.LoadedControls = Math.Round(report.Value("loadedControls").AsNumber().Or(0.0))
+        Me.LoadedPackages = Math.Round(report.Value("loadedPackages").AsNumber().Or(0.0))
+        Me.Problems = problems
+        Me.Catalog = fresh
+        Me.IsComplete = True
+        Me.Succeeded = True
+        Me.Summary = "Discovered " + String.From(Me.LoadedControls) + " package controls in " + String.From(Me.LoadedPackages) + " packages"
+        If Array.Count(problems) > 0 Then Me.Summary += " · " + String.From(Array.Count(problems)) + " problems"
+    End Sub
+
+    Public Sub Cancel()
+        If Not Me.IsComplete Then Me.Fail("Package discovery was cancelled.")
+    End Sub
+End Class
+
+''' Resolves an interpreter without a shell: explicit configuration first, then
+''' well-known absolute locations. Returns "" when none exists.
+Public Function StudioPythonPath() As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_PYTHON").Or("")
+    If configured <> "" Then Return configured
+    #If TargetWindows Then
+        For Each name As String In ["python3.exe", "python.exe"]
+            For Each folder As String In String.Split(System.EnvironmentVariable("PATH").Or(""), ";")
+                If folder = "" Then Continue For
+                Dim candidate As New FileSystemItem(Path.Join(folder, name))
+                If candidate.IsFile() Then Return candidate.FullPath()
+            Next
+        Next
+    #End If
+    Dim candidates As Array Of String = ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"]
+    For Each candidate As String In candidates
+        If New FileSystemItem(candidate).IsFile() Then Return candidate
+    Next
+    Return ""
+End Function
+
+''' The helper ships as an app resource; an explicit path overrides it for development.
+Public Function StudioDiscoveryHelperPath() As String
+    Dim configured As String = System.EnvironmentVariable("BUOY_STUDIO_DISCOVERY_HELPER").Or("")
+    If configured <> "" Then Return configured
+    Dim bundled As FileSystemItem = FileSystemItem.AppResource("discover_layout_packages.py")
+    If bundled = Nil Then Return ""
+    Return bundled.FullPath()
+End Function

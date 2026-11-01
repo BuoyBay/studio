@@ -1,0 +1,426 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+*{box-sizing:border-box}body{margin:0;font-family:var(--font-sans,system-ui);color:var(--foreground)}
+section{margin:0 0 18px}h3{font-size:13px;font-weight:600;margin:0 0 8px;color:var(--muted-foreground)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:6px}
+.tile{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;min-height:70px;padding:8px 4px;border:1px solid var(--border);border-radius:var(--radius,8px);background:var(--card);color:var(--foreground);text-align:center}
+.tile svg{width:24px;height:24px;flex-shrink:0}.tile span{font-size:10px;line-height:13px;color:var(--muted-foreground)}
+.identities{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:8px}
+.identity{display:flex;align-items:center;gap:12px;padding:16px;border:1px solid var(--border);border-radius:var(--radius,8px);background:var(--card)}
+.identity svg{width:68px;height:68px;flex-shrink:0}.identity span{font-size:12px}.identity small{display:block;color:var(--muted-foreground);font-size:10px;margin-top:4px}
+@media(max-width:420px){.identity{padding:10px;flex-direction:column;text-align:center}.identity svg{width:56px;height:56px}}
+</style></head><body><section><h3>Project</h3><div class="grid"><div class="tile" title="project.desktop"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="3.5" width="18.5" height="12.5" rx="2"/>
+  <path d="M12 16v4.25M8.5 20.5h7"/>
+  <path d="M2.75 7.5h18.5"/>
+</svg>
+<span>Desktop app</span></div><div class="tile" title="project.console"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="4" width="18.5" height="16" rx="2.5"/>
+  <path d="m7 9.5 2.75 2.5L7 14.5M12.5 15h4.5"/>
+</svg>
+<span>Console tool</span></div><div class="tile" title="project.library"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 2.75 20.25 7.25v9.5L12 21.25 3.75 16.75v-9.5z"/>
+  <path d="M3.75 7.25 12 11.75l8.25-4.5M12 11.75v9.5"/>
+</svg>
+<span>Library package</span></div><div class="tile" title="project.plugin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M9 2.75V7M15 2.75V7"/>
+  <path d="M6.5 7h11v3.5a5.5 5.5 0 0 1-11 0z"/>
+  <path d="M12 16v5.25"/>
+</svg>
+<span>Designer plug-in package</span></div><div class="tile" title="project.web"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="9"/>
+  <path d="M3 12h18"/>
+  <path d="M12 3c2.5 2.6 3.75 5.6 3.75 9S14.5 18.4 12 21c-2.5-2.6-3.75-5.6-3.75-9S9.5 5.6 12 3z"/>
+</svg>
+<span>Web content project</span></div><div class="tile" title="project.server"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3.5" width="18" height="7" rx="2"/>
+  <rect x="3" y="13.5" width="18" height="7" rx="2"/>
+  <circle cx="7" cy="7" r="1" fill="currentColor" stroke="none"/>
+  <circle cx="7" cy="17" r="1" fill="currentColor" stroke="none"/>
+  <path d="M11 7h6M11 17h6"/>
+</svg>
+<span>Server / service</span></div><div class="tile" title="project.tests"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M8.5 3h7M10 3v6.25l-5.3 9.3A1.65 1.65 0 0 0 6.13 21h11.74a1.65 1.65 0 0 0 1.43-2.45L14 9.25V3"/>
+  <path d="M7.4 15h9.2"/>
+</svg>
+<span>Test suite</span></div></div></section><section><h3>Navigator</h3><div class="grid"><div class="tile" title="brand.buoy"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.75"/>
+  <circle cx="12" cy="12" r="3.75"/>
+  <path d="m5.8 5.8 3.55 3.55M18.2 5.8l-3.55 3.55M5.8 18.2l3.55-3.55M18.2 18.2l-3.55-3.55"/>
+</svg>
+<span>Buoy project</span></div><div class="tile" title="nav.library"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="7" height="7" rx="1.75"/>
+  <rect x="13.5" y="3.5" width="7" height="7" rx="1.75"/>
+  <rect x="3.5" y="13.5" width="7" height="7" rx="1.75"/>
+  <path d="M17 13.5v7M13.5 17h7"/>
+</svg>
+<span>Control library</span></div></div></section><section><h3>Item</h3><div class="grid"><div class="tile" title="file.document"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+</svg>
+<span>Document</span></div><div class="tile" title="file.source"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <path d="m10 12.25-2 2.25 2 2.25M14 12.25l2 2.25-2 2.25"/>
+</svg>
+<span>Buoy source</span></div><div class="tile" title="file.layout"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <rect x="8" y="11.5" width="8" height="6.5" rx="1"/>
+  <path d="M8 14h8"/>
+</svg>
+<span>Layout source</span></div><div class="tile" title="file.entry"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <path d="M10.25 11.5v6l4.75-3z"/>
+</svg>
+<span>Entry module (main.bui)</span></div><div class="tile" title="file.config"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <path d="M10.25 11.25c-.9 0-1.35.45-1.35 1.35v.65c0 .55-.4.95-.9 1 .5.05.9.45.9 1v.65c0 .9.45 1.35 1.35 1.35M13.75 11.25c.9 0 1.35.45 1.35 1.35v.65c0 .55.4.95.9 1-.5.05-.9.45-.9 1v.65c0 .9-.45 1.35-1.35 1.35"/>
+</svg>
+<span>Configuration / data</span></div><div class="tile" title="file.text"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <path d="M8.5 12.5h7M8.5 15.5h7M8.5 18.5h4"/>
+</svg>
+<span>Text / Markdown</span></div><div class="tile" title="file.image"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <path d="m7.75 18.5 3-3.5 2 2 1.25-1.25 2.25 2.75"/>
+  <circle cx="10" cy="12" r="1.1" fill="currentColor" stroke="none"/>
+</svg>
+<span>Image resource</span></div><div class="tile" title="file.test"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+  <path d="M14 3v5h5"/>
+  <path d="m8.75 15.25 2.1 2.1 4.4-4.6"/>
+</svg>
+<span>Test source</span></div><div class="tile" title="file.folder"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3 7V6a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.5.7L11.5 6.5H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+  <path d="M3 10h18"/>
+</svg>
+<span>Folder</span></div></div></section><section><h3>Control</h3><div class="grid"><div class="tile" title="control.window"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="4" width="18.5" height="16" rx="2.5"/>
+  <path d="M2.75 8.75h18.5"/>
+  <circle cx="6" cy="6.4" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="8.75" cy="6.4" r="0.95" fill="currentColor" stroke="none"/>
+</svg>
+<span>Window</span></div><div class="tile" title="control.view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3" width="18" height="18" rx="2.5"/>
+  <rect x="6.5" y="6.5" width="6" height="5" rx="1"/>
+  <path d="M6.5 15.5h11" opacity=".45"/>
+</svg>
+<span>View</span></div><div class="tile" title="control.group-box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3.5 4.5h8"/>
+  <rect x="3" y="8" width="18" height="13" rx="2.5"/>
+  <path d="M6.5 12.5h11M6.5 16.5h7" opacity=".45"/>
+</svg>
+<span>GroupBox</span></div><div class="tile" title="control.tab-view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.25 7h.25A2.5 2.5 0 0 0 3 9.5v9A2.5 2.5 0 0 0 5.5 21h13a2.5 2.5 0 0 0 2.5-2.5v-9A2.5 2.5 0 0 0 18.5 7h.25"/>
+  <path d="M8.5 4.25H12v5.5H8.5A1.5 1.5 0 0 1 7 8.25v-2.5a1.5 1.5 0 0 1 1.5-1.5z" fill="currentColor" stroke="none" opacity=".35"/>
+  <rect x="7" y="4.25" width="10" height="5.5" rx="1.5"/>
+  <path d="M12 4.25v5.5"/>
+</svg>
+<span>TabView</span></div><div class="tile" title="control.page-panel"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M7 7V5.5A2.5 2.5 0 0 1 9.5 3h9A2.5 2.5 0 0 1 21 5.5v9a2.5 2.5 0 0 1-2.5 2.5H17" opacity=".45"/>
+  <rect x="3" y="7" width="14" height="14" rx="2.5"/>
+  <circle cx="7.25" cy="17.25" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="10" cy="17.25" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="12.75" cy="17.25" r="0.95" fill="currentColor" stroke="none"/>
+</svg>
+<span>PagePanel</span></div><div class="tile" title="control.stack-view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="4" y="3.5" width="16" height="3.75" rx="1.25"/>
+  <rect x="4" y="10.125" width="16" height="3.75" rx="1.25"/>
+  <rect x="4" y="16.75" width="16" height="3.75" rx="1.25"/>
+</svg>
+<span>StackView</span></div><div class="tile" title="control.splitter"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="4" width="18.5" height="16" rx="2.5"/>
+  <path d="M12 4v16"/>
+  <path d="m8 10-2 2 2 2M16 10l2 2-2 2"/>
+</svg>
+<span>Splitter</span></div><div class="tile" title="control.scroll-view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3" width="18" height="18" rx="2.5"/>
+  <path d="M6.75 8h6.5M6.75 12h6.5M6.75 16h4"/>
+  <rect x="16" y="6.5" width="2" height="6.5" rx="1" fill="currentColor" stroke="none"/>
+</svg>
+<span>ScrollView</span></div><div class="tile" title="control.button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="7" width="18.5" height="10" rx="3.5"/>
+  <path d="M8.5 12h7"/>
+</svg>
+<span>Button</span></div><div class="tile" title="control.bevel-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="2"/>
+  <rect x="7.5" y="7.5" width="9" height="9" rx="1"/>
+  <path d="m4.25 4.25 3.25 3.25M19.75 19.75 16.5 16.5"/>
+</svg>
+<span>BevelButton</span></div><div class="tile" title="control.segmented-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.75 7H9v10H5.75a3 3 0 0 1-3-3v-4a3 3 0 0 1 3-3z" fill="currentColor" stroke="none" opacity=".35"/>
+  <rect x="2.75" y="7" width="18.5" height="10" rx="3"/>
+  <path d="M9 7v10M15 7v10"/>
+</svg>
+<span>SegmentedButton</span></div><div class="tile" title="control.checkbox"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="3.5"/>
+  <path d="m7.75 12.25 2.9 2.9L16.25 9.5"/>
+</svg>
+<span>Checkbox</span></div><div class="tile" title="control.radio-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.5"/>
+  <circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/>
+</svg>
+<span>RadioButton</span></div><div class="tile" title="control.radio-group"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="6.5" cy="7" r="3"/>
+  <circle cx="6.5" cy="7" r="1.25" fill="currentColor" stroke="none"/>
+  <circle cx="6.5" cy="17" r="3"/>
+  <path d="M12.5 7h8M12.5 17h8"/>
+</svg>
+<span>RadioGroup</span></div><div class="tile" title="control.disclosure-triangle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M7 9.25h10L12 15.25z" fill="currentColor"/>
+</svg>
+<span>DisclosureTriangle</span></div><div class="tile" title="control.toolbar"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="6.5" width="18.5" height="11" rx="2.5"/>
+  <rect x="5.75" y="10.25" width="3.5" height="3.5" rx=".9" fill="currentColor" stroke="none"/>
+  <rect x="10.25" y="10.25" width="3.5" height="3.5" rx=".9" fill="currentColor" stroke="none"/>
+  <rect x="14.75" y="10.25" width="3.5" height="3.5" rx=".9" fill="currentColor" stroke="none"/>
+</svg>
+<span>Toolbar</span></div><div class="tile" title="control.label"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5 5.5h14M12 5.5v13"/>
+  <path d="M9 18.5h6"/>
+</svg>
+<span>Label</span></div><div class="tile" title="control.text-field"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="7" width="18.5" height="10" rx="2"/>
+  <path d="M7 9.5v5M5.9 9.5h2.2M5.9 14.5h2.2"/>
+</svg>
+<span>TextField</span></div><div class="tile" title="control.text-area"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3" width="18" height="18" rx="2.5"/>
+  <path d="M7 7.75h10M7 11.25h10M7 14.75h6"/>
+  <path d="m17.75 15.75-2 2"/>
+</svg>
+<span>TextArea</span></div><div class="tile" title="control.search-field"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="6.5" width="18.5" height="11" rx="5.5"/>
+  <circle cx="8.75" cy="11.5" r="2.25"/>
+  <path d="m10.4 13.15 1.6 1.6"/>
+  <path d="M14.5 12h3" opacity=".45"/>
+</svg>
+<span>SearchField</span></div><div class="tile" title="control.font-picker"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="m3.25 19 5.3-14h.9L14.75 19M5.4 14.25h7.2"/>
+  <circle cx="18" cy="16.5" r="2.5"/>
+  <path d="M20.5 13.5V19"/>
+</svg>
+<span>FontPicker</span></div><div class="tile" title="control.combo-box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="7" width="18.5" height="10" rx="2"/>
+  <path d="M6 12h5.5"/>
+  <path d="m14.5 10.75 2.25 2.25 2.25-2.25"/>
+</svg>
+<span>ComboBox</span></div><div class="tile" title="control.number-box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="7" width="18.5" height="10" rx="2"/>
+  <path d="M15 7v10"/>
+  <path d="m16.75 10.75 1.25-1.25 1.25 1.25M16.75 13.25l1.25 1.25 1.25-1.25"/>
+  <path d="M6 12h5.5"/>
+</svg>
+<span>NumberBox</span></div><div class="tile" title="control.stepper"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="7" y="2.75" width="10" height="18.5" rx="3"/>
+  <path d="M7 12h10"/>
+  <path d="m9.5 8.5 2.5-2.5 2.5 2.5M9.5 15.5l2.5 2.5 2.5-2.5"/>
+</svg>
+<span>Stepper</span></div><div class="tile" title="control.slider"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3 12h3.25M11.75 12H21"/>
+  <circle cx="9" cy="12" r="2.75"/>
+</svg>
+<span>Slider</span></div><div class="tile" title="control.progress-bar"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="8.5" width="18.5" height="7" rx="3.5"/>
+  <rect x="5" y="10.75" width="9" height="2.5" rx="1.25" fill="currentColor" stroke="none"/>
+</svg>
+<span>ProgressBar</span></div><div class="tile" title="control.activity-indicator"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12.00 7.75L12.00 3.75" opacity="1"/>
+  <path d="M15.01 8.99L17.83 6.17" opacity=".88"/>
+  <path d="M16.25 12.00L20.25 12.00" opacity=".76"/>
+  <path d="M15.01 15.01L17.83 17.83" opacity=".64"/>
+  <path d="M12.00 16.25L12.00 20.25" opacity=".52"/>
+  <path d="M8.99 15.01L6.17 17.83" opacity=".4"/>
+  <path d="M7.75 12.00L3.75 12.00" opacity=".3"/>
+  <path d="M8.99 8.99L6.17 6.17" opacity=".2"/>
+</svg>
+<span>ActivityIndicator</span></div><div class="tile" title="control.date-time-picker"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="4.5" width="18" height="16.5" rx="2.5"/>
+  <path d="M3 9.25h18M8 2.75v3.5M16 2.75v3.5"/>
+  <circle cx="7.5" cy="13.25" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="12" cy="13.25" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="16.5" cy="13.25" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="7.5" cy="17" r="0.95" fill="currentColor" stroke="none"/>
+  <circle cx="12" cy="17" r="0.95" fill="currentColor" stroke="none"/>
+</svg>
+<span>DateTimePicker</span></div><div class="tile" title="control.color-picker"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 12V3.25A8.75 8.75 0 0 1 19.6 16.4z" fill="currentColor" stroke="none" opacity=".35"/>
+  <circle cx="12" cy="12" r="8.75"/>
+  <path d="M12 3.25V12l7.6 4.4M12 12l-7.6 4.4"/>
+</svg>
+<span>ColorPicker</span></div><div class="tile" title="control.list-box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3.5" width="18" height="17" rx="2.5"/>
+  <path d="M3 9h18M3 14.5h18M9 3.5v17"/>
+</svg>
+<span>ListBox</span></div><div class="tile" title="control.tree-view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3" width="6" height="4.5" rx="1"/>
+  <rect x="12" y="9" width="9" height="4.5" rx="1"/>
+  <rect x="12" y="16" width="9" height="4.5" rx="1"/>
+  <path d="M6 7.5v10.75h6M6 11.25h6"/>
+</svg>
+<span>TreeView</span></div><div class="tile" title="control.image-view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="4" width="18" height="16" rx="2.5"/>
+  <circle cx="8.5" cy="9.5" r="1.75"/>
+  <path d="m21 16-4.5-4.5L7 20"/>
+</svg>
+<span>ImageView</span></div><div class="tile" title="control.canvas"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="3" width="18" height="18" rx="2.5"/>
+  <path d="M7 16.5c1.5-4 3-5.5 4.25-3.5s2.75.5 5.75-5"/>
+</svg>
+<span>Canvas</span></div><div class="tile" title="control.html-view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="4" width="18.5" height="16" rx="2.5"/>
+  <path d="M2.75 8.75h18.5"/>
+  <path d="m9.5 11.75-2.25 2.5 2.25 2.5M14.5 11.75l2.25 2.5-2.25 2.5"/>
+</svg>
+<span>HTMLView</span></div><div class="tile" title="control.popover"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.5 3.5h13A2.5 2.5 0 0 1 21 6v8a2.5 2.5 0 0 1-2.5 2.5H14.25L12 19.5l-2.25-3H5.5A2.5 2.5 0 0 1 3 14V6a2.5 2.5 0 0 1 2.5-2.5z"/>
+  <path d="M7 8.25h10M7 11.75h6"/>
+</svg>
+<span>Popover</span></div><div class="tile" title="control.tooltip"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="2.75" width="15" height="8.5" rx="2.25"/>
+  <path d="M6.25 7h8"/>
+  <path d="M12.75 12.75v7.5l2.1-1.85 1.55 3.35 1.55-.75-1.55-3.3H19.3z"/>
+</svg>
+<span>Tooltip</span></div><div class="tile" title="control.context-menu"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="8.25" y="6.5" width="12.75" height="14.5" rx="2"/>
+  <path d="M11.25 10.5h6.75M11.25 13.75h6.75M11.25 17h4"/>
+  <path d="M3 3.25 7.75 5.4 5.6 6.1 4.9 8.25z"/>
+</svg>
+<span>Context menu</span></div><div class="tile" title="control.menu-bar"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="3.5" width="18.5" height="5" rx="1.5"/>
+  <rect x="5" y="8.5" width="9.5" height="11.5" rx="1.5"/>
+  <path d="M7.75 12.25h4M7.75 16h4"/>
+</svg>
+<span>MenuBar</span></div><div class="tile" title="control.separator"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3 12h18"/>
+  <path d="M6.5 7.5h11M6.5 16.5h11" opacity=".35"/>
+</svg>
+<span>Separator</span></div><div class="tile" title="control.status-badge"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.75" y="7.5" width="18.5" height="9" rx="4.5"/>
+  <circle cx="7.5" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+  <path d="M11 12h6.5"/>
+</svg>
+<span>Status badge</span></div><div class="tile" title="control.generic"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="5" y="5" width="14" height="14" rx="1.5"/>
+  <rect x="3.5" y="3.5" width="3" height="3" rx=".6" fill="currentColor" stroke="none"/>
+  <rect x="17.5" y="3.5" width="3" height="3" rx=".6" fill="currentColor" stroke="none"/>
+  <rect x="3.5" y="17.5" width="3" height="3" rx=".6" fill="currentColor" stroke="none"/>
+  <rect x="17.5" y="17.5" width="3" height="3" rx=".6" fill="currentColor" stroke="none"/>
+</svg>
+<span>Control (fallback)</span></div><div class="tile" title="control.package"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5 9.5V6a1.5 1.5 0 0 1 1.5-1.5H10a2 2 0 1 1 4 0h3.5A1.5 1.5 0 0 1 19 6v3.5a2 2 0 1 1 0 4V18a1.5 1.5 0 0 1-1.5 1.5H14a2 2 0 1 0-4 0H6.5A1.5 1.5 0 0 1 5 18v-4.5a2 2 0 1 0 0-4z"/>
+</svg>
+<span>Package control (fallback)</span></div></div></section><section><h3>Fallback</h3><div class="grid"><div class="tile" title="status.unknown"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="3.5" stroke-dasharray="3 2.6"/>
+  <path d="M10 9.75a2 2 0 1 1 2.75 1.85c-.5.2-.75.6-.75 1.15v.5"/>
+  <circle cx="12" cy="16.25" r="1" fill="currentColor" stroke="none"/>
+</svg>
+<span>Unknown (last-resort fallback)</span></div></div></section><section><h3>Symbol</h3><div class="grid"><div class="tile" title="symbol.module"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M8.5 4c-1.75 0-2.5.9-2.5 2.5v2.75c0 1.15-.75 2-2 2.25v1c1.25.25 2 1.1 2 2.25v2.75C6 19.1 6.75 20 8.5 20M15.5 4c1.75 0 2.5.9 2.5 2.5v2.75c0 1.15.75 2 2 2.25v1c-1.25.25-2 1.1-2 2.25v2.75c0 1.6-.75 2.5-2.5 2.5"/>
+</svg>
+<span>Module</span></div><div class="tile" title="symbol.class"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="3.5"/>
+  <path d="M15.25 9a4.25 4.25 0 1 0 0 6"/>
+</svg>
+<span>Class</span></div><div class="tile" title="symbol.interface"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="3.5" stroke-dasharray="3.2 2.4"/>
+  <path d="M12 8v8M9.75 8h4.5M9.75 16h4.5"/>
+</svg>
+<span>Interface</span></div><div class="tile" title="symbol.enum"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="3.5"/>
+  <path d="M14.75 8h-5v8h5M9.75 12h4"/>
+</svg>
+<span>Enum</span></div><div class="tile" title="symbol.structure"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="3.5" width="17" height="17" rx="3.5"/>
+  <path d="M14.5 9.1A2.6 2.1 0 0 0 12 8h-.25a2 2 0 0 0 0 4h.5a2 2 0 0 1 0 4H12a2.6 2.1 0 0 1-2.5-1.1"/>
+</svg>
+<span>Structure</span></div><div class="tile" title="symbol.method"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.75"/>
+  <path d="M10.25 8.25c-1.6 2.3-1.6 5.2 0 7.5M13.75 8.25c1.6 2.3 1.6 5.2 0 7.5"/>
+</svg>
+<span>Function / Sub</span></div><div class="tile" title="symbol.property"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.75"/>
+  <path d="M10 16.5v-9h2.75a2.5 2.5 0 0 1 0 5H10"/>
+</svg>
+<span>Property</span></div><div class="tile" title="symbol.event"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M13.25 2.75 5.5 13.5h6l-1 7.75 8-11h-6z"/>
+</svg>
+<span>Event / Handle</span></div><div class="tile" title="symbol.constant"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.75"/>
+  <path d="M8.5 10.25h7M8.5 13.75h7"/>
+</svg>
+<span>Const</span></div></div></section><section><h3>Action</h3><div class="grid"><div class="tile" title="action.open"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19V6a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2"/><path d="m3 19 3-8h15l-3 8z"/></svg>
+<span>Open</span></div><div class="tile" title="action.save"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 3h13l3 3v15H4z"/><path d="M8 3v6h8V3M8 21v-8h8v8"/></svg>
+<span>Save</span></div><div class="tile" title="action.undo"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m8 4-5 5 5 5M3 9h10a7 7 0 0 1 7 7v4"/></svg>
+<span>Undo</span></div><div class="tile" title="action.redo"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m16 4 5 5-5 5M21 9H11a7 7 0 0 0-7 7v4"/></svg>
+<span>Redo</span></div><div class="tile" title="action.navigator"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M5.5 8h1M5.5 12h1M5.5 16h1"/></svg>
+<span>Navigator</span></div><div class="tile" title="action.agent"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16M17.5 8h1M17.5 12h1M17.5 16h1"/></svg>
+<span>Agent</span></div><div class="tile" title="action.tests"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3h8M10 3v6l-5 9a2 2 0 0 0 1.75 3h10.5A2 2 0 0 0 19 18l-5-9V3M7 15h10"/><path d="m10 17 1.5 1.5L15 15"/></svg>
+<span>Tests</span></div></div></section><div class="identities"><div class="identity"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- PROPOSAL: Buoy Studio identity. Vector stand-in in the established app-icon language
+       (rounded tile, ivory sculpted glyph, soft upper-left light). Not wired into any build. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#4a74f2"/>
+      <stop offset="1" stop-color="#28309a"/>
+    </linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffdf7"/>
+      <stop offset="1" stop-color="#e9e2d2"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".30"/>
+      <stop offset=".55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#tile)"/>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#sheen)"/>
+  <rect x="64" y="64" width="896" height="896" rx="206" fill="none" stroke="#ffffff" stroke-opacity=".22" stroke-width="4"/>
+  <rect x="186" y="232" width="600" height="500" rx="62" fill="#0b1046" opacity=".28"/>
+  <g>
+    <rect x="186" y="214" width="600" height="500" rx="62" fill="url(#ivory)"/>
+    <path d="M186 304h600" stroke="#d6cdb9" stroke-width="10"/>
+    <circle cx="246" cy="259" r="17" fill="#c7bea8"/>
+    <circle cx="300" cy="259" r="17" fill="#c7bea8"/>
+    <rect x="240" y="356" width="196" height="300" rx="28" fill="#3459dc"/>
+    <rect x="476" y="356" width="256" height="116" rx="28" fill="#3459dc" opacity=".55"/>
+    <rect x="476" y="508" width="168" height="40" rx="20" fill="#3459dc" opacity=".32"/>
+  </g>
+  <circle cx="704" cy="700" r="156" fill="#0b1046" opacity=".3"/>
+  <g>
+    <circle cx="704" cy="684" r="156" fill="#fffdf7"/>
+    <path d="M848.1 624.3A156 156 0 0 1 848.1 743.7L772.4 712.3A74 74 0 0 0 772.4 655.7ZM763.7 828.1A156 156 0 0 1 644.3 828.1L675.7 752.4A74 74 0 0 0 732.3 752.4ZM559.9 743.7A156 156 0 0 1 559.9 624.3L635.6 655.7A74 74 0 0 0 635.6 712.3ZM644.3 539.9A156 156 0 0 1 763.7 539.9L732.3 615.6A74 74 0 0 0 675.7 615.6Z" fill="#e5533d"/>
+    <circle cx="704" cy="684" r="74" fill="#2f3fb8"/>
+    <circle cx="704" cy="684" r="156" fill="none" stroke="#d6cdb9" stroke-width="6"/>
+  </g>
+</svg>
+<span>BuoyStudio<small>Application identity</small></span></div><div class="identity"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- PROPOSAL: Buoy Permissions identity. Ivory shield with a check over a slate-violet tile,
+       in the established app-icon language. Not wired into any build. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#6d5bd8"/>
+      <stop offset="1" stop-color="#3a2e86"/>
+    </linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffdf7"/>
+      <stop offset="1" stop-color="#e9e2d2"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".30"/>
+      <stop offset=".55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#tile)"/>
+  <rect x="62" y="62" width="900" height="900" rx="208" fill="url(#sheen)"/>
+  <rect x="64" y="64" width="896" height="896" rx="206" fill="none" stroke="#ffffff" stroke-opacity=".22" stroke-width="4"/>
+  <path d="M512 214 772 306v188c0 172-110 290-260 352-150-62-260-180-260-352V306z" fill="#160f40" opacity=".3"/>
+  <g>
+    <path d="M512 196 772 288v188c0 172-110 290-260 352-150-62-260-180-260-352V288z" fill="url(#ivory)"/>
+    <path d="m396 512 82 82 160-176" fill="none" stroke="#5141c4" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
+<span>Permissions<small>Application identity proposal</small></span></div></div></body></html>

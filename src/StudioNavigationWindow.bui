@@ -1,0 +1,266 @@
+Import StudioNavigation
+Import StudioQuickOpen
+Import StudioCommands
+Import StudioBookmarks
+Import StudioClipboard
+
+Public Class StudioNavigationController
+    Public Property Host As StudioNavigationHost
+    Public Property History As StudioNavigationHistory = New StudioNavigationHistory()
+    Public Property QuickOpen As StudioQuickOpenIndex = New StudioQuickOpenIndex()
+    Public Property Commands As StudioCommands = New StudioCommands()
+    Public Property Bookmarks As StudioBookmarks = New StudioBookmarks()
+    Public Property Clipboard As StudioClipboardHistory = New StudioClipboardHistory()
+    Public Property Context As String = "source"
+    Public Property Domain As String = "com.buoy.studio"
+    Public Property LinuxNative As Boolean = False
+    Private Property Picker As StudioNavigationWindow
+    Public Sub Constructor()
+        Me.Commands.Defaults()
+    End Sub
+    Public Function Load() As String
+        Me.QuickOpen.Load(Me.Domain)
+        Me.Bookmarks.Load(Me.Domain)
+        Return Me.Commands.Load(Me.Domain, Me.LinuxNative)
+    End Function
+    Public Sub Save()
+        Me.QuickOpen.Save(Me.Domain)
+        Me.Bookmarks.Save(Me.Domain)
+        Me.Commands.Save(Me.Domain)
+    End Sub
+    Public Function OpenLocation(location As StudioLocation, record As Boolean = True) As String
+        If Me.Host = Nil Then Return "Navigation host is unavailable"
+        If location = Nil Then Return "No location available"
+        Dim before As StudioLocation = Me.Host.NavigationLocation()
+        Dim failure As String = Me.Host.NavigationOpen(location.Copy())
+        If failure = "" Then
+            If record Then
+                Me.History.Visit(before)
+                Me.History.Visit(Me.Host.NavigationLocation())
+            End If
+            Me.QuickOpen.Used(location.DocumentID)
+        End If
+        Return failure
+    End Function
+    Public Function CanExecute(id As String) As Boolean
+        If Me.Host = Nil Then Return False
+        Select Case id
+        Case "navigation:back"
+            Return Me.History.Candidate(False) <> Nil
+        Case "navigation:forward"
+            Return Me.History.Candidate(True) <> Nil
+        Case "navigation:last-edit"
+            Return Me.History.LastEdit() <> Nil
+        Case "navigation:line", "navigation:bookmark", "navigation:clipboard"
+            Return Me.Host.NavigationLocation() <> Nil
+        Case "navigation:quick-open", "navigation:commands", "navigation:bookmarks", "navigation:bindings", "navigation:clipboard-clear"
+            Return True
+        End Select
+        Return Me.Host.NavigationCanCommand(id)
+    End Function
+    Public Function Execute(id As String) As String
+        If Not Me.CanExecute(id) Then Return "Command is unavailable in the current context"
+        Select Case id
+        Case "navigation:back", "navigation:forward"
+            Dim forward As Boolean = id = "navigation:forward"
+            Dim failure As String = Me.OpenLocation(Me.History.Candidate(forward), False)
+            If failure = "" Then Me.History.Commit(forward)
+            Return failure
+        Case "navigation:last-edit"
+            Return Me.OpenLocation(Me.History.LastEdit())
+        Case "navigation:clipboard-clear"
+            Me.Clipboard.Clear()
+            Return ""
+        Case "navigation:bookmark"
+            Me.Bookmarks.Toggle(Me.Host.NavigationLocation())
+            Me.Bookmarks.Save(Me.Domain)
+            Return ""
+        Case "navigation:quick-open", "navigation:commands", "navigation:line", "navigation:bookmarks", "navigation:clipboard", "navigation:bindings"
+            Me.ShowPicker(id)
+            Return ""
+        End Select
+        Return Me.Host.NavigationCommand(id)
+    End Function
+    Public Sub ShowPicker(mode As String)
+        If Me.Picker <> Nil Then Me.Picker.Dispose()
+        Me.Picker = New StudioNavigationWindow(Me, mode)
+        Me.Picker.Show()
+    End Sub
+    Public Sub Dispose()
+        If Me.Picker <> Nil Then Me.Picker.Dispose()
+        Me.Picker = Nil
+        Me.Host = Nil
+        Me.Clipboard.Clear()
+    End Sub
+End Class
+
+Private Class StudioNavigationQuery Inherits TextField
+    Public Property Owner As Weak StudioNavigationWindow
+    Handle TextChanged()
+        Dim owner As StudioNavigationWindow = Me.Owner
+        If owner <> Nil Then owner.Refresh()
+    End Handle
+End Class
+Private Class StudioNavigationButton Inherits Button
+    Public Property Owner As Weak StudioNavigationWindow
+    Handle Action()
+        Dim owner As StudioNavigationWindow = Me.Owner
+        If owner <> Nil Then owner.Accept()
+    End Handle
+End Class
+''' Reusable native picker. Select a row, then Activate; filtering never edits source.
+Public Class StudioNavigationWindow Inherits Window
+    Public Property Query As StudioNavigationQuery = New StudioNavigationQuery()
+    Public Property Binding As TextField = New TextField()
+    Public Property Results As ComboBox = New ComboBox()
+    Public Property Status As Label = New Label()
+    Private Property Captions As Array Of String = []
+    Private Property Summary As TextArea = New TextArea()
+    Private Property Activate As StudioNavigationButton = New StudioNavigationButton()
+    Private Property Controller As Weak StudioNavigationController
+    Private Property Mode As String
+    Private Property Locations As Array Of StudioLocation = []
+    Private Property CommandIDs As Array Of String = []
+    Private Property Clips As Array Of String = []
+    Private Property Expected As StudioLocation
+    Private Property Disposing As Boolean = False
+    Public Sub Constructor(controller As StudioNavigationController, mode As String)
+        Super.Constructor()
+        Me.Controller = controller
+        Me.Mode = mode
+        Me.Title = "Studio — " + mode
+        Me.Move(170, 140, 760, 480)
+        Me.SetMinSize(760.0, 480.0)
+        Me.Query.Owner = Me
+        Me.Query.Placeholder = "Filter paths or commands; path:line:column; Go To: line:column"
+        Me.Query.AccessibleLabel = "Navigation query"
+        Me.Query.Move(16, 16, 728, 30)
+        Me.AddSubview(Me.Query)
+        Me.Results.Move(16, 60, 728, 32)
+        Me.Results.AccessibleLabel = "Ranked navigation results"
+        Me.AddSubview(Me.Results)
+        Me.Summary.Move(16, 104, 728, 250)
+        Me.Summary.IsReadOnly = True
+        Me.Summary.AccessibleLabel = "Ranked results preview"
+        Me.AddSubview(Me.Summary)
+        Me.Binding.Move(16, 372, 550, 30)
+        Me.Binding.Placeholder = "Shortcut, e.g. Primary+Alt+K; empty clears"
+        Me.Binding.Visible = mode = "navigation:bindings"
+        Me.AddSubview(Me.Binding)
+        Me.Activate.Owner = Me
+        Me.Activate.Caption = "Activate"
+        If mode = "navigation:bindings" Then Me.Activate.Caption = "Save Binding"
+        Me.Activate.Move(590, 372, 154, 30)
+        Me.AddSubview(Me.Activate)
+        Me.Status.Move(16, 420, 728, 36)
+        Me.AddSubview(Me.Status)
+        If controller.Host <> Nil Then
+            Dim current As StudioLocation = controller.Host.NavigationLocation()
+            If current <> Nil Then Me.Expected = current.Copy()
+        End If
+        Me.Refresh()
+    End Sub
+    Public Sub Refresh()
+        Dim controller As StudioNavigationController = Me.Controller
+        If controller = Nil Then Return
+        Me.Captions = []
+        Me.CommandIDs = []
+        Me.Locations = []
+        Me.Clips = []
+        Select Case Me.Mode
+        Case "navigation:quick-open"
+            Me.Locations = controller.QuickOpen.Search(Me.Query.Text)
+            For Each loc As StudioLocation In Me.Locations
+                Me.Captions.Append(loc.Path + ":" + String.From(loc.Line) + ":" + String.From(loc.Column))
+            Next
+        Case "navigation:commands", "navigation:bindings"
+            For Each command As StudioCommand In controller.Commands.Search(Me.Query.Text, controller.Context)
+                Dim caption As String = command.Caption + "  " + command.Shortcut
+                If Not controller.CanExecute(command.ID) Then caption += " (unavailable)"
+                Me.Captions.Append(caption)
+                Me.CommandIDs.Append(command.ID)
+            Next
+        Case "navigation:bookmarks"
+            For Each item As StudioSourceBookmark In controller.Bookmarks.Items()
+                If StudioFuzzyRank(Me.Query.Text, item.Label + " " + item.Location.Path) < 0 Then Continue For
+                Me.Locations.Append(item.Location)
+                Dim caption As String = item.Label + " " + item.Location.Path + ":" + String.From(item.Location.Line)
+                If item.NeedsReview Then caption += " (source changed; review position)"
+                Me.Captions.Append(caption)
+            Next
+        Case "navigation:clipboard"
+            For Each text As String In controller.Clipboard.Items()
+                If StudioFuzzyRank(Me.Query.Text, text) < 0 Then Continue For
+                Me.Clips.Append(text)
+                Me.Captions.Append(String.Left(String.Replace(text, "\n", " ↵ "), 160))
+            Next
+        Case "navigation:line"
+            Me.Status.Text = "Enter a positive one-based line or line:column, then Activate."
+        End Select
+        Me.Results.RemoveAllItems()
+        Dim preview As String
+        For i As Integer = 0 To Math.Min(199, Array.Count(Me.Captions) - 1)
+            Me.Results.AddItem(Me.Captions(i))
+            If i < 20 Then preview += String.From(i + 1) + ". " + Me.Captions(i) + "\n"
+        Next
+        Me.Summary.Text = preview
+        If Me.Mode <> "navigation:line" Then Me.Status.Text = String.From(Array.Count(Me.Captions)) + " matches; choose a result then Activate. Narrow the filter for more than 200 matches."
+        If Me.Results.Count > 0 Then Me.Results.SelectedIndex = 0
+    End Sub
+    Public Sub Accept()
+        Dim controller As StudioNavigationController = Me.Controller
+        If controller = Nil Or controller.Host = Nil Then
+            Me.Status.Text = "Navigation host is unavailable"
+            Return
+        End If
+        Try
+            Dim failure As String
+            Dim row As Integer = Me.Results.SelectedIndex
+            Select Case Me.Mode
+            Case "navigation:line"
+                Dim loc As StudioLocation = StudioParsePosition(Me.Query.Text, Me.Expected)
+                If loc = Nil Then
+                    Me.Status.Text = "Enter line[:column], using positive integers"
+                    Return
+                End If
+                failure = controller.OpenLocation(loc)
+            Case "navigation:commands", "navigation:bindings"
+                If row < 0 Or row >= Array.Count(Me.CommandIDs) Then Return
+                If Me.Mode = "navigation:bindings" Then
+                    failure = controller.Commands.Bind(Me.CommandIDs(row), Me.Binding.Text, controller.LinuxNative)
+                    If failure = "" Then
+                        controller.Commands.Save(controller.Domain)
+                        Me.Refresh()
+                        Me.Status.Text = "Binding saved. The shell must refresh its menu accelerators."
+                        Return
+                    End If
+                Else
+                    ' Hide before dispatch: opening another picker can dispose this one.
+                    Me.Visible = False
+                    failure = controller.Execute(Me.CommandIDs(row))
+                End If
+            Case "navigation:clipboard"
+                If row < 0 Or row >= Array.Count(Me.Clips) Then Return
+                failure = controller.Host.NavigationPaste(Me.Clips(row), Me.Expected)
+            Case Else
+                If row < 0 Or row >= Array.Count(Me.Locations) Then Return
+                failure = controller.OpenLocation(Me.Locations(row))
+            End Select
+            Me.Status.Text = failure
+            If failure = "" Then Me.Visible = False
+        Catch e As Exception
+            Me.Status.Text = e.Message
+        End Try
+    End Sub
+    Handle Closing() As Boolean
+        If Me.Disposing Then Return False
+        Me.Visible = False
+        Return True
+    End Handle
+    Public Sub Dispose()
+        Me.Controller = Nil
+        Me.Disposing = True
+        Me.Visible = False
+        Me.Close()
+    End Sub
+End Class
