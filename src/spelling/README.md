@@ -31,8 +31,6 @@ with visible-line checking for large buffers and a persistent Settings toggle.
 Hover a flagged word for suggestions and Ignore. Its host API exposes
 `setSpellCheck(boolean)` and `setDocument({spellCheck:false,...})`.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 The spelling cache owns arrays through `StudioSpellingCacheEntry` to avoid the
 Buoy 0.72 optional-class-array read leak tracked as BUI-818. Search error paths
 keep throwing-call receivers in named locals (BUI-817). Native editor/input

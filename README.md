@@ -1,4 +1,4 @@
-# A native IDE for editing and designing Buoy applications
+# Native IDE with source editing, visual layout design, project navigation and agent integration
 
 Buoy Bay Studio combines a project navigator, source editor, visual layout canvas,
 property inspector, build messages and an agent panel. Native split panes keep
@@ -45,7 +45,5 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)

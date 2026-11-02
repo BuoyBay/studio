@@ -47,8 +47,6 @@ stack frames, scopes/locals and output. Variable mutation, expression evaluation
 watchpoints, reverse debugging and a source-gutter breakpoint editor are outside
 this implementation. Adapter availability and capabilities vary by host.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## macOS debugger authorization
 
 Apple LLDB may report `this is a non-interactive debug session, cannot get

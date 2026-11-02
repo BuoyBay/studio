@@ -23,7 +23,7 @@ application files or substituting compiler checks.
 helper. Do not include `Import`, `Sub Main`, `Export`, or an entry declaration.
 BuoyScript v1 has no imports. Use the selected toolchain's grammar and stdlib.
 
-```buoy
+```basic
 Dim raw As String = ProjectTool("project_list_items", "{}")
 Dim reply As JSONItem = Json.Parse(raw)
 If reply.HasKey("error") Then Return raw
@@ -64,7 +64,7 @@ byte offsets; a response over 1 MiB fails the script. U+0000 is not supported in
 project text. `project_workspace.execution = "unavailable"` describes the core
 project tools; it does not disable a separately configured script runner.
 
-```buoy
+```basic
 Dim raw As String = ProjectTool("project_read_item", "{\"itemId\":\"main\"}")
 Dim response As JSONItem = Json.Parse(raw)
 If response.HasKey("error") Then Return raw
@@ -214,7 +214,7 @@ The legacy agent protocol continues to use stdout and still forbids Print.
 
 Try this function body in the playground:
 
-```buoy
+```basic
 Print "Hello from BuoyStudio"
 Dim answer As Integer = 6 * 7
 Print "Answer: " + String.From(answer)

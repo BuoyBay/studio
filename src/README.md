@@ -1,12 +1,5 @@
 # Buoy Studio
 
-A native Buoy development studio in the classic REALbasic/Xojo arrangement:
-a Navigator (filterable project outline and control Library), a central
-document with a WYSIWYG Design view and a Source view, a Messages pane, and a
-collapsible Agent pane. Navigator, document, Messages and Agent regions use
-native `Splitter` panes whose sizes persist. See [docs/DESIGN.md](docs/DESIGN.md), [docs/GLOSSARY.md](docs/GLOSSARY.md)
-and docs/ACCEPTANCE.md (private maintainer material).
-
 At compact window widths the tool palette collapses to keep the canvas and
 Inspector usable beside Agent. Selecting a Library component or explicitly
 showing the palette makes room by collapsing Agent, then Navigator if needed.
@@ -67,17 +60,6 @@ packages must contain fresh native slices for the selected target; semantic
 checks alone do not validate those slices. `--self-test` runs only on the native
 host target. The standalone shell check cross-links on other hosts and executes
 its literal-argv/output/exit and failed-launch cleanup tests when run on Windows.
-
-The preview package is stored without ZIP compression when staged, preserving
-its payload bytes so Buoy 0.72's Windows compiler can discover it (BUI-008).
-Windows designer self-tests dispatch enabled menu tags through Studio's command
-route because nested `MenuItem.PerformAction` is defective (BUI-814); production
-menu dispatch is unchanged. Native follow-through and its snapshot limits are in
-the Windows acceptance report (not included in this repository).
-The builder stages an isolated consumer project to avoid unrelated app resource
-manifests. It checks the app on six Buoy targets before host compilation.
-The `--self-test` mode drives native actions and requires a distinct success
-marker; failure output cannot silently pass the runner.
 
 The native TreeView, SearchField and SegmentedButton come unchanged from
 `containers/integrations/`; the builder copies those module files into the
@@ -253,12 +235,6 @@ the workspace session and restored on reopen (each is re-verified against disk
 before use). The language server is told about renames (old document closed, new
 one opened).
 
-**Tests.** `tests/studio_file_refactor_test.bui` (planner), `tests/projectkit_rename_test.bui`
-(ProjectKit RenameItem/ReloadItem), `tests/studio_review_native_test.bui` (the review
-window's native list/checkbox cells and a real folder move with undo/redo on disk;
-verified on Linux, macOS and Windows), and the Studio `--self-test` IDE step (browse
-stays clean, rename/folder rename/undo/redo in place, unsaved review).
-
 ### Not done yet
 
 - **Framework API**: per-control native snapshots for the designer canvas belong in
@@ -281,9 +257,6 @@ consumer, so previewing does not require a separately installed PreviewKit.
 Qualified source paths identify observations; typed access follows Buoy's
 root-level lowering of nested controls. Interactive Studio preview does not
 capture screenshots or send permission-helper commands.
-
-It checks the Studio preview module and generated harness on all six targets,
-then verifies the shared native snapshot under private X11 on Linux.
 
 ## Agent connections
 
@@ -384,15 +357,6 @@ CLIs on Windows, point `_EXECUTABLE` at `node.exe` and include the CLI script pa
 before its ACP arguments in the JSON `_ARGS` array. Mistral Vibe uses `vibe-acp`.
 The presets follow the [ACP registry](https://github.com/agentclientprotocol/registry);
 custom ACP remains available for other agents.
-
-This saves the built app, per-step logs and `validation.json` under
-`dist/studio-container-validation/`, with the repository mounted read-only and no
-network or real model credentials during testing. See
-container setup (not included in this repository)
-for bootstrapping a new machine and the separately tracked Linux BuoyScript SDK
-availability limitation.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
 
 ## Continue with ChatGPT
 
@@ -578,8 +542,6 @@ Literal-only masks display their constant with an empty raw value. Application
 code can use `ReplaceValue` to explicitly load a new record over a rejected draft,
 or `CancelEdit` to restore the old value.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## Designer menus, toolbar and shortcuts
 
 Every LayoutEditor command is on the menubar (`StudioDesignerMenus.bui`). An item's
@@ -707,11 +669,6 @@ need a parameterless constructor. Code-behind subclasses are not used: the previ
 shows the layout class itself. For pixel captures with typed fixture data, use
 `tools/buoy_preview.py` (see `tools/preview/README.md`).
 
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## Code, Problems, debugger and terminal
 
 Source mode uses a native-input canvas editor with lexical highlighting, line
@@ -769,11 +726,6 @@ execution arrow. Continue, disconnect or editing that source clears the arrow.
 Unknown adapter paths are reported without opening files. Breakpoint entries are
 applied on Launch/Attach. See [debugger details](docs/DEBUGGER.md).
 
-## Tests
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## Documentation library
 
 Open **Help > Documentation** to browse the bundled upstream Buoy reference,
@@ -806,7 +758,6 @@ credentials are excluded from displayed errors and attached context.
 alongside the current source context. Agents can read that snapshot with the
 normal project tools. Editing its local buffer does not publish changes to the
 forge; repository writes remain explicit Tickets actions.
-
 
 Studio’s Find and Replace panel supports PCRE2 Grep in the current document:
 lookaround, named and numbered captures, multiline anchors, dot-all and optional
@@ -844,7 +795,6 @@ The breakpoint lane is separate from diagnostics and folding. Existing breakpoin
 toggles and the execution arrow remain available to debugger hosts; clicking a
 problem badge never toggles a breakpoint. LSP information and hint messages retain
 their own severities instead of being reported as warnings.
-
 
 ### BuoyScript library, playground and build events
 

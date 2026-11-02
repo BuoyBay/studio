@@ -17,7 +17,6 @@ identities (the rich, coloured application icons) live separately under
 
 ## Build and validate
 
-
 The tool needs only Python's standard library. `--contact-sheet` also needs
 the `buoy` compiler, and the rendered console binary must be able to load
 the runtime's image libraries. On hosts without `libjpeg.so.8`, set
@@ -103,7 +102,6 @@ matching image-generator prompts in the style of `apps/icon-prompts.json`, for
 when a raster master in the ceramic style of the existing icons is wanted.
 After approval, package a raster master with `tools/build_icons.py`.
 
-
 Studio app PNG, ICO, and ICNS files and tinted native tree-row icons are generated
 from the checked-in SVGs with `python3 tools/build_studio_icons.py` (ImageMagick
 required to regenerate). Builds package these resources without an image-tool
@@ -112,5 +110,3 @@ Studio configures navigator rows with 16-point icons; TreeView scales the artwor
 to its configured logical icon size.
 The designer control picker uses LayoutCatalog icon descriptors in its native
 list/grid palette, including validated package-provided icons.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.
