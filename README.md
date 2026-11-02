@@ -1,4 +1,4 @@
-# Native IDE — source, layout, navigation, agents
+# Native IDE
 
 Buoy Bay Studio combines a project navigator, source editor, visual layout canvas,
 property inspector, build messages and an agent panel. Native split panes keep
