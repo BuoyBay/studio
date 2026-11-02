@@ -38,12 +38,4 @@ Studio application code is in `src/`; reusable shared modules are in `shared/`.
 The generated-project scaffold exception and component license boundaries are
 explained in [LICENSING.md](LICENSING.md).
 
-## Local Buoy setup
-
-On your own machine, install Buoy and run:
-
-```sh
-buoy ai init --both
-```
-
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
